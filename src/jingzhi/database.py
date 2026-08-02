@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 SCHEMA = """
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS frames (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL DEFAULT 'display:primary',
     ts_ms INTEGER NOT NULL CHECK (ts_ms >= 0),
     path TEXT NOT NULL,
     perceptual_hash TEXT NOT NULL,
@@ -77,7 +79,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
     content_json TEXT NOT NULL,
     model TEXT
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at_utc TEXT NOT NULL
+);
 """
+
+LATEST_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +94,37 @@ class FrameRecord:
     id: int
     ts_ms: int
     path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineFrameRecord:
+    id: int
+    session_id: str
+    source_id: str
+    ts_ms: int
+    path: Path
+    width: int
+    height: int
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineTranscriptRecord:
+    id: int
+    source: str
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRecord:
+    id: str
+    title: str
+    started_at_utc: str
+    ended_at_utc: str | None
+    status: str
+    duration_ms: int
+    frame_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +140,24 @@ class Database:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.executescript(SCHEMA)
+            self.migrate(connection)
+
+    def migrate(self, connection: sqlite3.Connection) -> None:
+        """Bring both fresh and pre-versioned MVP databases to the latest schema."""
+        connection.executescript(SCHEMA)
+        frame_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(frames)").fetchall()
+        }
+        if "source_id" not in frame_columns:
+            connection.execute(
+                "ALTER TABLE frames ADD COLUMN source_id TEXT NOT NULL DEFAULT 'display:primary'"
+            )
+        applied_at = datetime.now().astimezone().isoformat()
+        connection.executemany(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+            [(version, applied_at) for version in range(1, LATEST_SCHEMA_VERSION + 1)],
+        )
+        connection.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION}")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -126,15 +183,132 @@ class Database:
             )
 
     def add_frame(
-        self, session_id: str, ts_ms: int, path: Path, image_hash: str, size: tuple[int, int]
+        self,
+        session_id: str,
+        ts_ms: int,
+        path: Path,
+        image_hash: str,
+        size: tuple[int, int],
+        *,
+        source_id: str = "display:primary",
     ) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
-                """INSERT INTO frames(session_id, ts_ms, path, perceptual_hash, width, height)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, ts_ms, str(path), image_hash, size[0], size[1]),
+                """INSERT INTO frames(
+                       session_id, source_id, ts_ms, path, perceptual_hash, width, height
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source_id, ts_ms, str(path), image_hash, size[0], size[1]),
             )
             return int(cursor.lastrowid)
+
+    def list_sessions(self) -> list[SessionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT
+                       sessions.id,
+                       sessions.title,
+                       sessions.started_at_utc,
+                       sessions.ended_at_utc,
+                       sessions.status,
+                       COUNT(DISTINCT frames.id) AS frame_count,
+                       COALESCE(MAX(frames.ts_ms), 0) AS last_frame_ms,
+                       COALESCE(MAX(transcript_segments.end_ms), 0) AS last_transcript_ms,
+                       COALESCE(MAX(questions.asked_at_ms), 0) AS last_question_ms
+                   FROM sessions
+                   LEFT JOIN frames ON frames.session_id = sessions.id
+                   LEFT JOIN transcript_segments
+                       ON transcript_segments.session_id = sessions.id
+                   LEFT JOIN questions ON questions.session_id = sessions.id
+                   GROUP BY sessions.id
+                   ORDER BY sessions.started_at_utc DESC, sessions.id"""
+            ).fetchall()
+        return [self._session_from_row(row) for row in rows]
+
+    def get_session(self, session_id: str) -> SessionRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT
+                       sessions.id,
+                       sessions.title,
+                       sessions.started_at_utc,
+                       sessions.ended_at_utc,
+                       sessions.status,
+                       (SELECT COUNT(*) FROM frames WHERE session_id = sessions.id) AS frame_count,
+                       COALESCE(
+                           (SELECT MAX(ts_ms) FROM frames WHERE session_id = sessions.id), 0
+                       ) AS last_frame_ms,
+                       COALESCE(
+                           (SELECT MAX(end_ms) FROM transcript_segments
+                            WHERE session_id = sessions.id), 0
+                       ) AS last_transcript_ms,
+                       COALESCE(
+                           (SELECT MAX(asked_at_ms) FROM questions
+                            WHERE session_id = sessions.id), 0
+                       ) AS last_question_ms
+                   FROM sessions WHERE sessions.id = ?""",
+                (session_id,),
+            ).fetchone()
+        return self._session_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _session_from_row(row: sqlite3.Row) -> SessionRecord:
+        stored_duration_ms = 0
+        if row["ended_at_utc"]:
+            started = datetime.fromisoformat(row["started_at_utc"])
+            ended = datetime.fromisoformat(row["ended_at_utc"])
+            stored_duration_ms = max(0, int((ended - started).total_seconds() * 1000))
+        duration_ms = max(
+            stored_duration_ms,
+            int(row["last_frame_ms"]),
+            int(row["last_transcript_ms"]),
+            int(row["last_question_ms"]),
+        )
+        return SessionRecord(
+            id=row["id"],
+            title=row["title"],
+            started_at_utc=row["started_at_utc"],
+            ended_at_utc=row["ended_at_utc"],
+            status=row["status"],
+            duration_ms=duration_ms,
+            frame_count=int(row["frame_count"]),
+        )
+
+    def timeline_frames(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineFrameRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, session_id, source_id, ts_ms, path, width, height
+                   FROM frames
+                   WHERE session_id = ? AND ts_ms BETWEEN ? AND ?
+                   ORDER BY ts_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [
+            TimelineFrameRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                source_id=row["source_id"],
+                ts_ms=row["ts_ms"],
+                path=Path(row["path"]),
+                width=row["width"],
+                height=row["height"],
+            )
+            for row in rows
+        ]
+
+    def timeline_transcripts(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineTranscriptRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, source, start_ms, end_ms, text
+                   FROM transcript_segments
+                   WHERE session_id = ? AND end_ms >= ? AND start_ms <= ?
+                   ORDER BY start_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [TimelineTranscriptRecord(**dict(row)) for row in rows]
 
     def add_audio_chunk(
         self, session_id: str, source: str, start_ms: int, end_ms: int, path: Path
