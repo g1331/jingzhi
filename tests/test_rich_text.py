@@ -36,7 +36,7 @@ def test_summary_is_formatted_as_readable_markdown() -> None:
 
     markdown = MainWindow._format_summary(result)
 
-    assert markdown.startswith("# 课后总结")
+    assert markdown.startswith("# 会话总结")
     assert "## 知识点" in markdown
     assert r"$\\epsilon$" in markdown
     assert "## 疑问与错题" in markdown

@@ -222,10 +222,10 @@ class MainWindow(QMainWindow):
         provider_layout.addWidget(hint, 2, 1, 1, 3)
         layout.addWidget(provider_group)
 
-        session_group = QGroupBox("学习会话")
+        session_group = QGroupBox("上下文会话")
         session_layout = QHBoxLayout(session_group)
-        self.title_input = QLineEdit("学习会话")
-        self.title_input.setPlaceholderText("本节课标题")
+        self.title_input = QLineEdit("新会话")
+        self.title_input.setPlaceholderText("为这次记录命名")
         self.system_audio_check = QCheckBox("系统声音")
         self.system_audio_check.setChecked(self.manager.settings.capture_system_audio)
         self.microphone_check = QCheckBox("麦克风")
@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("结束")
         self.stop_button.setProperty("role", "danger")
         self.stop_button.setEnabled(False)
-        self.summary_button = QPushButton("生成课后总结")
+        self.summary_button = QPushButton("生成会话总结")
         session_layout.addWidget(QLabel("标题"))
         session_layout.addWidget(self.title_input, 1)
         session_layout.addWidget(self.system_audio_check)
@@ -291,13 +291,13 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(12, 10, 12, 12)
         question_row = QHBoxLayout()
         self.question = QLineEdit()
-        self.question.setPlaceholderText("例如：老师刚才为什么要这样换元？")
+        self.question.setPlaceholderText("例如：刚才这个结论是怎么得到的？")
         self.ask_button = QPushButton("提问")
         self.ask_button.setProperty("role", "primary")
         question_row.addWidget(self.question, 1)
         question_row.addWidget(self.ask_button)
         answer_header = QHBoxLayout()
-        heading = QLabel("回答与课后材料")
+        heading = QLabel("回答与会话材料")
         heading.setObjectName("sectionTitle")
         self.output_source_button = QPushButton("查看原文")
         self.output_source_button.setProperty("role", "quiet")
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_summary(result: dict) -> str:
-        lines = ["# 课后总结", "", str(result.get("summary") or "暂无课程摘要。")]
+        lines = ["# 会话总结", "", str(result.get("summary") or "暂无会话摘要。")]
         knowledge_points = result.get("knowledge_points")
         lines.extend(["", "## 知识点"])
         if isinstance(knowledge_points, list) and knowledge_points:
@@ -481,7 +481,7 @@ class MainWindow(QMainWindow):
         if not self._configure_provider_from_form():
             return
         self.summary_button.setEnabled(False)
-        self.output.set_markdown("_正在生成课后总结…_")
+        self.output.set_markdown("_正在生成会话总结…_")
 
         def work() -> None:
             try:

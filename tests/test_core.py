@@ -8,7 +8,7 @@ from jingzhi.capture.audio import _prepare_mono_audio
 from jingzhi.capture.screen import average_hash
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import Database
-from jingzhi.llm import OpenAIStudyModel, ProviderRequestError
+from jingzhi.llm import OpenAIContextModel, ProviderRequestError
 
 
 def test_average_hash_distinguishes_opposite_images() -> None:
@@ -77,7 +77,7 @@ def test_provider_api_modes_route_without_network(monkeypatch, api_mode: str) ->
         responses=FakeResponses(),
         chat=SimpleNamespace(completions=FakeCompletions()),
     )
-    model = OpenAIStudyModel(
+    model = OpenAIContextModel(
         "vision-model",
         api_key="secret",
         base_url="https://provider.example/v1/",
@@ -99,7 +99,7 @@ def test_provider_html_response_becomes_concise_error(monkeypatch) -> None:
             raise RuntimeError("<!DOCTYPE html><html>" + "wide-content" * 1_000 + "</html>")
 
     client = SimpleNamespace(responses=HtmlResponses())
-    model = OpenAIStudyModel(
+    model = OpenAIContextModel(
         "vision-model",
         api_key="secret",
         base_url="https://provider.example/api/proxy",

@@ -12,7 +12,7 @@ from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
 from jingzhi.context import ContextAssembler
 from jingzhi.database import Database
-from jingzhi.llm import OpenAIStudyModel
+from jingzhi.llm import OpenAIContextModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
 from jingzhi.transcribe import TranscriptionWorker
 
@@ -53,8 +53,8 @@ class SessionManager:
         self.llm_api_key = api_key.strip()
         self.llm_api_mode = api_mode
 
-    def _study_model(self) -> OpenAIStudyModel:
-        return OpenAIStudyModel(
+    def _context_model(self) -> OpenAIContextModel:
+        return OpenAIContextModel(
             self.llm_model,
             api_key=self.llm_api_key,
             base_url=self.llm_base_url,
@@ -151,7 +151,7 @@ class SessionManager:
         return session_id
 
     def test_provider(self) -> str:
-        return self._study_model().test_connection()
+        return self._context_model().test_connection()
 
     def stop(self) -> str | None:
         if not self.is_recording:
@@ -182,7 +182,7 @@ class SessionManager:
             raise RuntimeError("Start a study session before asking a question")
         asked_at_ms = self.clock.now_ms()
         context = ContextAssembler(self.database).around_question(self.session_id, asked_at_ms)
-        model = self._study_model()
+        model = self._context_model()
         try:
             answer = model.answer(question, context)
             self.database.add_question(
@@ -215,7 +215,7 @@ class SessionManager:
         )
         if not transcript:
             raise RuntimeError("No transcript is available yet")
-        result = self._study_model().summarize(transcript)
+        result = self._context_model().summarize(transcript)
         created_at = datetime.now(UTC).isoformat()
         for kind in ("summary", "knowledge_points", "mistakes"):
             self.database.add_artifact(

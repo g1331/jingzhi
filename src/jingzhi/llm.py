@@ -13,7 +13,7 @@ class ProviderRequestError(RuntimeError):
     """A concise, user-facing provider request failure."""
 
 
-class OpenAIStudyModel:
+class OpenAIContextModel:
     def __init__(
         self,
         model: str,
@@ -76,7 +76,7 @@ class OpenAIStudyModel:
 
     @staticmethod
     def _chat_image_part(path: Path) -> dict[str, Any]:
-        image = OpenAIStudyModel._image_part(path)
+        image = OpenAIContextModel._image_part(path)
         return {"type": "image_url", "image_url": {"url": image["image_url"]}}
 
     @staticmethod
@@ -96,8 +96,8 @@ class OpenAIStudyModel:
             {
                 "type": "input_text",
                 "text": (
-                    "你是学习辅导助手。只能依据提供的课程字幕和截图回答；如果依据不足，"
-                    "明确说明缺少什么。引用关键字幕时标注相对课程开始的秒数。\n\n"
+                    "你是桌面上下文助手。只能依据提供的会话字幕和截图回答；如果依据不足，"
+                    "明确说明缺少什么。引用关键字幕时标注相对会话开始的秒数。\n\n"
                     f"问题：{question}\n\n字幕：\n{context.transcript or '（当前没有字幕）'}"
                 ),
             }
@@ -144,7 +144,7 @@ class OpenAIStudyModel:
 
     def summarize(self, transcript: str) -> dict[str, Any]:
         prompt = (
-            "根据课程字幕生成严格 JSON，不要使用 Markdown 代码块。结构必须是："
+            "根据会话字幕生成严格 JSON，不要使用 Markdown 代码块。结构必须是："
             '{"summary":"...","knowledge_points":[{"name":"...","explanation":"...",'
             '"evidence_time_s":0}],"mistakes":[{"issue":"...","correction":"...",'
             '"evidence_time_s":0,"confidence":"high|medium|low"}]。'
