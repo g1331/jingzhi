@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;"
+    />
+    <title>境织工作台视觉原型</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main id="app" aria-live="polite"></main>
+    <nav class="prototype-switcher" aria-label="原型方案切换">
+      <button type="button" data-variant-step="-1" aria-label="上一个方案">←</button>
+      <div>
+        <span class="prototype-kicker">PROTOTYPE</span>
+        <strong id="variant-label">A</strong>
+      </div>
+      <button type="button" data-variant-step="1" aria-label="下一个方案">→</button>
+    </nav>
+    <script src="app.js"></script>
+  </body>
+</html>
