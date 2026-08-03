@@ -1,4 +1,3 @@
-
 from jingzhi.rich_text import ASSET_ROOT, RENDERER_PATH
 from jingzhi.ui import MainWindow
 

@@ -36,9 +36,7 @@ class LocalOnlyPage(QWebEnginePage):
             return False
         return True
 
-    def createWindow(
-        self, window_type: QWebEnginePage.WebWindowType
-    ) -> QWebEnginePage | None:
+    def createWindow(self, window_type: QWebEnginePage.WebWindowType) -> QWebEnginePage | None:
         del window_type
         return None
 
@@ -55,9 +53,7 @@ class MarkdownWebView(QWebEngineView):
         self.setPage(page)
         settings = self.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-        settings.setAttribute(
-            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
-        )
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False
         )
