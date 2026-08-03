@@ -6,7 +6,18 @@ build-backend = "hatchling.build"
 name = "jingzhi"
 version = "0.1.0"
 description = "Local-first multimodal desktop context companion"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<3.14"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "faster-whisper>=1.2,<2",
   "keyring>=25.7,<26",
@@ -25,6 +36,10 @@ dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
 
 [project.scripts]
 jingzhi = "jingzhi.main:main"
+
+[project.urls]
+Repository = "https://github.com/g1331/jingzhi"
+Issues = "https://github.com/g1331/jingzhi/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jingzhi"]

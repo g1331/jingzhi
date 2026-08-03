@@ -27,9 +27,7 @@ class RecordingAnswerModel:
 
 def add_transcript(database: Database, session_id: str, path: Path, text: str) -> int:
     chunk_id = database.add_audio_chunk(session_id, "system", 1_000, 2_000, path)
-    return database.add_transcript(
-        session_id, chunk_id, "system", 1_000, 2_000, text, "zh", 0.9
-    )
+    return database.add_transcript(session_id, chunk_id, "system", 1_000, 2_000, text, "zh", 0.9)
 
 
 def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
@@ -42,9 +40,7 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     frame_id = database.add_frame(
         session_id, 1_500, existing_frame, "0" * 64, (100, 100), source_id="display:2"
     )
-    database.add_frame(
-        session_id, 1_700, tmp_path / "missing.webp", "1" * 64, (100, 100)
-    )
+    database.add_frame(session_id, 1_700, tmp_path / "missing.webp", "1" * 64, (100, 100))
     segment_id = add_transcript(database, session_id, tmp_path / "audio.wav", "原始字幕")
     original_version_id = database.transcript_versions(segment_id)[0].id
     model = RecordingAnswerModel()
@@ -109,9 +105,7 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     assert database.answer_evidence(first.id)[0].content_text == "原始字幕"
 
 
-def test_question_anchor_is_fixed_before_user_finishes_typing(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_question_anchor_is_fixed_before_user_finishes_typing(monkeypatch, tmp_path: Path) -> None:
     manager = SessionManager(Settings(data_dir=tmp_path))
     session_id = manager.database.create_session("test", "2026-01-01T00:00:00+00:00")
     times = iter((1_000, 9_000))
@@ -133,9 +127,7 @@ def test_question_anchor_is_fixed_before_user_finishes_typing(
     assert question.asked_at_ms == 1_000
 
 
-def test_failed_request_remains_the_current_reanswer_target(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_failed_request_remains_the_current_reanswer_target(monkeypatch, tmp_path: Path) -> None:
     manager = SessionManager(Settings(data_dir=tmp_path))
     session_id = manager.database.create_session("test", "2026-01-01T00:00:00+00:00")
     manager.session_id = session_id
@@ -158,9 +150,7 @@ def test_failed_request_remains_the_current_reanswer_target(
     assert manager.last_question_id == manager.database.latest_question_id(session_id)
 
 
-def test_reanswer_persisted_question_after_application_restart(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reanswer_persisted_question_after_application_restart(monkeypatch, tmp_path: Path) -> None:
     database = Database(tmp_path / "jingzhi.sqlite3")
     session_id = database.create_session("test", "2026-01-01T00:00:00+00:00")
     first_service = QuestionAnsweringService(
@@ -181,7 +171,9 @@ def test_reanswer_persisted_question_after_application_restart(
     answer = restarted.reanswer_question(first.question_id)
 
     assert answer == "answer 1"
-    assert [item.version_number for item in restarted.database.answer_versions(first.question_id)] == [
+    assert [
+        item.version_number for item in restarted.database.answer_versions(first.question_id)
+    ] == [
         1,
         2,
     ]

@@ -1,5 +1,8 @@
 # 境织 · JINGZHI
 
+[![CI](https://github.com/g1331/jingzhi/actions/workflows/ci.yml/badge.svg)](https://github.com/g1331/jingzhi/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 境织是一款 Windows 优先、Python 实现、本地优先的桌面上下文助手。它把屏幕、声音和时间线组织成可回看、可追问的上下文，适用于学习、会议、办公、资料研究和技术排障。当前版本验证最关键的闭环：
 
 1. 持续采集屏幕，但仅保存发生明显变化的关键帧；
@@ -71,9 +74,12 @@
 | `sessions` | `id`, `started_at_utc`, `status` | 一次学习、会议或工作会话 |
 | `frames` | `session_id`, `ts_ms`, `path`, `perceptual_hash` | 关键帧及其相对时间 |
 | `audio_chunks` | `source`, `start_ms`, `end_ms`, `state` | 系统音频/麦克风分块及处理状态 |
-| `transcript_segments` | `source`, `start_ms`, `end_ms`, `text` | 与音频块对齐的字幕 |
+| `transcript_segments` | `source`, `start_ms`, `end_ms`, `text` | 与音频块对齐的字幕片段 |
+| `transcript_versions` | `segment_id`, `kind`, `text`, `active` | 原始识别、模型校订和用户编辑版本 |
 | `transcript_fts` | `segment_id`, `text` | 后续全局关键词检索入口 |
-| `questions` | `asked_at_ms`, `context_start_ms`, `answer` | 问题、答案及使用的时间窗口 |
+| `questions` | `asked_at_ms`, `context_start_ms`, `context_end_ms` | 问题及固定的问题锚点范围 |
+| `answer_versions` | `question_id`, `version_number`, `model`, `request_status` | 不可变的回答版本和实际请求结果 |
+| `answer_evidence` | `stable_id`, `transcript_version_id`, `frame_id` | 模型实际使用的字幕版本和关键帧 |
 | `artifacts` | `kind`, `content_json`, `model` | 总结、知识点和错误提取结果 |
 
 时间对齐只使用 `time.monotonic_ns()` 派生的 `ts_ms`。UTC 时间仅用于展示和跨会话排序。这样即使系统校时或用户修改时间，字幕与截图也不会错位。
@@ -95,7 +101,7 @@
 - 屏幕、音频、字幕和数据库均保存在本机；
 - 只有用户主动提问或生成总结时才调用云模型；
 - 提问只上传选中的关键帧和时间窗口字幕，不上传整段录屏或音频；
-- API 密钥可从界面或环境变量提供，只保存在当前进程内存中，不写入数据库或配置文件；
+- API 密钥可从界面或环境变量提供；保存配置时写入 Windows 凭据管理器，不以明文写入项目配置或 SQLite；
 - 正式版本必须增加排除应用/窗口列表，并默认排除密码管理器、隐私窗口、通知中心和指定浏览器标签；
 - 必须提供明显的录制状态、暂停快捷键和“立即删除本次会话”；
 - 删除功能需要同时清理媒体文件、普通表、FTS 影子表及备份，并说明 SQLite 删除后的取证残留风险；高敏感场景应使用整盘加密或每会话加密容器。
@@ -133,11 +139,17 @@ $env:WHISPER_DEVICE = "cuda"
 $env:WHISPER_COMPUTE_TYPE = "float16"
 ```
 
-执行核心测试：
+执行完整工程检查：
 
 ```powershell
-uv run pytest
+uv lock --check
+uv run ruff format --check src tests
+uv run ruff check src tests
+uv run pytest -q
+uv build
 ```
+
+提交和 Pull Request 约定见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。安全问题报告方式见 [`SECURITY.md`](SECURITY.md)。本项目采用 [MIT License](LICENSE)。
 
 ## 分阶段开发计划
 
@@ -191,5 +203,5 @@ uv run pytest
 - `faster-whisper` 首次下载模型需要网络，CPU 上的 `small` 模型未必能在所有电脑上达到实时速度。
 - SoundCard 官方列出了若干 Windows/WASAPI 已知问题，必须在目标声卡上实测；生产版本应保存设备 ID，不应永久依赖默认设备。
 - 课后总结一次提交全部字幕，长课程可能超过模型上下文。下一步应实现章节级 map-reduce，并保留每段摘要到原字幕的映射。
-- 目前没有保存模型请求中实际采用的 frame ID 列表，只保存时间窗口。正式审计和可复现回答需要新增 `question_context_items` 关联表。
+- 问答已经保存模型实际使用的关键帧和字幕版本；回答区域尚未完整展示和定位这些证据，后续界面必须直接读取持久化关联而不是重新推断。
 - 应用退出时会等待剩余转写完成，长队列可能导致退出较慢。正式版本应将任务状态持久化并允许后台续跑。
