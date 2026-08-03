@@ -221,6 +221,204 @@ def test_session_selection_thumbnail_zoom_and_detail_switching(tmp_path: Path) -
     window.close()
 
 
+def test_answer_selection_updates_exact_evidence_across_zoom_and_unavailable_history(
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "answer-selection.sqlite3")
+    session_id = database.create_session("问答证据", "2026-08-03T09:00:00+00:00")
+
+    frame_ids: list[int] = []
+    transcript_ids: list[int] = []
+    transcript_version_ids: list[int] = []
+    for index, ts_ms in enumerate((15_000, 320_000), start=1):
+        image_path = tmp_path / f"answer-frame-{index}.webp"
+        Image.new("RGB", (320, 180), "white" if index == 1 else "navy").save(image_path)
+        frame_ids.append(
+            database.add_frame(
+                session_id,
+                ts_ms,
+                image_path,
+                f"answer-hash-{index}",
+                (320, 180),
+                source_id=f"display:{index}",
+            )
+        )
+        chunk_id = database.add_audio_chunk(
+            session_id,
+            "system",
+            ts_ms,
+            ts_ms + 8_000,
+            tmp_path / f"answer-audio-{index}.flac",
+        )
+        transcript_id = database.add_transcript(
+            session_id,
+            chunk_id,
+            "system",
+            ts_ms + 1_000,
+            ts_ms + 6_000,
+            f"回答 {index} 使用的原始字幕",
+            "zh",
+            0.9,
+        )
+        transcript_ids.append(transcript_id)
+        transcript_version_ids.append(database.transcript_versions(transcript_id)[0].id)
+
+    question_ids: list[int] = []
+
+    answer_ids: list[int] = []
+    for index in range(2):
+        question_id = database.create_question(
+            session_id,
+            25_000 + index * 310_000,
+            f"第 {index + 1} 个问题",
+            0,
+            25_000 + index * 310_000,
+        )
+        question_ids.append(question_id)
+
+        answer = database.record_answer_version(
+            question_id,
+            model="answer-model",
+            connection_json=None,
+            request_status="succeeded",
+            request_id=None,
+            answer=f"第 {index + 1} 个回答",
+            error=None,
+            evidence_state="exact",
+            evidence=[
+                {
+                    "stable_id": f"transcript-version:{transcript_version_ids[index]}",
+                    "kind": "transcript",
+                    "source": "system",
+                    "start_ms": 16_000 + index * 305_000,
+                    "end_ms": 21_000 + index * 305_000,
+                    "transcript_version_id": transcript_version_ids[index],
+                    "content_text": f"回答 {index + 1} 使用的原始字幕",
+                },
+                {
+                    "stable_id": f"frame:{frame_ids[index]}",
+                    "kind": "frame",
+                    "source": f"display:{index + 1}",
+                    "start_ms": 15_000 + index * 305_000,
+                    "end_ms": 15_000 + index * 305_000,
+                    "frame_id": frame_ids[index],
+                    "resource_path": str(tmp_path / f"answer-frame-{index + 1}.webp"),
+                },
+            ],
+        )
+        answer_ids.append(answer.id)
+
+    legacy_question_id = database.create_question(session_id, 350_000, "历史问题", 340_000, 350_000)
+    unavailable = database.record_answer_version(
+        legacy_question_id,
+        model=None,
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="历史回答",
+        error=None,
+        evidence_state="unavailable",
+        evidence=[],
+    )
+    database.add_transcript_version(
+        transcript_ids[0], "user_edit", "后来编辑但不应替代旧回答证据的字幕"
+    )
+    database.finish_session(session_id, "2026-08-03T09:06:00+00:00", "complete")
+
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+
+    selector = window.findChild(QComboBox, "answerSelector")
+    status = window.findChild(QLabel, "answerEvidenceStatus")
+    assert selector is not None and status is not None
+    assert selector.count() == 3
+
+    selector.setCurrentIndex(selector.findData(answer_ids[0]))
+    application.processEvents()
+    first_frame = window.findChild(QPushButton, f"keyframe-{frame_ids[0]}")
+    second_frame = window.findChild(QPushButton, f"keyframe-{frame_ids[1]}")
+    first_transcript = window.findChild(QPushButton, f"transcript-{transcript_ids[0]}")
+    second_transcript = window.findChild(QPushButton, f"transcript-{transcript_ids[1]}")
+    assert first_frame.property("cited") is True
+    assert first_transcript.property("cited") is True
+    assert second_frame.property("cited") is False
+    assert second_transcript.property("cited") is False
+    assert "回答 1 使用的原始字幕" in first_transcript.text()
+    assert status.property("state") == "exact"
+
+    selector.setCurrentIndex(selector.findData(answer_ids[1]))
+    application.processEvents()
+    first_frame = window.findChild(QPushButton, f"keyframe-{frame_ids[0]}")
+    second_frame = window.findChild(QPushButton, f"keyframe-{frame_ids[1]}")
+    assert first_frame.property("cited") is False
+    assert second_frame.property("cited") is True
+    first_transcript = window.findChild(QPushButton, f"transcript-{transcript_ids[0]}")
+    second_transcript = window.findChild(QPushButton, f"transcript-{transcript_ids[1]}")
+    assert first_transcript.property("cited") is False
+    assert second_transcript.property("cited") is True
+
+    window.findChild(QPushButton, "zoom-1-minute").click()
+    application.processEvents()
+    assert window.findChild(QPushButton, f"keyframe-{frame_ids[0]}").property("cited") is False
+    assert (
+        window.findChild(QPushButton, f"transcript-{transcript_ids[0]}").property("cited") is False
+    )
+
+    navigator = window.findChild(QSlider, "timelineNavigator")
+    navigator.setValue(300)
+    application.processEvents()
+    assert window.findChild(QPushButton, f"keyframe-{frame_ids[1]}").property("cited") is True
+    second_transcript = window.findChild(QPushButton, f"transcript-{transcript_ids[1]}")
+    assert second_transcript.property("cited") is True
+    assert "回答 2 使用的原始字幕" in second_transcript.text()
+
+    selector = window.findChild(QComboBox, "answerSelector")
+    selector.setCurrentIndex(selector.findData(unavailable.id))
+    application.processEvents()
+    assert all(button.property("cited") is False for button in _frame_buttons(window))
+    visible_transcripts = [
+        button
+        for button in window.findChildren(QPushButton)
+        if button.objectName().startswith("transcript-")
+    ]
+    assert all(button.property("cited") is False for button in visible_transcripts)
+
+    assert status.property("state") == "unavailable"
+    assert "不可恢复" in status.text()
+
+    new_answer = database.record_answer_version(
+        question_ids[0],
+        model="answer-model",
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="刚完成的回答",
+        error=None,
+        evidence_state="exact",
+        evidence=[
+            {
+                "stable_id": f"frame:{frame_ids[1]}",
+                "kind": "frame",
+                "source": "display:2",
+                "start_ms": 320_000,
+                "end_ms": 320_000,
+                "frame_id": frame_ids[1],
+                "resource_path": str(tmp_path / "answer-frame-2.webp"),
+            }
+        ],
+    )
+    window._show_answer(question_ids[0], "刚完成的回答")
+
+    application.processEvents()
+    assert selector.count() == 4
+    assert selector.currentData() == new_answer.id
+    assert window.findChild(QPushButton, f"keyframe-{frame_ids[1]}").property("cited") is True
+    window.close()
+
+
 def test_transcript_detail_supports_diff_undo_and_user_edit(tmp_path: Path, monkeypatch) -> None:
     application = QApplication.instance() or QApplication([])
     database = Database(tmp_path / "versions.sqlite3")
@@ -451,7 +649,7 @@ def test_quick_question_controls_range_cancel_voice_and_manual_speech(
     assert recorder.voice_finished == 1
     assert window.question.text() == "语音转成的可编辑问题"
 
-    window._show_answer("这是默认静音的回答")
+    window._show_answer(41, "这是默认静音的回答")
     assert spoken == []
     window.speak_button.click()
     assert spoken == ["这是默认静音的回答"]

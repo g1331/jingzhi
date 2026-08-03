@@ -10,6 +10,7 @@ from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import (
     AnswerVersionRecord,
     Database,
+    SessionAnswerRecord,
     SessionRecord,
     TimelineFrameRecord,
     TimelineQuestionRecord,
@@ -175,6 +176,8 @@ class SessionTimeline:
     window_end_ms: int
     answer_frame_ids: frozenset[int] = frozenset()
     answer_transcript_ids: frozenset[int] = frozenset()
+    selected_answer_id: int | None = None
+    answer_evidence_state: str | None = None
 
 
 class JingzhiApplicationService:
@@ -240,6 +243,7 @@ class JingzhiApplicationService:
         *,
         window_start_ms: int = 0,
         window_duration_ms: int | None = None,
+        answer_version_id: int | None = None,
     ) -> SessionTimeline:
         session = self.database.get_session(session_id)
         if session is None:
@@ -252,14 +256,56 @@ class JingzhiApplicationService:
             maximum_start_ms = max(0, duration_ms - window_duration_ms)
             start_ms = min(max(0, window_start_ms), maximum_start_ms)
             end_ms = min(duration_ms, start_ms + window_duration_ms)
+
+        selected_answer = None
+        if answer_version_id is not None:
+            selected_answer = next(
+                (
+                    answer
+                    for answer in self.database.session_answers(session_id)
+                    if answer.id == answer_version_id
+                ),
+                None,
+            )
+            if selected_answer is None:
+                raise KeyError(f"Unknown answer version for session: {answer_version_id}")
+
+        transcripts = self._timeline_transcripts(session_id, start_ms, end_ms)
+        answer_frame_ids: frozenset[int] = frozenset()
+        answer_transcript_ids: frozenset[int] = frozenset()
+        if selected_answer is not None and selected_answer.evidence_state == "exact":
+            evidence = self.database.answer_evidence(selected_answer.id)
+            answer_frame_ids = frozenset(
+                item.frame_id
+                for item in evidence
+                if item.kind == "frame" and item.frame_id is not None
+            )
+            version_ids = tuple(
+                item.transcript_version_id
+                for item in evidence
+                if item.kind == "transcript" and item.transcript_version_id is not None
+            )
+            cited_transcripts = self.database.timeline_transcript_versions(
+                session_id, version_ids, start_ms, end_ms
+            )
+            cited_by_segment = {item.id: item for item in cited_transcripts}
+            transcripts = [cited_by_segment.get(item.id, item) for item in transcripts]
+            answer_transcript_ids = frozenset(cited_by_segment)
+
         return SessionTimeline(
             session=session,
             frames=tuple(self.database.timeline_frames(session_id, start_ms, end_ms)),
-            transcripts=tuple(self._timeline_transcripts(session_id, start_ms, end_ms)),
+            transcripts=tuple(transcripts),
             questions=tuple(self.database.timeline_questions(session_id, start_ms, end_ms)),
             duration_ms=duration_ms,
             window_start_ms=start_ms,
             window_end_ms=end_ms,
+            answer_frame_ids=answer_frame_ids,
+            answer_transcript_ids=answer_transcript_ids,
+            selected_answer_id=selected_answer.id if selected_answer is not None else None,
+            answer_evidence_state=(
+                selected_answer.evidence_state if selected_answer is not None else None
+            ),
         )
 
     def _timeline_transcripts(
@@ -298,6 +344,9 @@ class JingzhiApplicationService:
 
     def transcript_correction_settings(self, session_id: str) -> TranscriptCorrectionSettingsRecord:
         return self.database.transcript_correction_settings(session_id)
+
+    def session_answers(self, session_id: str) -> list[SessionAnswerRecord]:
+        return self.database.session_answers(session_id)
 
     def edit_transcript(self, segment_id: int, text: str) -> int:
         version_id = self.database.add_transcript_version(segment_id, "user_edit", text)

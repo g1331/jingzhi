@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 
 from jingzhi.application import JingzhiApplicationService, SessionTimeline
 from jingzhi.config import Settings
-from jingzhi.database import TimelineFrameRecord, TimelineTranscriptRecord
+from jingzhi.database import SessionAnswerRecord, TimelineFrameRecord, TimelineTranscriptRecord
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
@@ -244,6 +244,14 @@ QFrame#recordingCapsule {
 }
 QLabel#evidenceImage { background: #edeae1; border: 1px solid #374442; }
 QLabel#evidenceMetadata { color: #92a29c; font-size: 11px; }
+QLabel#answerEvidenceStatus {
+    color: #9ee7ca; background: #142a23; border: 1px solid #295b4b;
+    border-radius: 6px; padding: 5px 8px; font-size: 11px;
+}
+QLabel#answerEvidenceStatus[state="unavailable"] {
+    color: #f2d49d; background: #2b2316; border-color: #765522;
+}
+
 QLabel#emptyState { color: #71827c; font-size: 12px; }
 """
 
@@ -252,7 +260,8 @@ class UiBridge(QObject):
     segment = Signal(int, int, str, str)
     worker_warning = Signal(str)
     action_error = Signal(str)
-    answer = Signal(str)
+    answer = Signal(int, str)
+
     voice_transcript = Signal(int, str)
     voice_error = Signal(int, str)
     summary = Signal(str)
@@ -299,6 +308,9 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self._selected_session_id: str | None = None
         self._reanswer_question_id: int | None = None
+        self._selected_answer_version_id: int | None = None
+        self._answers_by_id: dict[int, SessionAnswerRecord] = {}
+
         self._selected_frame: TimelineFrameRecord | None = None
         self._selected_transcript: TimelineTranscriptRecord | None = None
         self._timeline: SessionTimeline | None = None
@@ -307,6 +319,8 @@ class MainWindow(QMainWindow):
         self._paused = False
         self._question_active = False
         self._question_generation = 0
+        self._active_question_id: int | None = None
+
         self._last_answer = ""
         self._speech: QTextToSpeech | None = None
         self._animations_enabled = motion_enabled()
@@ -704,6 +718,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         session_id = str(item.data(Qt.ItemDataRole.UserRole))
+        session_changed = session_id != self._selected_session_id
         self._selected_session_id = session_id
         correction_settings = self.service.transcript_correction_settings(session_id)
         self.correction_check.blockSignals(True)
@@ -715,12 +730,20 @@ class MainWindow(QMainWindow):
         self.correction_window_input.setCurrentIndex(max(0, correction_index))
         self.correction_check.blockSignals(False)
         self.correction_window_input.blockSignals(False)
+
+        answers = self.service.session_answers(session_id)
+        self._answers_by_id = {answer.id: answer for answer in answers}
+        if session_changed or self._selected_answer_version_id not in self._answers_by_id:
+            self._selected_answer_version_id = answers[-1].id if answers else None
+        self._populate_answer_selector(answers)
+
         window_duration = self.ZOOM_WINDOWS[self._zoom_key]
         try:
             timeline = self.service.open_session(
                 session_id,
                 window_start_ms=self._window_start_ms,
                 window_duration_ms=window_duration,
+                answer_version_id=self._selected_answer_version_id,
             )
         except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
             self._show_action_error(str(exc))
@@ -729,7 +752,61 @@ class MainWindow(QMainWindow):
         self._selected_frame = None
         self._selected_transcript = None
         self._render_timeline(timeline)
+        self._show_selected_answer(timeline)
         self._refresh_reanswer_target()
+
+    def _populate_answer_selector(self, answers: list[SessionAnswerRecord]) -> None:
+        self.answer_selector.blockSignals(True)
+        self.answer_selector.clear()
+        for answer in answers:
+            self.answer_selector.addItem(
+                f"{self._format_time(answer.asked_at_ms)} · {answer.question}"
+                f" · 回答 {answer.version_number}",
+                answer.id,
+            )
+        selected_index = self.answer_selector.findData(self._selected_answer_version_id)
+        self.answer_selector.setCurrentIndex(selected_index)
+        self.answer_selector.setEnabled(bool(answers))
+        self.answer_selector.blockSignals(False)
+
+    def _show_selected_answer(self, timeline: SessionTimeline) -> None:
+        answer = self._answers_by_id.get(timeline.selected_answer_id or -1)
+        if answer is None:
+            self.answer_evidence_status.hide()
+            self.output.set_markdown("")
+            self._last_answer = ""
+            self.speak_button.setEnabled(False)
+            return
+
+        if timeline.answer_evidence_state == "unavailable":
+            self.answer_evidence_status.setText(
+                "此历史回答的精确证据不可恢复；未按问题时间范围推测引用。"
+            )
+            evidence_state = "unavailable"
+        else:
+            self.answer_evidence_status.setText(
+                "已在时间线上高亮此回答实际引用的关键帧和字幕版本。"
+            )
+            evidence_state = "exact"
+        self.answer_evidence_status.setProperty("state", evidence_state)
+        self.answer_evidence_status.style().unpolish(self.answer_evidence_status)
+        self.answer_evidence_status.style().polish(self.answer_evidence_status)
+        self.answer_evidence_status.show()
+
+        content = answer.answer or (
+            f"请求失败：{answer.error}" if answer.error else "此回答没有内容。"
+        )
+        self._last_answer = content
+        self.output.set_markdown(content)
+        self.speak_button.setEnabled(bool(answer.answer and answer.answer.strip()))
+
+    @Slot()
+    def _select_answer(self) -> None:
+        answer_id = self.answer_selector.currentData()
+        self._selected_answer_version_id = int(answer_id) if answer_id is not None else None
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
 
     def _select_session_item(self, item: QListWidgetItem | None) -> None:
         self._window_start_ms = 0
@@ -1019,6 +1096,19 @@ class MainWindow(QMainWindow):
         question_row.addWidget(self.voice_button)
         question_row.addWidget(self.cancel_question_button)
         question_row.addWidget(self.ask_button)
+        answer_selection_row = QHBoxLayout()
+        answer_selection_label = QLabel("选择问答")
+        answer_selection_label.setObjectName("trackLabel")
+        self.answer_selector = QComboBox()
+        self.answer_selector.setObjectName("answerSelector")
+        self.answer_selector.setEnabled(False)
+        self.answer_evidence_status = QLabel()
+        self.answer_evidence_status.setObjectName("answerEvidenceStatus")
+        self.answer_evidence_status.hide()
+        answer_selection_row.addWidget(answer_selection_label)
+        answer_selection_row.addWidget(self.answer_selector, 1)
+        answer_selection_row.addWidget(self.answer_evidence_status, 2)
+
         answer_header = QHBoxLayout()
         heading = QLabel("回答与会话材料")
         heading.setObjectName("sectionTitle")
@@ -1040,6 +1130,8 @@ class MainWindow(QMainWindow):
         answer_header.addWidget(self.copy_output_button)
         self.output = MarkdownDocument()
         panel_layout.addLayout(question_row)
+        panel_layout.addLayout(answer_selection_row)
+
         panel_layout.addLayout(answer_header)
         panel_layout.addWidget(self.output, 1)
         return panel
@@ -1054,6 +1146,8 @@ class MainWindow(QMainWindow):
         self.capsule_ask_button.clicked.connect(self._focus_question)
         self.ask_button.clicked.connect(self._ask)
         self.reanswer_button.clicked.connect(self._reanswer)
+        self.answer_selector.currentIndexChanged.connect(self._select_answer)
+
         self.question.focused.connect(self._capture_question_anchor)
         self.question.returnPressed.connect(self._ask)
         self.question_range.currentIndexChanged.connect(self._change_question_range)
@@ -1239,9 +1333,13 @@ class MainWindow(QMainWindow):
             self._open_session_item(current)
 
     def _refresh_reanswer_target(self) -> None:
-        self._reanswer_question_id = None
-        if self._selected_session_id is not None:
+        selected_answer = self._answers_by_id.get(self._selected_answer_version_id or -1)
+        if selected_answer is not None:
+            self._reanswer_question_id = selected_answer.question_id
+        elif self._selected_session_id is not None:
             self._reanswer_question_id = self.service.latest_question_id(self._selected_session_id)
+        else:
+            self._reanswer_question_id = None
         self.reanswer_button.setEnabled(
             self._reanswer_question_id is not None
             and callable(getattr(self.manager, "reanswer_question", None))
@@ -1251,7 +1349,9 @@ class MainWindow(QMainWindow):
     def _capture_question_anchor(self) -> None:
         was_active = self._question_active
         try:
-            self.service.begin_question(int(self.question_range.currentData()))
+            self._active_question_id = self.service.begin_question(
+                int(self.question_range.currentData())
+            )
         except Exception as exc:  # noqa: BLE001 - UI boundary surfaces invalid session state
             self._show_action_error(str(exc))
             return
@@ -1283,6 +1383,8 @@ class MainWindow(QMainWindow):
             self._show_action_error(str(exc))
             return
         self._question_active = False
+        self._active_question_id = None
+
         self._question_generation += 1
         self.question.clear()
         self.voice_button.setEnabled(True)
@@ -1401,9 +1503,11 @@ class MainWindow(QMainWindow):
             return
         if not self._question_active:
             self._capture_question_anchor()
-        if not self._question_active:
+        question_id = self._active_question_id
+        if not self._question_active or question_id is None:
             return
         self._question_active = False
+        self._active_question_id = None
         self.ask_button.setEnabled(False)
         self.output.set_markdown("_正在结合字幕和关键画面回答…_")
 
@@ -1413,7 +1517,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
-                self.bridge.answer.emit(result)
+                self.bridge.answer.emit(question_id, result)
 
         threading.Thread(target=work, name="answer-question", daemon=True).start()
 
@@ -1432,7 +1536,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
-                self.bridge.answer.emit(result)
+                self.bridge.answer.emit(question_id, result)
 
         threading.Thread(target=work, name="reanswer-question", daemon=True).start()
 
@@ -1492,13 +1596,29 @@ class MainWindow(QMainWindow):
         self.voice_button.setEnabled(True)
         self.voice_button.setText("按住说话")
 
-    @Slot(str)
-    def _show_answer(self, answer: str) -> None:
+    @Slot(int, str)
+    def _show_answer(self, question_id: int, answer: str) -> None:
         self._last_answer = answer
         self.output.set_markdown(answer)
         self.ask_button.setEnabled(True)
         self.speak_button.setEnabled(bool(answer.strip()))
-        self._refresh_reanswer_target()
+        current = self.session_library.currentItem()
+        if self._selected_session_id is not None:
+            completed_answers = [
+                item
+                for item in self.service.session_answers(self._selected_session_id)
+                if item.question_id == question_id
+            ]
+            if completed_answers:
+                self._selected_answer_version_id = max(
+                    completed_answers, key=lambda item: (item.version_number, item.id)
+                ).id
+                if current is not None:
+                    self._open_session_item(current)
+            else:
+                self._refresh_reanswer_target()
+        else:
+            self._refresh_reanswer_target()
         self._set_status("回答完成", "success")
 
     @Slot()
