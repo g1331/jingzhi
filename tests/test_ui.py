@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QPushButton,
@@ -77,6 +78,30 @@ def _contains_rgb(image, target: tuple[int, int, int], tolerance: int = 4) -> bo
             ):
                 return True
     return False
+
+
+def test_clearing_timeline_layout_hides_widgets_before_detaching_them() -> None:
+    class DetachTrackingButton(QPushButton):
+        visible_when_detached: bool | None = None
+
+        def setParent(self, parent) -> None:  # type: ignore[no-untyped-def]
+            if parent is None:
+                self.visible_when_detached = self.isVisible()
+            super().setParent(parent)
+
+    application = QApplication.instance() or QApplication([])
+    parent = QWidget()
+    layout = QHBoxLayout(parent)
+    button = DetachTrackingButton("旧关键帧")
+    layout.addWidget(button)
+    parent.show()
+    application.processEvents()
+
+    MainWindow._clear_layout(layout)
+
+    assert button.visible_when_detached is False
+    assert button.isVisible() is False
+    parent.close()
 
 
 def test_html_warning_is_compacted_and_does_not_change_window_width(tmp_path) -> None:
