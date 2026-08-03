@@ -9,6 +9,7 @@ from jingzhi.database import (
     Database,
     SessionRecord,
     TimelineFrameRecord,
+    TimelineQuestionRecord,
     TimelineTranscriptRecord,
 )
 
@@ -33,9 +34,12 @@ class SessionTimeline:
     session: SessionRecord
     frames: tuple[TimelineFrameRecord, ...]
     transcripts: tuple[TimelineTranscriptRecord, ...]
+    questions: tuple[TimelineQuestionRecord, ...]
     duration_ms: int
     window_start_ms: int
     window_end_ms: int
+    answer_frame_ids: frozenset[int] = frozenset()
+    answer_transcript_ids: frozenset[int] = frozenset()
 
 
 class JingzhiApplicationService:
@@ -86,12 +90,18 @@ class JingzhiApplicationService:
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         duration_ms = self._current_duration(session)
-        start_ms = max(0, window_start_ms)
-        end_ms = duration_ms if window_duration_ms is None else start_ms + window_duration_ms
+        if window_duration_ms is None:
+            start_ms = 0
+            end_ms = duration_ms
+        else:
+            maximum_start_ms = max(0, duration_ms - window_duration_ms)
+            start_ms = min(max(0, window_start_ms), maximum_start_ms)
+            end_ms = min(duration_ms, start_ms + window_duration_ms)
         return SessionTimeline(
             session=session,
             frames=tuple(self.database.timeline_frames(session_id, start_ms, end_ms)),
             transcripts=tuple(self.database.timeline_transcripts(session_id, start_ms, end_ms)),
+            questions=tuple(self.database.timeline_questions(session_id, start_ms, end_ms)),
             duration_ms=duration_ms,
             window_start_ms=start_ms,
             window_end_ms=end_ms,

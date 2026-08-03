@@ -129,3 +129,9 @@ def test_application_service_browses_sessions_and_scaled_keyframes_without_hardw
     assert [(frame.id, frame.source_id) for frame in timeline.frames] == [
         (first_id, "display:1")
     ]
+
+    clamped = service.open_session(
+        session_id, window_start_ms=999_000, window_duration_ms=60_000
+    )
+    assert clamped.window_start_ms == 260_000
+    assert clamped.window_end_ms == 320_000

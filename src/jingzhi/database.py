@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 SCHEMA = """
@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 LATEST_SCHEMA_VERSION = 2
 
+SESSION_SUMMARY_QUERY = """
+SELECT
+    sessions.id,
+    sessions.title,
+    sessions.started_at_utc,
+    sessions.ended_at_utc,
+    sessions.status,
+    (SELECT COUNT(*) FROM frames WHERE session_id = sessions.id) AS frame_count,
+    COALESCE((SELECT MAX(ts_ms) FROM frames WHERE session_id = sessions.id), 0)
+        AS last_frame_ms,
+    COALESCE(
+        (SELECT MAX(end_ms) FROM transcript_segments WHERE session_id = sessions.id), 0
+    ) AS last_transcript_ms,
+    COALESCE((SELECT MAX(asked_at_ms) FROM questions WHERE session_id = sessions.id), 0)
+        AS last_question_ms
+FROM sessions
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class FrameRecord:
@@ -114,6 +132,14 @@ class TimelineTranscriptRecord:
     start_ms: int
     end_ms: int
     text: str
+    correction_state: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineQuestionRecord:
+    id: int
+    asked_at_ms: int
+    question: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +178,7 @@ class Database:
             connection.execute(
                 "ALTER TABLE frames ADD COLUMN source_id TEXT NOT NULL DEFAULT 'display:primary'"
             )
-        applied_at = datetime.now().astimezone().isoformat()
+        applied_at = datetime.now(UTC).isoformat()
         connection.executemany(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
             [(version, applied_at) for version in range(1, LATEST_SCHEMA_VERSION + 1)],
@@ -204,48 +230,14 @@ class Database:
     def list_sessions(self) -> list[SessionRecord]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT
-                       sessions.id,
-                       sessions.title,
-                       sessions.started_at_utc,
-                       sessions.ended_at_utc,
-                       sessions.status,
-                       COUNT(DISTINCT frames.id) AS frame_count,
-                       COALESCE(MAX(frames.ts_ms), 0) AS last_frame_ms,
-                       COALESCE(MAX(transcript_segments.end_ms), 0) AS last_transcript_ms,
-                       COALESCE(MAX(questions.asked_at_ms), 0) AS last_question_ms
-                   FROM sessions
-                   LEFT JOIN frames ON frames.session_id = sessions.id
-                   LEFT JOIN transcript_segments
-                       ON transcript_segments.session_id = sessions.id
-                   LEFT JOIN questions ON questions.session_id = sessions.id
-                   GROUP BY sessions.id
-                   ORDER BY sessions.started_at_utc DESC, sessions.id"""
+                SESSION_SUMMARY_QUERY + " ORDER BY sessions.started_at_utc DESC, sessions.id"
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT
-                       sessions.id,
-                       sessions.title,
-                       sessions.started_at_utc,
-                       sessions.ended_at_utc,
-                       sessions.status,
-                       (SELECT COUNT(*) FROM frames WHERE session_id = sessions.id) AS frame_count,
-                       COALESCE(
-                           (SELECT MAX(ts_ms) FROM frames WHERE session_id = sessions.id), 0
-                       ) AS last_frame_ms,
-                       COALESCE(
-                           (SELECT MAX(end_ms) FROM transcript_segments
-                            WHERE session_id = sessions.id), 0
-                       ) AS last_transcript_ms,
-                       COALESCE(
-                           (SELECT MAX(asked_at_ms) FROM questions
-                            WHERE session_id = sessions.id), 0
-                       ) AS last_question_ms
-                   FROM sessions WHERE sessions.id = ?""",
+                SESSION_SUMMARY_QUERY + " WHERE sessions.id = ?",
                 (session_id,),
             ).fetchone()
         return self._session_from_row(row) if row is not None else None
@@ -309,6 +301,19 @@ class Database:
                 (session_id, start_ms, end_ms),
             ).fetchall()
         return [TimelineTranscriptRecord(**dict(row)) for row in rows]
+
+    def timeline_questions(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineQuestionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, asked_at_ms, question
+                   FROM questions
+                   WHERE session_id = ? AND asked_at_ms BETWEEN ? AND ?
+                   ORDER BY asked_at_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [TimelineQuestionRecord(**dict(row)) for row in rows]
 
     def add_audio_chunk(
         self, session_id: str, source: str, start_ms: int, end_ms: int, path: Path
