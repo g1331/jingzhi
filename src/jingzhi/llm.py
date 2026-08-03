@@ -58,6 +58,7 @@ class OpenAIContextModel:
 
         def error(message: str) -> ProviderRequestError:
             return ProviderRequestError(message, request_id=request_id)
+
         lowered = raw.lower()
         status = getattr(exc, "status_code", None)
         target = self.base_url or "OpenAI 官方地址"
@@ -122,8 +123,7 @@ class OpenAIContextModel:
                 {
                     "type": "input_text",
                     "text": (
-                        f"[{frame.stable_id}][{frame.ts_ms / 1000:.1f}s]"
-                        f"[{frame.source}] 关键帧"
+                        f"[{frame.stable_id}][{frame.ts_ms / 1000:.1f}s][{frame.source}] 关键帧"
                     ),
                 }
             )

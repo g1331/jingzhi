@@ -235,9 +235,7 @@ def test_transcript_detail_supports_diff_undo_and_user_edit(tmp_path: Path, monk
         -0.2,
     )
     database.set_chunk_state(chunk_id, "transcribed")
-    database.add_transcript_version(
-        segment_id, "correction", "换入变量", model="correction-small"
-    )
+    database.add_transcript_version(segment_id, "correction", "换入变量", model="correction-small")
     database.configure_transcript_correction(session_id, enabled=True, window_ms=30_000)
     service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
     window = MainWindow(Settings(data_dir=tmp_path), service=service)

@@ -1,0 +1,36 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          title = os.environ["PR_TITLE"]
+          pattern = r"^(功能|修复|测试|重构|文档|构建|杂务)(\([^)]+\))?: .+ \(#[1-9][0-9]*\)$"
+          if not re.fullmatch(pattern, title):
+              print("PR title must match: 类型(范围): 动宾短语 (#Issue)")
+              print("Allowed types: 功能、修复、测试、重构、文档、构建、杂务")
+              print(f"Received: {title}")
+              sys.exit(1)
+          PY

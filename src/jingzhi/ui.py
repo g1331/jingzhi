@@ -100,6 +100,7 @@ class EvidenceButton(QPushButton):
         self._hover_animation.setEndValue(target)
         self._hover_animation.start()
 
+
 APP_STYLE = """
 QWidget {
     background: #111719;
@@ -377,9 +378,7 @@ class MainWindow(QMainWindow):
         self.session_library = QListWidget()
         self.session_library.setObjectName("sessionLibrary")
         self.session_library.setSpacing(3)
-        self.session_library.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self.session_library.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         panel_layout.addWidget(title)
         panel_layout.addWidget(subtitle)
         panel_layout.addSpacing(10)
@@ -462,7 +461,7 @@ class MainWindow(QMainWindow):
         self.api_mode_input.setCurrentIndex(max(0, mode_index))
         self.api_key_input = QLineEdit(getattr(self.manager, "llm_api_key", ""))
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_input.setPlaceholderText("只保存在本次运行的内存中")
+        self.api_key_input.setPlaceholderText("保存配置时写入 Windows 凭据管理器")
         self.model_input = QLineEdit(getattr(self.manager, "llm_model", ""))
         self.model_input.setPlaceholderText("支持图片输入的模型名称")
         self.test_provider_button = QPushButton("测试连接")
@@ -751,9 +750,7 @@ class MainWindow(QMainWindow):
         self.workspace_breadcrumb.setText(f"会话 / {session.started_at_utc[:10]}")
         self.workspace_title.setText(session.title)
         state = "记录中" if session.status == "recording" else "已完成"
-        self.workspace_meta.setText(
-            f"{state} · {len(timeline.frames)} 张关键帧位于当前缩放窗口"
-        )
+        self.workspace_meta.setText(f"{state} · {len(timeline.frames)} 张关键帧位于当前缩放窗口")
         self.timeline_range.setText(
             f"{self._format_time(timeline.window_start_ms)} — "
             f"{self._format_time(min(timeline.window_end_ms, timeline.duration_ms))}"
@@ -784,8 +781,7 @@ class MainWindow(QMainWindow):
                 button.setProperty("selected", False)
                 button.setProperty("cited", frame.id in timeline.answer_frame_ids)
                 button.setToolTip(
-                    f"关键帧 #{frame.id} · {frame.source_id} · "
-                    f"{self._format_time(frame.ts_ms)}"
+                    f"关键帧 #{frame.id} · {frame.source_id} · {self._format_time(frame.ts_ms)}"
                 )
                 pixmap = QPixmap(str(frame.path))
                 if not pixmap.isNull():
@@ -816,9 +812,7 @@ class MainWindow(QMainWindow):
                 gap_seconds = max(0, (transcript.start_ms - cursor_ms) // 1000)
                 if gap_seconds:
                     self.transcript_layout.addStretch(gap_seconds)
-                state_label = self.CORRECTION_STATE_LABELS.get(
-                    transcript.correction_state or ""
-                )
+                state_label = self.CORRECTION_STATE_LABELS.get(transcript.correction_state or "")
                 prefix = f"{state_label} · " if state_label else ""
                 button = EvidenceButton(
                     f"{prefix}{self._format_time(transcript.start_ms)}–"
@@ -828,9 +822,7 @@ class MainWindow(QMainWindow):
                 button.setObjectName(f"transcript-{transcript.id}")
                 button.setProperty("transcript", True)
                 button.setProperty("selected", False)
-                button.setProperty(
-                    "cited", transcript.id in timeline.answer_transcript_ids
-                )
+                button.setProperty("cited", transcript.id in timeline.answer_transcript_ids)
                 button.setProperty("correctionState", transcript.correction_state or "")
                 button.setToolTip(f"{transcript.source} · {transcript.text}")
                 button.clicked.connect(
@@ -1213,9 +1205,7 @@ class MainWindow(QMainWindow):
     def _refresh_reanswer_target(self) -> None:
         self._reanswer_question_id = None
         if self._selected_session_id is not None:
-            self._reanswer_question_id = self.service.latest_question_id(
-                self._selected_session_id
-            )
+            self._reanswer_question_id = self.service.latest_question_id(self._selected_session_id)
         self.reanswer_button.setEnabled(
             self._reanswer_question_id is not None
             and callable(getattr(self.manager, "reanswer_question", None))
