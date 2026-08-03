@@ -91,11 +91,11 @@ def test_provider_api_modes_route_without_network(monkeypatch, api_mode: str) ->
         api_mode=api_mode,
     )
     monkeypatch.setattr(model, "_client", lambda: client)
-    context = QuestionContext(0, 1_000, "[0.1s] lecture", ())
+    context = QuestionContext(0, 1_000, (), ())
 
     answer = model.answer("why?", context)
 
-    assert answer in {"response answer", "chat answer"}
+    assert answer.text in {"response answer", "chat answer"}
     assert model.base_url == "https://provider.example/v1"
     assert calls[0]["model"] == "vision-model"
 

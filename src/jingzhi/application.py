@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import (
+    AnswerVersionRecord,
     Database,
     SessionRecord,
     TimelineFrameRecord,
@@ -15,10 +18,95 @@ from jingzhi.database import (
     TranscriptCorrectionSettingsRecord,
     TranscriptVersionRecord,
 )
+from jingzhi.llm import AnswerModelResult
 from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
     TranscriptCorrectionProcessor,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConnectionSnapshot:
+    model: str
+    base_url: str
+    api_mode: str
+
+
+class AnswerModel(Protocol):
+    def answer(self, question: str, context: QuestionContext) -> AnswerModelResult: ...
+
+
+class QuestionAnsweringService:
+    """Owns question anchors, exact model evidence, and immutable answer versions."""
+
+    def __init__(
+        self,
+        database: Database,
+        model: AnswerModel,
+        connection: ModelConnectionSnapshot,
+    ) -> None:
+        self.database = database
+        self.model = model
+        self.connection = connection
+
+    def ask(
+        self,
+        session_id: str,
+        asked_at_ms: int,
+        question: str,
+        *,
+        lookback_ms: int = 8 * 60_000,
+    ) -> AnswerVersionRecord:
+        context = ContextAssembler(self.database).around_question(
+            session_id, asked_at_ms, lookback_ms=lookback_ms
+        )
+        question_id = self.database.create_question(
+            session_id, asked_at_ms, question, context.start_ms, context.end_ms
+        )
+        return self._answer(question_id, question, context)
+
+    def reanswer(self, question_id: int) -> AnswerVersionRecord:
+        question = self.database.question(question_id)
+        if question is None:
+            raise KeyError(f"Unknown question: {question_id}")
+        if question.context_start_ms is None or question.context_end_ms is None:
+            raise RuntimeError("The original question anchor is unavailable")
+        context = ContextAssembler(self.database).for_anchor(
+            question.session_id, question.context_start_ms, question.context_end_ms
+        )
+        return self._answer(question.id, question.question, context)
+
+    def _answer(
+        self, question_id: int, question: str, context: QuestionContext
+    ) -> AnswerVersionRecord:
+        connection_json = json.dumps(asdict(self.connection), ensure_ascii=False, sort_keys=True)
+        evidence = context.persistence_items()
+        try:
+            result = self.model.answer(question, context)
+        except Exception as exc:
+            self.database.record_answer_version(
+                question_id,
+                model=self.connection.model,
+                connection_json=connection_json,
+                request_status="failed",
+                request_id=getattr(exc, "request_id", None),
+                answer=None,
+                error=str(exc),
+                evidence_state="exact",
+                evidence=evidence,
+            )
+            raise
+        return self.database.record_answer_version(
+            question_id,
+            model=result.model or self.connection.model,
+            connection_json=connection_json,
+            request_status="succeeded",
+            request_id=result.request_id,
+            answer=result.text,
+            error=None,
+            evidence_state="exact",
+            evidence=evidence,
+        )
 
 
 class RecordingAdapter(Protocol):
@@ -146,6 +234,9 @@ class JingzhiApplicationService:
 
     def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
         return self.database.transcript_versions(segment_id)
+
+    def latest_question_id(self, session_id: str) -> int | None:
+        return self.database.latest_question_id(session_id)
 
     def transcript_correction_settings(self, session_id: str) -> TranscriptCorrectionSettingsRecord:
         return self.database.transcript_correction_settings(session_id)

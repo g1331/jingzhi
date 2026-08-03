@@ -125,6 +125,39 @@ CREATE TABLE IF NOT EXISTS questions (
     error TEXT
 );
 
+CREATE TABLE IF NOT EXISTS answer_versions (
+    id INTEGER PRIMARY KEY,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    model TEXT,
+    connection_json TEXT,
+    request_status TEXT NOT NULL CHECK (request_status IN ('succeeded', 'failed')),
+    upstream_request_id TEXT,
+    answer TEXT,
+    error TEXT,
+    evidence_state TEXT NOT NULL CHECK (evidence_state IN ('exact', 'unavailable')),
+    created_at_utc TEXT NOT NULL,
+    UNIQUE(question_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS answer_version_history
+ON answer_versions(question_id, version_number);
+
+CREATE TABLE IF NOT EXISTS answer_evidence (
+    answer_version_id INTEGER NOT NULL REFERENCES answer_versions(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stable_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('transcript', 'frame')),
+    source TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    transcript_version_id INTEGER REFERENCES transcript_versions(id),
+    frame_id INTEGER REFERENCES frames(id),
+    content_text TEXT,
+    resource_path TEXT,
+    PRIMARY KEY(answer_version_id, ordinal),
+    UNIQUE(answer_version_id, stable_id)
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -140,7 +173,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -260,6 +293,63 @@ class TranscriptCorrectionRunRecord:
     error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class QuestionRecord:
+    id: int
+    session_id: str
+    asked_at_ms: int
+    question: str
+    context_start_ms: int | None
+    context_end_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerVersionRecord:
+    id: int
+    question_id: int
+    version_number: int
+    model: str | None
+    connection_json: str | None
+    request_status: str
+    request_id: str | None
+    answer: str | None
+    error: str | None
+    evidence_state: str
+    created_at_utc: str
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerEvidenceRecord:
+    ordinal: int
+    stable_id: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    transcript_version_id: int | None
+    frame_id: int | None
+    content_text: str | None
+    resource_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerTranscriptRecord:
+    segment_id: int
+    version_id: int
+    source: str
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerFrameRecord:
+    frame_id: int
+    source: str
+    ts_ms: int
+    path: Path
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -269,6 +359,7 @@ class Database:
 
     def migrate(self, connection: sqlite3.Connection) -> None:
         """Bring both fresh and pre-versioned MVP databases to the latest schema."""
+        previous_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         connection.executescript(SCHEMA)
         frame_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(frames)").fetchall()
@@ -285,6 +376,19 @@ class Database:
                SELECT id, 'original', text, ?, 1 FROM transcript_segments""",
             (applied_at,),
         )
+        if previous_version < 4:
+            connection.execute(
+                """INSERT OR IGNORE INTO answer_versions(
+                       question_id, version_number, request_status, answer, error,
+                       evidence_state, created_at_utc
+                   )
+                   SELECT id, 1,
+                          CASE WHEN answer IS NOT NULL THEN 'succeeded' ELSE 'failed' END,
+                          answer, error, 'unavailable', ?
+                   FROM questions
+                   WHERE answer IS NOT NULL OR error IS NOT NULL""",
+                (applied_at,),
+            )
         connection.executemany(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
             [(version, applied_at) for version in range(1, LATEST_SCHEMA_VERSION + 1)],
@@ -735,6 +839,193 @@ class Database:
                 (state, datetime.now(UTC).isoformat(), error_source, error, run_id),
             )
         return TranscriptCorrectionRunRecord(run_id, state, error_source, error)
+
+    def answer_transcripts_between(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[AnswerTranscriptRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT segment.id AS segment_id, version.id AS version_id,
+                          segment.source, segment.start_ms, segment.end_ms, version.text
+                   FROM transcript_segments AS segment
+                   JOIN effective_transcript_versions AS version
+                     ON version.segment_id = segment.id
+                   WHERE segment.session_id = ?
+                     AND segment.end_ms >= ? AND segment.start_ms <= ?
+                   ORDER BY segment.start_ms, segment.id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [AnswerTranscriptRecord(**dict(row)) for row in rows]
+
+    def answer_frames_near(
+        self, session_id: str, center_ms: int, start_ms: int, end_ms: int, limit: int = 4
+    ) -> list[AnswerFrameRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id AS frame_id, source_id AS source, ts_ms, path FROM frames
+                   WHERE session_id = ? AND ts_ms BETWEEN ? AND ?
+                   ORDER BY abs(ts_ms - ?), id LIMIT ?""",
+                (session_id, start_ms, end_ms, center_ms, limit),
+            ).fetchall()
+        return [
+            AnswerFrameRecord(
+                frame_id=row["frame_id"],
+                source=row["source"],
+                ts_ms=row["ts_ms"],
+                path=Path(row["path"]),
+            )
+            for row in rows
+        ]
+
+    def create_question(
+        self,
+        session_id: str,
+        asked_at_ms: int,
+        question: str,
+        context_start_ms: int,
+        context_end_ms: int,
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO questions(
+                       session_id, asked_at_ms, question, context_start_ms, context_end_ms
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (session_id, asked_at_ms, question, context_start_ms, context_end_ms),
+            )
+            return int(cursor.lastrowid)
+
+    def question(self, question_id: int) -> QuestionRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT id, session_id, asked_at_ms, question,
+                          context_start_ms, context_end_ms
+                   FROM questions WHERE id = ?""",
+                (question_id,),
+            ).fetchone()
+        return QuestionRecord(**dict(row)) if row is not None else None
+
+    def latest_question_id(self, session_id: str) -> int | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT id FROM questions
+                   WHERE session_id = ? ORDER BY asked_at_ms DESC, id DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+    def record_answer_version(
+        self,
+        question_id: int,
+        *,
+        model: str | None,
+        connection_json: str | None,
+        request_status: str,
+        request_id: str | None,
+        answer: str | None,
+        error: str | None,
+        evidence_state: str,
+        evidence: list[dict[str, object]],
+    ) -> AnswerVersionRecord:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            version_number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(version_number), 0) + 1
+                       FROM answer_versions WHERE question_id = ?""",
+                    (question_id,),
+                ).fetchone()[0]
+            )
+            created_at = datetime.now(UTC).isoformat()
+            cursor = connection.execute(
+                """INSERT INTO answer_versions(
+                       question_id, version_number, model, connection_json, request_status,
+                       upstream_request_id, answer, error, evidence_state, created_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    question_id,
+                    version_number,
+                    model,
+                    connection_json,
+                    request_status,
+                    request_id,
+                    answer,
+                    error,
+                    evidence_state,
+                    created_at,
+                ),
+            )
+            answer_version_id = int(cursor.lastrowid)
+            connection.executemany(
+                """INSERT INTO answer_evidence(
+                       answer_version_id, ordinal, stable_id, kind, source,
+                       start_ms, end_ms, transcript_version_id, frame_id,
+                       content_text, resource_path
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        answer_version_id,
+                        ordinal,
+                        item["stable_id"],
+                        item["kind"],
+                        item["source"],
+                        item["start_ms"],
+                        item["end_ms"],
+                        item.get("transcript_version_id"),
+                        item.get("frame_id"),
+                        item.get("content_text"),
+                        item.get("resource_path"),
+                    )
+                    for ordinal, item in enumerate(evidence)
+                ],
+            )
+        return AnswerVersionRecord(
+            answer_version_id,
+            question_id,
+            version_number,
+            model,
+            connection_json,
+            request_status,
+            request_id,
+            answer,
+            error,
+            evidence_state,
+            created_at,
+        )
+
+    def answer_versions(self, question_id: int) -> list[AnswerVersionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, question_id, version_number, model, connection_json,
+                          request_status, upstream_request_id AS request_id, answer, error,
+                          evidence_state, created_at_utc
+                   FROM answer_versions WHERE question_id = ? ORDER BY version_number""",
+                (question_id,),
+            ).fetchall()
+        return [AnswerVersionRecord(**dict(row)) for row in rows]
+
+    def answer_evidence(self, answer_version_id: int) -> list[AnswerEvidenceRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT ordinal, stable_id, kind, source, start_ms, end_ms,
+                          transcript_version_id, frame_id, content_text, resource_path
+                   FROM answer_evidence WHERE answer_version_id = ? ORDER BY ordinal""",
+                (answer_version_id,),
+            ).fetchall()
+        return [
+            AnswerEvidenceRecord(
+                ordinal=row["ordinal"],
+                stable_id=row["stable_id"],
+                kind=row["kind"],
+                source=row["source"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                transcript_version_id=row["transcript_version_id"],
+                frame_id=row["frame_id"],
+                content_text=row["content_text"],
+                resource_path=Path(row["resource_path"]) if row["resource_path"] else None,
+            )
+            for row in rows
+        ]
 
     def add_question(
         self,
