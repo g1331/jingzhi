@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from jingzhi.application import ModelConnectionSnapshot, QuestionAnsweringService
+from jingzhi.application import (
+    JingzhiApplicationService,
+    ModelConnectionSnapshot,
+    QuestionAnsweringService,
+)
 from jingzhi.config import Settings
 from jingzhi.database import Database
 from jingzhi.llm import AnswerModelResult
@@ -105,26 +109,130 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     assert database.answer_evidence(first.id)[0].content_text == "原始字幕"
 
 
-def test_question_anchor_is_fixed_before_user_finishes_typing(monkeypatch, tmp_path: Path) -> None:
+def test_application_service_persists_anchor_before_slow_input_and_applies_selected_range(
+    monkeypatch, tmp_path: Path
+) -> None:
     manager = SessionManager(Settings(data_dir=tmp_path))
     session_id = manager.database.create_session("test", "2026-01-01T00:00:00+00:00")
-    times = iter((1_000, 9_000))
+    times = iter((400_000, 900_000))
     manager.session_id = session_id
     manager.clock = SimpleNamespace(now_ms=lambda: next(times))
-    service = QuestionAnsweringService(
+    model = RecordingAnswerModel()
+    question_service = QuestionAnsweringService(
         manager.database,
-        RecordingAnswerModel(),
+        model,
         ModelConnectionSnapshot("answer-model", "", "responses"),
     )
-    monkeypatch.setattr(manager, "_question_service", lambda: service)
+    monkeypatch.setattr(manager, "_question_service", lambda: question_service)
+    service = JingzhiApplicationService(manager.database, recorder=manager)
 
-    manager.capture_question_anchor()
-    manager.answer("输入了较长时间的问题")
+    question_id = service.begin_question()
+    anchor = manager.database.question(question_id)
+    assert anchor is not None
+    assert anchor.asked_at_ms == 400_000
+    assert anchor.question == ""
+    assert anchor.state == "draft"
+    assert (anchor.context_start_ms, anchor.context_end_ms) == (280_000, 400_000)
 
-    assert manager.last_question_id is not None
-    question = manager.database.question(manager.last_question_id)
+    service.set_question_range(30_000)
+    answer = service.submit_question("输入了较长时间的问题")
+
+    assert answer == "answer 1"
+    question = manager.database.question(question_id)
     assert question is not None
-    assert question.asked_at_ms == 1_000
+    assert question.asked_at_ms == 400_000
+    assert (question.context_start_ms, question.context_end_ms) == (370_000, 400_000)
+    assert question.state == "submitted"
+    assert model.contexts[0][0] == "输入了较长时间的问题"
+
+
+def test_repeated_trigger_reuses_pending_anchor_and_cancel_deletes_it_without_model_call(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(Settings(data_dir=tmp_path))
+    session_id = manager.database.create_session("test", "2026-01-01T00:00:00+00:00")
+    times = iter((400_000, 490_000))
+    manager.session_id = session_id
+    manager.clock = SimpleNamespace(now_ms=lambda: next(times))
+    model = RecordingAnswerModel()
+    monkeypatch.setattr(
+        manager,
+        "_question_service",
+        lambda: QuestionAnsweringService(
+            manager.database,
+            model,
+            ModelConnectionSnapshot("answer-model", "", "responses"),
+        ),
+    )
+    service = JingzhiApplicationService(manager.database, recorder=manager)
+
+    first_id = service.begin_question(5 * 60_000)
+    second_id = service.begin_question(30_000)
+
+    assert second_id == first_id
+    pending = manager.database.question(first_id)
+    assert pending is not None
+    assert (pending.context_start_ms, pending.context_end_ms) == (100_000, 400_000)
+    assert manager.database.latest_question_id(session_id) is None
+    assert manager.database.timeline_questions(session_id, 0, 500_000) == []
+    assert pending.asked_at_ms == 400_000
+    assert service.cancel_question() is True
+    assert manager.database.question(first_id) is None
+    assert model.contexts == []
+    assert service.cancel_question() is False
+
+
+def test_question_voice_release_transcribes_once_and_returns_editable_text(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(Settings(data_dir=tmp_path))
+    session_id = manager.database.create_session("test", "2026-01-01T00:00:00+00:00")
+    manager.session_id = session_id
+    manager.clock = SimpleNamespace(now_ms=lambda: 5_000)
+    recording_path = tmp_path / "question.flac"
+    voice_recorders = []
+
+    class FakeVoiceRecorder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.started_paths: list[Path] = []
+            self.stop_calls = 0
+            self.cancel_calls = 0
+            voice_recorders.append(self)
+
+        def start(self, path: Path) -> None:
+            self.started_paths.append(path)
+
+        def stop(self) -> Path:
+            self.stop_calls += 1
+            return recording_path
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+    class FakeQuestionTranscriber:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def transcribe(self, path: Path) -> str:
+            assert path == recording_path
+            return "可编辑的语音问题"
+
+    monkeypatch.setattr("jingzhi.session.QuestionVoiceRecorder", FakeVoiceRecorder)
+    monkeypatch.setattr("jingzhi.session.WhisperQuestionTranscriber", FakeQuestionTranscriber)
+    service = JingzhiApplicationService(manager.database, recorder=manager)
+
+    service.begin_question()
+    service.start_question_voice()
+    assert service.finish_question_voice() == "可编辑的语音问题"
+    with pytest.raises(RuntimeError, match="No question voice recording is active"):
+        service.finish_question_voice()
+
+    service.start_question_voice()
+    pending_question_id = manager.pending_question_id
+    assert pending_question_id is not None
+    assert manager.stop() is None
+    assert manager.database.question(pending_question_id) is None
+    assert voice_recorders[-1].cancel_calls == 1
 
 
 def test_failed_request_remains_the_current_reanswer_target(monkeypatch, tmp_path: Path) -> None:

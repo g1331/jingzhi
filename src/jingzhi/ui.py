@@ -9,7 +9,8 @@ from difflib import SequenceMatcher
 from typing import ClassVar
 
 from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QSize, Qt, Signal, Slot
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -252,6 +253,8 @@ class UiBridge(QObject):
     worker_warning = Signal(str)
     action_error = Signal(str)
     answer = Signal(str)
+    voice_transcript = Signal(int, str)
+    voice_error = Signal(int, str)
     summary = Signal(str)
     stopped = Signal(str)
     provider_tested = Signal(str)
@@ -302,6 +305,10 @@ class MainWindow(QMainWindow):
         self._zoom_key = "whole"
         self._window_start_ms = 0
         self._paused = False
+        self._question_active = False
+        self._question_generation = 0
+        self._last_answer = ""
+        self._speech: QTextToSpeech | None = None
         self._animations_enabled = motion_enabled()
         self._build_ui()
         self._connect_signals()
@@ -993,9 +1000,24 @@ class MainWindow(QMainWindow):
         question_row = QHBoxLayout()
         self.question = QuestionInput()
         self.question.setPlaceholderText("例如：刚才这个结论是怎么得到的？")
+        self.question_range = QComboBox()
+        self.question_range.setObjectName("questionRange")
+        for label, lookback_ms in (
+            ("30 秒", 30_000),
+            ("2 分钟", 2 * 60_000),
+            ("5 分钟", 5 * 60_000),
+        ):
+            self.question_range.addItem(label, lookback_ms)
+        self.question_range.setCurrentIndex(1)
+        self.voice_button = QPushButton("按住说话")
+        self.cancel_question_button = QPushButton("取消")
+        self.cancel_question_button.setProperty("role", "quiet")
         self.ask_button = QPushButton("提问")
         self.ask_button.setProperty("role", "primary")
         question_row.addWidget(self.question, 1)
+        question_row.addWidget(self.question_range)
+        question_row.addWidget(self.voice_button)
+        question_row.addWidget(self.cancel_question_button)
         question_row.addWidget(self.ask_button)
         answer_header = QHBoxLayout()
         heading = QLabel("回答与会话材料")
@@ -1003,12 +1025,16 @@ class MainWindow(QMainWindow):
         self.reanswer_button = QPushButton("基于最新字幕重新回答")
         self.reanswer_button.setProperty("role", "quiet")
         self.reanswer_button.setEnabled(False)
+        self.speak_button = QPushButton("朗读回答")
+        self.speak_button.setProperty("role", "quiet")
+        self.speak_button.setEnabled(False)
         self.output_source_button = QPushButton("查看原文")
         self.output_source_button.setProperty("role", "quiet")
         self.copy_output_button = QPushButton("复制原文")
         self.copy_output_button.setProperty("role", "quiet")
         answer_header.addWidget(heading)
         answer_header.addStretch(1)
+        answer_header.addWidget(self.speak_button)
         answer_header.addWidget(self.reanswer_button)
         answer_header.addWidget(self.output_source_button)
         answer_header.addWidget(self.copy_output_button)
@@ -1030,6 +1056,14 @@ class MainWindow(QMainWindow):
         self.reanswer_button.clicked.connect(self._reanswer)
         self.question.focused.connect(self._capture_question_anchor)
         self.question.returnPressed.connect(self._ask)
+        self.question_range.currentIndexChanged.connect(self._change_question_range)
+        self.cancel_question_button.clicked.connect(self._cancel_question)
+        self.voice_button.pressed.connect(self._start_question_voice)
+        self.voice_button.released.connect(self._finish_question_voice)
+        self.speak_button.clicked.connect(self._speak_answer)
+        self.ask_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Q"), self)
+        self.ask_shortcut.activated.connect(self._focus_question)
+        self.ask_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.summary_button.clicked.connect(self._summarize)
         self.test_provider_button.clicked.connect(self._test_provider)
         self.save_provider_button.clicked.connect(self._save_provider)
@@ -1048,6 +1082,8 @@ class MainWindow(QMainWindow):
         self.bridge.worker_warning.connect(self._show_worker_warning)
         self.bridge.action_error.connect(self._show_action_error)
         self.bridge.answer.connect(self._show_answer)
+        self.bridge.voice_transcript.connect(self._show_voice_transcript)
+        self.bridge.voice_error.connect(self._show_voice_error)
         self.bridge.summary.connect(self._show_summary)
         self.bridge.stopped.connect(self._recording_stopped)
         self.bridge.provider_tested.connect(self._provider_tested)
@@ -1213,17 +1249,92 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _capture_question_anchor(self) -> None:
-        capture = getattr(self.manager, "capture_question_anchor", None)
-        if not callable(capture):
-            return
+        was_active = self._question_active
         try:
-            capture()
+            self.service.begin_question(int(self.question_range.currentData()))
         except Exception as exc:  # noqa: BLE001 - UI boundary surfaces invalid session state
             self._show_action_error(str(exc))
+            return
+        self._question_active = True
+        if not was_active:
+            self._question_generation += 1
 
     @Slot()
     def _focus_question(self) -> None:
-        self.question.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        if self.question.hasFocus():
+            self._capture_question_anchor()
+        else:
+            self.question.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    @Slot()
+    def _change_question_range(self) -> None:
+        if not self._question_active:
+            return
+        try:
+            self.service.set_question_range(int(self.question_range.currentData()))
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces persistence failures
+            self._show_action_error(str(exc))
+
+    @Slot()
+    def _cancel_question(self) -> None:
+        try:
+            self.service.cancel_question()
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces persistence failures
+            self._show_action_error(str(exc))
+            return
+        self._question_active = False
+        self._question_generation += 1
+        self.question.clear()
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("按住说话")
+
+    @Slot()
+    def _start_question_voice(self) -> None:
+        if not self._question_active:
+            self._capture_question_anchor()
+        if not self._question_active:
+            return
+        try:
+            self.service.start_question_voice()
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces microphone failures
+            self._show_action_error(str(exc))
+            return
+        self.voice_button.setText("松开结束")
+
+    @Slot()
+    def _finish_question_voice(self) -> None:
+        if self.voice_button.text() != "松开结束":
+            return
+        self.voice_button.setEnabled(False)
+        self.voice_button.setText("正在转写…")
+        generation = self._question_generation
+
+        def work() -> None:
+            try:
+                transcript = self.service.finish_question_voice()
+            except Exception as exc:  # noqa: BLE001 - background task reports through Qt
+                self.bridge.voice_error.emit(generation, str(exc))
+            else:
+                self.bridge.voice_transcript.emit(generation, transcript)
+
+        threading.Thread(target=work, name="question-voice", daemon=True).start()
+
+    @Slot(int, str)
+    def _show_voice_transcript(self, generation: int, transcript: str) -> None:
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("按住说话")
+        if generation != self._question_generation or not self._question_active:
+            return
+        self.question.setText(transcript)
+        self.question.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    @Slot(int, str)
+    def _show_voice_error(self, generation: int, message: str) -> None:
+        if generation != self._question_generation:
+            return
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("按住说话")
+        self._show_action_error(message)
 
     @Slot()
     def _toggle_pause(self) -> None:
@@ -1288,12 +1399,17 @@ class MainWindow(QMainWindow):
         question = self.question.text().strip()
         if not question or not self._configure_provider_from_form():
             return
+        if not self._question_active:
+            self._capture_question_anchor()
+        if not self._question_active:
+            return
+        self._question_active = False
         self.ask_button.setEnabled(False)
         self.output.set_markdown("_正在结合字幕和关键画面回答…_")
 
         def work() -> None:
             try:
-                result = self.manager.answer(question)
+                result = self.service.submit_question(question)
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
@@ -1373,13 +1489,25 @@ class MainWindow(QMainWindow):
         self._refresh_reanswer_target()
         self.summary_button.setEnabled(True)
         self.test_provider_button.setEnabled(True)
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("按住说话")
 
     @Slot(str)
     def _show_answer(self, answer: str) -> None:
+        self._last_answer = answer
         self.output.set_markdown(answer)
         self.ask_button.setEnabled(True)
+        self.speak_button.setEnabled(bool(answer.strip()))
         self._refresh_reanswer_target()
         self._set_status("回答完成", "success")
+
+    @Slot()
+    def _speak_answer(self) -> None:
+        if not self._last_answer:
+            return
+        if self._speech is None:
+            self._speech = QTextToSpeech()
+        self._speech.say(self._last_answer)
 
     @Slot(str)
     def _show_summary(self, summary: str) -> None:
@@ -1401,6 +1529,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _recording_stopped(self, session_id: str) -> None:
+        self._question_active = False
+        self._question_generation += 1
+        self.question.clear()
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("按住说话")
         self._set_status(f"已结束 · {session_id[:8]}", "success")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -1415,6 +1548,8 @@ class MainWindow(QMainWindow):
         self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._question_active:
+            self.service.cancel_question()
         configure_provider = getattr(self.manager, "configure_provider", None)
         save_provider = getattr(self.manager, "save_provider", None)
         if callable(configure_provider) and callable(save_provider):

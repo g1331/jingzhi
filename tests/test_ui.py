@@ -1,4 +1,5 @@
 import os
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QLabel,
     QListWidget,
     QPushButton,
@@ -364,4 +366,109 @@ def test_reduced_motion_disables_nonessential_timeline_animations(
     assert window._detail_opacity.opacity() == 1.0
     assert EvidenceButton.HOVER_DURATION_MS == 145
     assert window._detail_animation.duration() == 220
+    window.close()
+
+
+def test_quick_question_controls_range_cancel_voice_and_manual_speech(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "questions.sqlite3")
+    database.create_session("即时提问", "2026-08-03T09:00:00+00:00")
+
+    class QuestionRecorder(NoHardwareRecorder):
+        is_recording = True
+
+        def __init__(self) -> None:
+            self.anchor_calls: list[int] = []
+            self.range_calls: list[int] = []
+            self.cancel_calls = 0
+            self.voice_started = 0
+            self.voice_finished = 0
+            self.block_voice = False
+            self.voice_finish_started = threading.Event()
+            self.release_voice_finish = threading.Event()
+
+        def capture_question_anchor(self, lookback_ms: int) -> int:
+            self.anchor_calls.append(lookback_ms)
+            return 41
+
+        def set_question_range(self, lookback_ms: int) -> None:
+            self.range_calls.append(lookback_ms)
+
+        def cancel_question(self) -> bool:
+            self.cancel_calls += 1
+            return True
+
+        def start_question_voice(self) -> None:
+            self.voice_started += 1
+
+        def finish_question_voice(self) -> str:
+            self.voice_finished += 1
+            if self.block_voice:
+                self.voice_finish_started.set()
+                self.release_voice_finish.wait(timeout=2)
+            return "语音转成的可编辑问题"
+
+    spoken: list[str] = []
+
+    class FakeSpeech:
+        def say(self, text: str) -> None:
+            spoken.append(text)
+
+    monkeypatch.setattr("jingzhi.ui.QTextToSpeech", FakeSpeech)
+    recorder = QuestionRecorder()
+    service = JingzhiApplicationService(database, recorder=recorder)
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+
+    window.capsule_ask_button.click()
+    window.capsule_ask_button.click()
+    assert recorder.anchor_calls == [2 * 60_000, 2 * 60_000]
+    assert window.question.hasFocus()
+    assert window.ask_shortcut.context() == Qt.ShortcutContext.ApplicationShortcut
+    window.ask_shortcut.activated.emit()
+    assert recorder.anchor_calls[-1] == 2 * 60_000
+
+    range_input = window.findChild(QComboBox, "questionRange")
+    assert range_input is not None
+    assert [range_input.itemData(index) for index in range(range_input.count())] == [
+        30_000,
+        2 * 60_000,
+        5 * 60_000,
+    ]
+    range_input.setCurrentIndex(0)
+    assert recorder.range_calls[-1] == 30_000
+
+    window.voice_button.pressed.emit()
+    window.voice_button.released.emit()
+    for _ in range(50):
+        application.processEvents()
+        if window.question.text():
+            break
+    assert recorder.voice_started == 1
+    assert recorder.voice_finished == 1
+    assert window.question.text() == "语音转成的可编辑问题"
+
+    window._show_answer("这是默认静音的回答")
+    assert spoken == []
+    window.speak_button.click()
+    assert spoken == ["这是默认静音的回答"]
+    window.cancel_question_button.click()
+    assert recorder.cancel_calls == 1
+    assert window.question.text() == ""
+
+    window.ask_shortcut.activated.emit()
+    recorder.block_voice = True
+    window.voice_button.pressed.emit()
+    window.voice_button.released.emit()
+    assert recorder.voice_finish_started.wait(timeout=1)
+    window.cancel_question_button.click()
+    recorder.release_voice_finish.set()
+    for _ in range(50):
+        application.processEvents()
+    assert recorder.cancel_calls == 2
+    assert window.question.text() == ""
+    assert window.voice_button.text() == "按住说话"
     window.close()
