@@ -36,25 +36,26 @@ uv run ruff format src tests
 
 ## 提交
 
-提交标题采用：
+提交标题采用 Conventional Commits：
 
 ```text
-<类型>(<范围>): <动宾短语> (#<Issue>)
+<type>(<scope>): <中文或英文动宾短语> (#<Issue>)
 ```
 
-允许的类型：`功能`、`修复`、`测试`、`重构`、`文档`、`构建`、`杂务`。
+允许的 `type`：`feat`、`fix`、`test`、`refactor`、`docs`、`build`、`chore`。
+
 
 示例：
 
 ```text
-功能(问答): 持久化回答的确切证据 (#4)
-修复(字幕): 保留用户编辑版本的最高优先级 (#3)
-构建(仓库): 建立公开仓库工程化基线 (#21)
+feat(qa): 持久化回答的确切证据 (#4)
+fix(transcript): 保留用户编辑版本的最高优先级 (#3)
+build(repository): 建立公开仓库工程化基线 (#21)
 ```
 
 正文只在需要解释原因、迁移方式或风险时添加。多行正文必须使用真实换行，不得写入字面量 `\n`。
 
-Dependabot 自动生成的依赖更新使用 `构建(依赖)` 前缀，不要求关联人工 Issue；其他提交不得使用这一例外。
+Dependabot 自动生成的依赖更新使用 `build(deps)` 前缀，不要求关联人工 Issue；其他提交不得使用这一例外。
 
 ## Pull Request
 

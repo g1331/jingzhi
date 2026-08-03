@@ -32,10 +32,10 @@ jobs:
           import sys
 
           title = os.environ["PR_TITLE"]
-          pattern = r"^(功能|修复|测试|重构|文档|构建|杂务)(\([^)]+\))?: .+ \(#[1-9][0-9]*\)$"
+          pattern = r"^(feat|fix|test|refactor|docs|build|chore)(\([^)]+\))?: .+ \(#[1-9][0-9]*\)$"
           if not re.fullmatch(pattern, title):
-              print("PR title must match: 类型(范围): 动宾短语 (#Issue)")
-              print("Allowed types: 功能、修复、测试、重构、文档、构建、杂务")
+              print("PR title must match: type(scope): title (#Issue)")
+              print("Allowed types: feat, fix, test, refactor, docs, build, chore")
               print(f"Received: {title}")
               sys.exit(1)
           PY
