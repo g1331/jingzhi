@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,17 @@ from jingzhi.transcript_correction import CorrectionRequest
 
 class ProviderRequestError(RuntimeError):
     """A concise, user-facing provider request failure."""
+
+    def __init__(self, message: str, *, request_id: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerModelResult:
+    text: str
+    request_id: str | None = None
+    model: str | None = None
 
 
 class OpenAIContextModel:
@@ -42,29 +54,31 @@ class OpenAIContextModel:
 
     def _provider_error(self, exc: Exception) -> ProviderRequestError:
         raw = str(exc).strip()
+        request_id = getattr(exc, "request_id", None)
+
+        def error(message: str) -> ProviderRequestError:
+            return ProviderRequestError(message, request_id=request_id)
         lowered = raw.lower()
         status = getattr(exc, "status_code", None)
         target = self.base_url or "OpenAI 官方地址"
         if "<!doctype html" in lowered or "<html" in lowered:
-            return ProviderRequestError(
+            return error(
                 "Provider 返回了 HTML 页面，而不是 OpenAI 兼容的 JSON。"
                 f"请检查 Base URL（当前：{target}）是否应以 /v1 结尾，"
                 "并确认所选 API 类型与服务端一致。"
             )
         if status in {401, 403}:
-            return ProviderRequestError("Provider 拒绝鉴权，请检查 API Key 和访问权限。")
+            return error("Provider 拒绝鉴权，请检查 API Key 和访问权限。")
         if status == 404:
             endpoint = "/responses" if self.api_mode == "responses" else "/chat/completions"
-            return ProviderRequestError(
-                f"Provider 未找到接口 {endpoint}。请检查 Base URL 或切换 API 类型。"
-            )
+            return error(f"Provider 未找到接口 {endpoint}。请检查 Base URL 或切换 API 类型。")
         if status == 429:
-            return ProviderRequestError("Provider 返回限流错误，请稍后重试或检查账户额度。")
+            return error("Provider 返回限流错误，请稍后重试或检查账户额度。")
         if not raw:
             raw = type(exc).__name__
         # Never let an upstream HTML document or oversized SDK dump stretch the UI.
         compact = re.sub(r"\s+", " ", raw)[:360]
-        return ProviderRequestError(f"Provider 请求失败：{compact}")
+        return error(f"Provider 请求失败：{compact}")
 
     @staticmethod
     def _image_part(path: Path) -> dict[str, str]:
@@ -92,7 +106,7 @@ class OpenAIContextModel:
             )
         return str(content or "")
 
-    def answer(self, question: str, context: QuestionContext) -> str:
+    def answer(self, question: str, context: QuestionContext) -> AnswerModelResult:
         content: list[dict[str, str]] = [
             {
                 "type": "input_text",
@@ -103,7 +117,17 @@ class OpenAIContextModel:
                 ),
             }
         ]
-        content.extend(self._image_part(path) for path in context.frame_paths if path.is_file())
+        for frame in context.frames:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"[{frame.stable_id}][{frame.ts_ms / 1000:.1f}s]"
+                        f"[{frame.source}] 关键帧"
+                    ),
+                }
+            )
+            content.append({"type": "input_image", "image_url": frame.image_url})
         try:
             client = self._client()
             if self.api_mode == "responses":
@@ -111,17 +135,29 @@ class OpenAIContextModel:
                     model=self.model,
                     input=[{"role": "user", "content": content}],
                 )
-                return response.output_text
+                return AnswerModelResult(
+                    response.output_text,
+                    getattr(response, "id", None),
+                    getattr(response, "model", self.model),
+                )
 
-            chat_content: list[dict[str, Any]] = [{"type": "text", "text": content[0]["text"]}]
-            chat_content.extend(
-                self._chat_image_part(path) for path in context.frame_paths if path.is_file()
-            )
+            chat_content: list[dict[str, Any]] = []
+            for item in content:
+                if item["type"] == "input_text":
+                    chat_content.append({"type": "text", "text": item["text"]})
+                else:
+                    chat_content.append(
+                        {"type": "image_url", "image_url": {"url": item["image_url"]}}
+                    )
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": chat_content}],
             )
-            return self._chat_text(response)
+            return AnswerModelResult(
+                self._chat_text(response),
+                getattr(response, "id", None),
+                getattr(response, "model", self.model),
+            )
         except ProviderRequestError:
             raise
         except Exception as exc:

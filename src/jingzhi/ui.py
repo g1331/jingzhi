@@ -62,6 +62,14 @@ def motion_enabled() -> bool:
     return not success or bool(animations_enabled.value)
 
 
+class QuestionInput(QLineEdit):
+    focused = Signal()
+
+    def focusInEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.focused.emit()
+        super().focusInEvent(event)
+
+
 class EvidenceButton(QPushButton):
     HOVER_DURATION_MS = 145
 
@@ -286,6 +294,7 @@ class MainWindow(QMainWindow):
         self.manager = service.recorder
         self.settings = settings
         self._selected_session_id: str | None = None
+        self._reanswer_question_id: int | None = None
         self._selected_frame: TimelineFrameRecord | None = None
         self._selected_transcript: TimelineTranscriptRecord | None = None
         self._timeline: SessionTimeline | None = None
@@ -714,6 +723,7 @@ class MainWindow(QMainWindow):
         self._selected_frame = None
         self._selected_transcript = None
         self._render_timeline(timeline)
+        self._refresh_reanswer_target()
 
     def _select_session_item(self, item: QListWidgetItem | None) -> None:
         self._window_start_ms = 0
@@ -989,7 +999,7 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(12, 10, 12, 12)
         question_row = QHBoxLayout()
-        self.question = QLineEdit()
+        self.question = QuestionInput()
         self.question.setPlaceholderText("例如：刚才这个结论是怎么得到的？")
         self.ask_button = QPushButton("提问")
         self.ask_button.setProperty("role", "primary")
@@ -998,12 +1008,16 @@ class MainWindow(QMainWindow):
         answer_header = QHBoxLayout()
         heading = QLabel("回答与会话材料")
         heading.setObjectName("sectionTitle")
+        self.reanswer_button = QPushButton("基于最新字幕重新回答")
+        self.reanswer_button.setProperty("role", "quiet")
+        self.reanswer_button.setEnabled(False)
         self.output_source_button = QPushButton("查看原文")
         self.output_source_button.setProperty("role", "quiet")
         self.copy_output_button = QPushButton("复制原文")
         self.copy_output_button.setProperty("role", "quiet")
         answer_header.addWidget(heading)
         answer_header.addStretch(1)
+        answer_header.addWidget(self.reanswer_button)
         answer_header.addWidget(self.output_source_button)
         answer_header.addWidget(self.copy_output_button)
         self.output = MarkdownDocument()
@@ -1021,6 +1035,8 @@ class MainWindow(QMainWindow):
         self.pause_button.clicked.connect(self._toggle_pause)
         self.capsule_ask_button.clicked.connect(self._focus_question)
         self.ask_button.clicked.connect(self._ask)
+        self.reanswer_button.clicked.connect(self._reanswer)
+        self.question.focused.connect(self._capture_question_anchor)
         self.question.returnPressed.connect(self._ask)
         self.summary_button.clicked.connect(self._summarize)
         self.test_provider_button.clicked.connect(self._test_provider)
@@ -1194,6 +1210,27 @@ class MainWindow(QMainWindow):
         if current is not None:
             self._open_session_item(current)
 
+    def _refresh_reanswer_target(self) -> None:
+        self._reanswer_question_id = None
+        if self._selected_session_id is not None:
+            self._reanswer_question_id = self.service.latest_question_id(
+                self._selected_session_id
+            )
+        self.reanswer_button.setEnabled(
+            self._reanswer_question_id is not None
+            and callable(getattr(self.manager, "reanswer_question", None))
+        )
+
+    @Slot()
+    def _capture_question_anchor(self) -> None:
+        capture = getattr(self.manager, "capture_question_anchor", None)
+        if not callable(capture):
+            return
+        try:
+            capture()
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces invalid session state
+            self._show_action_error(str(exc))
+
     @Slot()
     def _focus_question(self) -> None:
         self.question.setFocus(Qt.FocusReason.ShortcutFocusReason)
@@ -1275,6 +1312,25 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, name="answer-question", daemon=True).start()
 
     @Slot()
+    def _reanswer(self) -> None:
+        question_id = self._reanswer_question_id
+        if question_id is None or not self._configure_provider_from_form():
+            return
+        self.ask_button.setEnabled(False)
+        self.reanswer_button.setEnabled(False)
+        self.output.set_markdown("_正在基于最新有效字幕重新回答…_")
+
+        def work() -> None:
+            try:
+                result = self.manager.reanswer_question(question_id)
+            except Exception as exc:  # noqa: BLE001 - background task reports through Qt
+                self.bridge.action_error.emit(str(exc))
+            else:
+                self.bridge.answer.emit(result)
+
+        threading.Thread(target=work, name="reanswer-question", daemon=True).start()
+
+    @Slot()
     def _summarize(self) -> None:
         if not self._configure_provider_from_form():
             return
@@ -1324,6 +1380,7 @@ class MainWindow(QMainWindow):
         self.notice.show()
         self.output.set_markdown(f"## 请求未完成\n\n{compact}")
         self.ask_button.setEnabled(True)
+        self._refresh_reanswer_target()
         self.summary_button.setEnabled(True)
         self.test_provider_button.setEnabled(True)
 
@@ -1331,6 +1388,7 @@ class MainWindow(QMainWindow):
     def _show_answer(self, answer: str) -> None:
         self.output.set_markdown(answer)
         self.ask_button.setEnabled(True)
+        self._refresh_reanswer_target()
         self._set_status("回答完成", "success")
 
     @Slot(str)

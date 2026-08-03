@@ -6,11 +6,11 @@ import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from jingzhi.application import ModelConnectionSnapshot, QuestionAnsweringService
 from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
-from jingzhi.context import ContextAssembler
 from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
@@ -53,6 +53,8 @@ class SessionManager:
         self.llm_api_key = settings.llm_api_key
         self.llm_api_mode = settings.llm_api_mode
         self.provider_settings_store = ProviderSettingsStore(settings.data_dir)
+        self.last_question_id: int | None = None
+        self.pending_question_anchor_ms: int | None = None
 
     def configure_provider(self, *, model: str, base_url: str, api_key: str, api_mode: str) -> None:
         model = model.strip()
@@ -139,6 +141,8 @@ class SessionManager:
         self.session_id = session_id
         self.clock = clock
         self.stop_event = stop_event
+        self.last_question_id = None
+        self.pending_question_anchor_ms = None
         self.chunk_queue = chunk_queue
         self.database.configure_transcript_correction(
             session_id,
@@ -295,34 +299,50 @@ class SessionManager:
         self.correction_flush_event.clear()
         return session_id
 
+    def _question_service(self) -> QuestionAnsweringService:
+        return QuestionAnsweringService(
+            self.database,
+            self._context_model(),
+            ModelConnectionSnapshot(self.llm_model, self.llm_base_url, self.llm_api_mode),
+        )
+
+    def capture_question_anchor(self) -> int:
+        if self.session_id is None or self.clock is None:
+            raise RuntimeError("Start a study session before asking a question")
+        self.pending_question_anchor_ms = self.clock.now_ms()
+        return self.pending_question_anchor_ms
+
     def answer(self, question: str) -> str:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
-        asked_at_ms = self.clock.now_ms()
-        context = ContextAssembler(self.database).around_question(self.session_id, asked_at_ms)
-        model = self._context_model()
+        asked_at_ms = self.pending_question_anchor_ms
+        if asked_at_ms is None:
+            asked_at_ms = self.clock.now_ms()
+        self.pending_question_anchor_ms = None
         try:
-            answer = model.answer(question, context)
-            self.database.add_question(
-                self.session_id,
-                asked_at_ms,
-                question,
-                answer,
-                context.start_ms,
-                context.end_ms,
-            )
-            return answer
-        except Exception as exc:
-            self.database.add_question(
-                self.session_id,
-                asked_at_ms,
-                question,
-                None,
-                context.start_ms,
-                context.end_ms,
-                str(exc),
-            )
-            raise
+            result = self._question_service().ask(self.session_id, asked_at_ms, question)
+        finally:
+            self.last_question_id = self.database.latest_question_id(self.session_id)
+        assert result.answer is not None
+        return result.answer
+
+    def reanswer_question(self, question_id: int) -> str:
+        result = self._question_service().reanswer(question_id)
+        self.last_question_id = question_id
+        assert result.answer is not None
+        return result.answer
+
+    def reanswer_last_question(self) -> str:
+        if self.session_id is None:
+            raise RuntimeError("There is no current session")
+        if self.last_question_id is None:
+            self.last_question_id = self.database.latest_question_id(self.session_id)
+        if self.last_question_id is None:
+            raise RuntimeError("There is no question to answer again")
+        question = self.database.question(self.last_question_id)
+        if question is None or question.session_id != self.session_id:
+            raise RuntimeError("The selected question does not belong to the current session")
+        return self.reanswer_question(self.last_question_id)
 
     def summarize(self) -> dict:
         if self.session_id is None:
