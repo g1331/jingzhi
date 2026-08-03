@@ -321,6 +321,21 @@ class AnswerVersionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionAnswerRecord:
+    id: int
+    question_id: int
+    version_number: int
+    asked_at_ms: int
+    question: str
+    model: str | None
+    request_status: str
+    answer: str | None
+    error: str | None
+    evidence_state: str
+    created_at_utc: str
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerEvidenceRecord:
     ordinal: int
     stable_id: str
@@ -533,6 +548,41 @@ class Database:
                      AND segment.end_ms >= ? AND segment.start_ms <= ?
                    ORDER BY segment.start_ms, segment.id""",
                 (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [TimelineTranscriptRecord(**dict(row)) for row in rows]
+
+    def timeline_transcript_versions(
+        self,
+        session_id: str,
+        version_ids: tuple[int, ...],
+        start_ms: int,
+        end_ms: int,
+    ) -> list[TimelineTranscriptRecord]:
+        if not version_ids:
+            return []
+        placeholders = ", ".join("?" for _ in version_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT segment.id, segment.source, segment.start_ms, segment.end_ms,
+                           version.text, version.id AS version_id,
+                           version.kind AS version_kind, original.text AS original_text,
+                           CASE
+                               WHEN settings.enabled IS NULL OR settings.enabled = 0 THEN NULL
+                               WHEN version.kind = 'user_edit' THEN 'edited'
+                               WHEN version.kind = 'correction' THEN 'corrected'
+                               ELSE 'pending'
+                           END AS correction_state
+                    FROM transcript_versions AS version
+                    JOIN transcript_segments AS segment ON segment.id = version.segment_id
+                    JOIN transcript_versions AS original
+                      ON original.segment_id = segment.id AND original.kind = 'original'
+                    LEFT JOIN transcript_correction_settings AS settings
+                      ON settings.session_id = segment.session_id
+                    WHERE segment.session_id = ?
+                      AND segment.end_ms >= ? AND segment.start_ms <= ?
+                      AND version.id IN ({placeholders})
+                    ORDER BY segment.start_ms, segment.id""",
+                (session_id, start_ms, end_ms, *version_ids),
             ).fetchall()
         return [TimelineTranscriptRecord(**dict(row)) for row in rows]
 
@@ -1045,6 +1095,21 @@ class Database:
                 (question_id,),
             ).fetchall()
         return [AnswerVersionRecord(**dict(row)) for row in rows]
+
+    def session_answers(self, session_id: str) -> list[SessionAnswerRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT answer.id, answer.question_id, answer.version_number,
+                          question.asked_at_ms, question.question, answer.model,
+                          answer.request_status, answer.answer, answer.error,
+                          answer.evidence_state, answer.created_at_utc
+                   FROM answer_versions AS answer
+                   JOIN questions AS question ON question.id = answer.question_id
+                   WHERE question.session_id = ? AND question.state = 'submitted'
+                   ORDER BY question.asked_at_ms, question.id, answer.version_number""",
+                (session_id,),
+            ).fetchall()
+        return [SessionAnswerRecord(**dict(row)) for row in rows]
 
     def answer_evidence(self, answer_version_id: int) -> list[AnswerEvidenceRecord]:
         with self.connect() as connection:
