@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jingzhi.provider_settings import ProviderSettingsStore
+from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,9 @@ class Settings:
     llm_api_mode: str = "responses"
     capture_microphone: bool = True
     capture_system_audio: bool = True
+    transcript_correction_enabled: bool = False
+    transcript_correction_window_seconds: int = CORRECTION_WINDOW_SECONDS[1]
+    transcript_correction_model: str = "gpt-5.5"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -38,4 +42,5 @@ class Settings:
             llm_base_url=os.getenv("OPENAI_BASE_URL", saved.base_url),
             llm_api_key=os.getenv("OPENAI_API_KEY", saved.api_key),
             llm_api_mode=os.getenv("OPENAI_API_MODE", saved.api_mode),
+            transcript_correction_model=os.getenv("TRANSCRIPT_CORRECTION_MODEL", saved.model),
         )

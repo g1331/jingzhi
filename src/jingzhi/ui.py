@@ -1,39 +1,102 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 import threading
+from difflib import SequenceMatcher
+from typing import ClassVar
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QSize, Qt, Signal, Slot
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
-    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from jingzhi.application import JingzhiApplicationService, SessionTimeline
 from jingzhi.config import Settings
+from jingzhi.database import TimelineFrameRecord, TimelineTranscriptRecord
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
+from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
 
 logger = logging.getLogger(__name__)
+
+
+def motion_enabled() -> bool:
+    if os.environ.get("JINGZHI_REDUCE_MOTION") == "1":
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        animations_enabled = ctypes.c_int()
+        success = ctypes.windll.user32.SystemParametersInfoW(  # type: ignore[attr-defined]
+            0x1042, 0, ctypes.byref(animations_enabled), 0
+        )
+    except (AttributeError, OSError):
+        return True
+    return not success or bool(animations_enabled.value)
+
+
+class EvidenceButton(QPushButton):
+    HOVER_DURATION_MS = 145
+
+    def __init__(self, text: str, *, animations: bool) -> None:
+        super().__init__(text)
+        self._animations = animations
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(0.92 if animations else 1.0)
+        self.setGraphicsEffect(self._opacity)
+        self._hover_animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._hover_animation.setDuration(self.HOVER_DURATION_MS)
+        self._hover_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def enterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._animate_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._animate_hover(0.92)
+        super().leaveEvent(event)
+
+    def _animate_hover(self, target: float) -> None:
+        if not self._animations:
+            self._opacity.setOpacity(1.0)
+            return
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._opacity.opacity())
+        self._hover_animation.setEndValue(target)
+        self._hover_animation.start()
 
 APP_STYLE = """
 QWidget {
     background: #111719;
     color: #e7ece9;
+    font-family: "Microsoft YaHei UI", "Segoe UI";
     font-size: 13px;
 }
 QMainWindow { background: #0b1012; }
@@ -124,6 +187,54 @@ QPushButton#noticeClose {
 }
 QFrame#contentPanel { background: #141b1d; border: 1px solid #273235; border-radius: 10px; }
 QSplitter::handle { background: #1f292b; height: 6px; }
+QFrame#libraryPanel { background: #0b1112; border-right: 1px solid #273235; }
+QFrame#detailPanel { background: #11191a; border-left: 1px solid #273235; }
+QListWidget#sessionLibrary {
+    background: transparent; border: none; outline: none; padding: 2px;
+}
+QListWidget#sessionLibrary::item {
+    min-height: 52px; padding: 7px 9px; border-radius: 6px; color: #b7c4bf;
+}
+QListWidget#sessionLibrary::item:hover { background: #151f20; }
+QListWidget#sessionLibrary::item:selected { background: #173329; color: #dcf5eb; }
+QFrame#timelinePanel { background: #0e1516; border: 1px solid #273235; border-radius: 8px; }
+QFrame[timelineTrack="true"] { background: #121b1c; border-top: 1px solid #243032; }
+QLabel#trackLabel { color: #71827c; font-size: 10px; font-weight: 700; }
+QPushButton[zoom="true"] { min-height: 25px; padding: 0 9px; font-size: 10px; }
+QPushButton[zoom="true"]:checked { color: #081612; background: #79d3b4; border-color: #79d3b4; }
+QPushButton[keyframe="true"] {
+    min-width: 132px; max-width: 132px; min-height: 88px; padding: 5px;
+    background: #edf0e9; color: #17201d; border: 1px solid #43514d;
+    text-align: left; font-size: 9px;
+}
+QPushButton[keyframe="true"]:hover { border-color: #79d3b4; }
+QPushButton[keyframe="true"][cited="true"] { border: 2px solid #79d3b4; }
+QPushButton[keyframe="true"][selected="true"] { border: 2px solid #e7b36a; }
+QPushButton[keyframe="true"][cited="true"][selected="true"] {
+    border: 2px solid #e7b36a; background: #dff5e9;
+}
+QPushButton[transcript="true"] {
+    min-width: 190px; max-width: 240px; min-height: 48px; padding: 6px 9px;
+    background: #182221; color: #bdcac5; border: 1px solid #33413e;
+    text-align: left; font-size: 9px;
+}
+QPushButton[transcript="true"][cited="true"] { border: 2px solid #79d3b4; }
+QPushButton[transcript="true"][selected="true"] { border: 2px solid #e7b36a; }
+QPushButton[transcript="true"][cited="true"][selected="true"] {
+    border: 2px solid #e7b36a; background: #17352d;
+}
+QPushButton[correctionState="corrected"] { color: #9ee7ca; }
+QPushButton[correctionState="pending"] { color: #ffd59a; }
+QPushButton[correctionState="recognizing"] { color: #a9c7ff; }
+QPushButton[correctionState="edited"] { color: #e7b36a; }
+QLabel#transcriptChip { background: #182221; border: 1px solid #33413e; padding: 7px; }
+QLabel#eventChip { color: #a7b5b0; background: #171f20; padding: 7px; }
+QFrame#recordingCapsule {
+    background: #111817; border: 1px solid #604927; border-radius: 9px;
+}
+QLabel#evidenceImage { background: #edeae1; border: 1px solid #374442; }
+QLabel#evidenceMetadata { color: #92a29c; font-size: 11px; }
+QLabel#emptyState { color: #71827c; font-size: 12px; }
 """
 
 
@@ -138,112 +249,163 @@ class UiBridge(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings) -> None:
+    CORRECTION_STATE_LABELS: ClassVar[dict[str, str]] = {
+        "recognizing": "识别中",
+        "pending": "待校订",
+        "corrected": "已校订",
+        "edited": "用户已编辑",
+    }
+    ZOOM_WINDOWS: ClassVar[dict[str, int | None]] = {
+        "whole": None,
+        "5-minutes": 5 * 60_000,
+        "1-minute": 60_000,
+        "seconds": 10_000,
+    }
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        service: JingzhiApplicationService | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("境织")
-        self.setMinimumSize(860, 640)
-        self.resize(1120, 780)
+        self.setMinimumSize(1080, 640)
+        self.resize(1280, 720)
         self.bridge = UiBridge()
-        self.manager = SessionManager(
-            settings,
-            on_segment=lambda start, end, source, text: self.bridge.segment.emit(
-                start, end, source, text
-            ),
-            on_error=self.bridge.worker_warning.emit,
-        )
+        if service is None:
+            manager = SessionManager(
+                settings,
+                on_segment=lambda start, end, source, text: self.bridge.segment.emit(
+                    start, end, source, text
+                ),
+                on_error=self.bridge.worker_warning.emit,
+            )
+            service = JingzhiApplicationService(manager.database, recorder=manager)
+        self.service = service
+        self.manager = service.recorder
+        self.settings = settings
+        self._selected_session_id: str | None = None
+        self._selected_frame: TimelineFrameRecord | None = None
+        self._selected_transcript: TimelineTranscriptRecord | None = None
+        self._timeline: SessionTimeline | None = None
+        self._zoom_key = "whole"
+        self._window_start_ms = 0
+        self._paused = False
+        self._animations_enabled = motion_enabled()
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
+        self._refresh_sessions()
 
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(20, 16, 20, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        header = QHBoxLayout()
-        title_column = QVBoxLayout()
-        title = QLabel("境织")
-        title.setObjectName("appTitle")
-        subtitle = QLabel("让刚刚发生的一切，随时可问")
-        subtitle.setObjectName("subtitle")
-        title_column.addWidget(title)
-        title_column.addWidget(subtitle)
-        header.addLayout(title_column)
-        header.addStretch(1)
+        capsule_row = QHBoxLayout()
+        capsule_row.setContentsMargins(220, 8, 280, 6)
+        capsule_row.addStretch(1)
+        capsule = QFrame()
+        capsule.setObjectName("recordingCapsule")
+        capsule_layout = QHBoxLayout(capsule)
+        capsule_layout.setContentsMargins(10, 6, 8, 6)
+        capsule_layout.setSpacing(7)
         self.status = QLabel("空闲")
         self.status.setObjectName("statusPill")
         self.status.setProperty("state", "idle")
-        header.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignBottom)
-        layout.addLayout(header)
-
-        provider_group = QGroupBox("模型连接")
-        provider_layout = QGridLayout(provider_group)
-        provider_layout.setHorizontalSpacing(10)
-        provider_layout.setVerticalSpacing(8)
-        provider_layout.setColumnStretch(1, 4)
-        provider_layout.setColumnStretch(3, 2)
-
-        self.base_url_input = QLineEdit(self.manager.llm_base_url)
-        self.base_url_input.setPlaceholderText(
-            "例如 https://provider.example/v1；官方 OpenAI 可留空"
-        )
-        self.base_url_input.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.api_mode_input = QComboBox()
-        self.api_mode_input.addItem("Responses API", "responses")
-        self.api_mode_input.addItem("Chat Completions", "chat_completions")
-        mode_index = self.api_mode_input.findData(self.manager.llm_api_mode)
-        self.api_mode_input.setCurrentIndex(max(0, mode_index))
-        self.api_key_input = QLineEdit(self.manager.llm_api_key)
-        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_input.setPlaceholderText("只保存在本次运行的内存中")
-        self.model_input = QLineEdit(self.manager.llm_model)
-        self.model_input.setPlaceholderText("支持图片输入的模型名称")
-        self.test_provider_button = QPushButton("测试连接")
-        self.save_provider_button = QPushButton("保存配置")
-
-        provider_layout.addWidget(QLabel("Base URL"), 0, 0)
-        provider_layout.addWidget(self.base_url_input, 0, 1)
-        provider_layout.addWidget(QLabel("接口类型"), 0, 2)
-        provider_layout.addWidget(self.api_mode_input, 0, 3)
-        provider_layout.addWidget(QLabel("API Key"), 1, 0)
-        provider_layout.addWidget(self.api_key_input, 1, 1)
-        provider_layout.addWidget(QLabel("模型"), 1, 2)
-        provider_layout.addWidget(self.model_input, 1, 3)
-        provider_buttons = QVBoxLayout()
-        provider_buttons.setSpacing(6)
-        provider_buttons.addWidget(self.test_provider_button)
-        provider_buttons.addWidget(self.save_provider_button)
-        provider_layout.addLayout(provider_buttons, 0, 4, 2, 1)
-        hint = QLabel(
-            "返回网页源码通常表示 Base URL 或接口类型不匹配。API Key 保存到 Windows 凭据管理器。"
-        )
-        hint.setObjectName("hint")
-        provider_layout.addWidget(hint, 2, 1, 1, 3)
-        layout.addWidget(provider_group)
-
-        session_group = QGroupBox("上下文会话")
-        session_layout = QHBoxLayout(session_group)
         self.title_input = QLineEdit("新会话")
-        self.title_input.setPlaceholderText("为这次记录命名")
+        self.title_input.setPlaceholderText("会话标题")
+        self.title_input.setMaximumWidth(150)
         self.system_audio_check = QCheckBox("系统声音")
-        self.system_audio_check.setChecked(self.manager.settings.capture_system_audio)
+        self.system_audio_check.setChecked(self.settings.capture_system_audio)
         self.microphone_check = QCheckBox("麦克风")
-        self.microphone_check.setChecked(self.manager.settings.capture_microphone)
+        self.microphone_check.setChecked(self.settings.capture_microphone)
         self.start_button = QPushButton("开始记录")
         self.start_button.setProperty("role", "primary")
         self.stop_button = QPushButton("结束")
         self.stop_button.setProperty("role", "danger")
         self.stop_button.setEnabled(False)
-        self.summary_button = QPushButton("生成会话总结")
-        session_layout.addWidget(QLabel("标题"))
-        session_layout.addWidget(self.title_input, 1)
-        session_layout.addWidget(self.system_audio_check)
-        session_layout.addWidget(self.microphone_check)
-        session_layout.addWidget(self.start_button)
-        session_layout.addWidget(self.stop_button)
-        session_layout.addWidget(self.summary_button)
-        layout.addWidget(session_group)
+        self.pause_button = QPushButton("暂停")
+        self.pause_button.setEnabled(callable(getattr(self.manager, "pause", None)))
+        if not self.pause_button.isEnabled():
+            self.pause_button.setToolTip("当前采集适配器尚未提供暂停能力")
+        self.capsule_ask_button = QPushButton("提问")
+        capsule_layout.addWidget(self.status)
+        capsule_layout.addWidget(self.title_input)
+        capsule_layout.addWidget(self.system_audio_check)
+        capsule_layout.addWidget(self.microphone_check)
+        capsule_layout.addWidget(self.pause_button)
+        capsule_layout.addWidget(self.capsule_ask_button)
+        capsule_layout.addWidget(self.start_button)
+        capsule_layout.addWidget(self.stop_button)
+        capsule_row.addWidget(capsule)
+        capsule_row.addStretch(1)
+        layout.addLayout(capsule_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(1)
+        splitter.addWidget(self._build_library_panel())
+        splitter.addWidget(self._build_workspace_panel())
+        splitter.addWidget(self._build_detail_panel())
+        splitter.setSizes([220, 780, 280])
+        layout.addWidget(splitter, 1)
+        self.setCentralWidget(root)
+
+    def _build_library_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("libraryPanel")
+        panel.setMinimumWidth(200)
+        panel.setMaximumWidth(230)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 12, 10, 12)
+        title = QLabel("境织")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("本地会话库")
+        subtitle.setObjectName("subtitle")
+        self.session_library = QListWidget()
+        self.session_library.setObjectName("sessionLibrary")
+        self.session_library.setSpacing(3)
+        self.session_library.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        panel_layout.addWidget(title)
+        panel_layout.addWidget(subtitle)
+        panel_layout.addSpacing(10)
+        panel_layout.addWidget(self.session_library, 1)
+        library_state = QLabel("会话与关键帧均保存在本机")
+        library_state.setObjectName("hint")
+        library_state.setWordWrap(True)
+        panel_layout.addWidget(library_state)
+        return panel
+
+    def _build_workspace_panel(self) -> QWidget:
+        panel = QFrame()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 8, 14, 12)
+        panel_layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title_column = QVBoxLayout()
+        self.workspace_breadcrumb = QLabel("会话 / 请选择会话")
+        self.workspace_breadcrumb.setObjectName("hint")
+        self.workspace_title = QLabel("关键帧时间线")
+        self.workspace_title.setObjectName("appTitle")
+        self.workspace_meta = QLabel("从左侧打开已有会话，沿统一时间线核对证据。")
+        self.workspace_meta.setObjectName("subtitle")
+        title_column.addWidget(self.workspace_breadcrumb)
+        title_column.addWidget(self.workspace_title)
+        title_column.addWidget(self.workspace_meta)
+        header.addLayout(title_column, 1)
+        self.summary_button = QPushButton("生成会话材料")
+        self.summary_button.setProperty("role", "primary")
+        self.provider_toggle_button = QPushButton("模型连接")
+        self.provider_toggle_button.setProperty("role", "quiet")
+        header.addWidget(self.provider_toggle_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        header.addWidget(self.summary_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        panel_layout.addLayout(header)
 
         self.notice = QFrame()
         self.notice.setObjectName("notice")
@@ -260,29 +422,566 @@ class MainWindow(QMainWindow):
         notice_layout.addWidget(self.notice_text, 1)
         notice_layout.addWidget(notice_close, alignment=Qt.AlignmentFlag.AlignTop)
         self.notice.hide()
-        layout.addWidget(self.notice)
+        panel_layout.addWidget(self.notice)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_transcript_panel())
-        splitter.addWidget(self._build_answer_panel())
-        splitter.setSizes([390, 260])
-        layout.addWidget(splitter, 1)
-        self.setCentralWidget(root)
-
-    def _build_transcript_panel(self) -> QWidget:
-        panel = QFrame()
-        panel.setObjectName("contentPanel")
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(12, 10, 12, 12)
-        heading = QLabel("实时字幕")
-        heading.setObjectName("sectionTitle")
-        self.transcript = QPlainTextEdit()
-        self.transcript.setReadOnly(True)
-        self.transcript.setPlaceholderText("开始记录后，字幕会按时间出现在这里。")
-        panel_layout.addWidget(heading)
-        panel_layout.addWidget(self.transcript, 1)
+        panel_layout.addWidget(self._build_timeline_panel(), 3)
+        panel_layout.addWidget(self._build_answer_panel(), 2)
+        self.provider_group = self._build_provider_panel()
+        self.provider_group.hide()
+        panel_layout.addWidget(self.provider_group)
         return panel
+
+    def _build_provider_panel(self) -> QWidget:
+        provider_group = QGroupBox("模型连接")
+        provider_layout = QGridLayout(provider_group)
+        provider_layout.setHorizontalSpacing(10)
+        provider_layout.setVerticalSpacing(8)
+        provider_layout.setColumnStretch(1, 4)
+        provider_layout.setColumnStretch(3, 2)
+
+        self.base_url_input = QLineEdit(getattr(self.manager, "llm_base_url", ""))
+        self.base_url_input.setPlaceholderText(
+            "例如 https://provider.example/v1；官方 OpenAI 可留空"
+        )
+        self.base_url_input.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.api_mode_input = QComboBox()
+        self.api_mode_input.addItem("Responses API", "responses")
+        self.api_mode_input.addItem("Chat Completions", "chat_completions")
+        mode_index = self.api_mode_input.findData(
+            getattr(self.manager, "llm_api_mode", "responses")
+        )
+        self.api_mode_input.setCurrentIndex(max(0, mode_index))
+        self.api_key_input = QLineEdit(getattr(self.manager, "llm_api_key", ""))
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText("只保存在本次运行的内存中")
+        self.model_input = QLineEdit(getattr(self.manager, "llm_model", ""))
+        self.model_input.setPlaceholderText("支持图片输入的模型名称")
+        self.test_provider_button = QPushButton("测试连接")
+        self.save_provider_button = QPushButton("保存配置")
+        self.correction_check = QCheckBox("启用字幕校订")
+        self.correction_check.setChecked(self.settings.transcript_correction_enabled)
+        self.correction_window_input = QComboBox()
+        for seconds in CORRECTION_WINDOW_SECONDS:
+            self.correction_window_input.addItem(f"{seconds} 秒", seconds)
+        correction_index = self.correction_window_input.findData(
+            self.settings.transcript_correction_window_seconds
+        )
+        self.correction_window_input.setCurrentIndex(max(0, correction_index))
+        self.correction_model_input = QLineEdit(
+            getattr(self.manager, "correction_model", self.settings.transcript_correction_model)
+        )
+        self.correction_model_input.setPlaceholderText("字幕校订角色使用的小模型")
+
+        provider_layout.addWidget(QLabel("Base URL"), 0, 0)
+        provider_layout.addWidget(self.base_url_input, 0, 1)
+        provider_layout.addWidget(QLabel("接口类型"), 0, 2)
+        provider_layout.addWidget(self.api_mode_input, 0, 3)
+        provider_layout.addWidget(QLabel("API Key"), 1, 0)
+        provider_layout.addWidget(self.api_key_input, 1, 1)
+        provider_layout.addWidget(QLabel("模型"), 1, 2)
+        provider_layout.addWidget(self.model_input, 1, 3)
+        provider_buttons = QVBoxLayout()
+        provider_buttons.setSpacing(6)
+        provider_buttons.addWidget(self.test_provider_button)
+        provider_buttons.addWidget(self.save_provider_button)
+        provider_layout.addLayout(provider_buttons, 0, 4, 2, 1)
+        provider_layout.addWidget(self.correction_check, 2, 0, 1, 2)
+        provider_layout.addWidget(QLabel("校订窗口"), 2, 2)
+        provider_layout.addWidget(self.correction_window_input, 2, 3)
+        provider_layout.addWidget(QLabel("校订模型"), 3, 0)
+        provider_layout.addWidget(self.correction_model_input, 3, 1, 1, 3)
+        hint = QLabel(
+            "返回网页源码通常表示 Base URL 或接口类型不匹配；API Key 保存到 Windows "
+            "凭据管理器。启用字幕校订会按所选窗口发送相邻字幕和带来源时间标签的代表性"
+            "关键帧；关闭时只使用本地 Whisper 原文。"
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        provider_layout.addWidget(hint, 4, 0, 1, 4)
+        return provider_group
+
+    def _build_timeline_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("timelinePanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(12, 7, 9, 7)
+        timeline_title = QLabel("统一时间线")
+        timeline_title.setObjectName("sectionTitle")
+        self.timeline_range = QLabel("00:00 — 00:00")
+        self.timeline_range.setObjectName("hint")
+        toolbar.addWidget(timeline_title)
+        toolbar.addWidget(self.timeline_range)
+        toolbar.addStretch(1)
+        self.zoom_group = QButtonGroup(self)
+        self.zoom_group.setExclusive(True)
+        for key, text in (
+            ("whole", "整段"),
+            ("5-minutes", "5 分钟"),
+            ("1-minute", "1 分钟"),
+            ("seconds", "秒级"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName(f"zoom-{key}")
+            button.setProperty("zoom", True)
+            button.setCheckable(True)
+            button.setChecked(key == "whole")
+            button.clicked.connect(lambda _checked=False, zoom_key=key: self._set_zoom(zoom_key))
+            self.zoom_group.addButton(button)
+            toolbar.addWidget(button)
+        panel_layout.addLayout(toolbar)
+
+        navigator_row = QHBoxLayout()
+        navigator_row.setContentsMargins(12, 0, 10, 5)
+        navigator_label = QLabel("窗口起点")
+        navigator_label.setObjectName("trackLabel")
+        self.timeline_navigator = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_navigator.setObjectName("timelineNavigator")
+        self.timeline_navigator.setTracking(False)
+        self.timeline_navigator.setEnabled(False)
+        self.timeline_navigator.valueChanged.connect(self._navigate_timeline)
+        navigator_row.addWidget(navigator_label)
+        navigator_row.addWidget(self.timeline_navigator, 1)
+        panel_layout.addLayout(navigator_row)
+
+        self.keyframe_track, self.keyframe_content, self.keyframe_layout = self._make_track(
+            "keyframeTrack", "关键帧", 106
+        )
+        panel_layout.addWidget(self.keyframe_track)
+
+        self.transcript_track, self.transcript_content, self.transcript_layout = self._make_track(
+            "transcriptTrack", "字幕", 68
+        )
+        panel_layout.addWidget(self.transcript_track)
+
+        event_frame = QFrame()
+        event_frame.setObjectName("eventTrack")
+        event_frame.setProperty("timelineTrack", True)
+        event_layout = QHBoxLayout(event_frame)
+        event_layout.setContentsMargins(10, 4, 8, 4)
+        event_label = QLabel("事件")
+        event_label.setObjectName("trackLabel")
+        event_label.setFixedWidth(48)
+        self.event_text = QLabel("选择会话后显示会话边界与状态")
+        self.event_text.setObjectName("eventChip")
+        event_layout.addWidget(event_label)
+        event_layout.addWidget(self.event_text, 1)
+        panel_layout.addWidget(event_frame)
+        return panel
+
+    @staticmethod
+    def _make_track(
+        object_name: str, label_text: str, height: int
+    ) -> tuple[QWidget, QWidget, QHBoxLayout]:
+        frame = QFrame()
+        frame.setObjectName(object_name)
+        frame.setProperty("timelineTrack", True)
+        frame.setMinimumHeight(height)
+        track_layout = QHBoxLayout(frame)
+        track_layout.setContentsMargins(10, 4, 8, 4)
+        label = QLabel(label_text)
+        label.setObjectName("trackLabel")
+        label.setFixedWidth(48)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        track_layout.addWidget(label)
+        track_layout.addWidget(scroll, 1)
+        return frame, content, content_layout
+
+    def _build_detail_panel(self) -> QWidget:
+        panel = QFrame()
+        self.detail_panel = panel
+        panel.setObjectName("detailPanel")
+        panel.setMinimumWidth(260)
+        panel.setMaximumWidth(300)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
+        heading = QLabel("证据详情")
+        heading.setObjectName("sectionTitle")
+        self.evidence_image = QLabel("选择关键帧查看大图")
+        self.evidence_image.setObjectName("evidenceImage")
+        self.evidence_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.evidence_image.setMinimumHeight(180)
+        self.evidence_image.setWordWrap(True)
+        self.evidence_title = QLabel("尚未选择证据")
+        self.evidence_title.setObjectName("appTitle")
+        self.evidence_title.setWordWrap(True)
+        self.evidence_metadata = QLabel("来源与会话相对时间将在这里显示。")
+        self.evidence_metadata.setObjectName("evidenceMetadata")
+        self.evidence_metadata.setWordWrap(True)
+        self.evidence_version = QLabel()
+        self.evidence_version.setObjectName("hint")
+        self.evidence_version.setWordWrap(True)
+        self.evidence_version.hide()
+        transcript_actions = QHBoxLayout()
+        self.transcript_diff_button = QPushButton("查看差异")
+        self.transcript_edit_button = QPushButton("手动编辑")
+        self.transcript_undo_button = QPushButton("撤销校订")
+        for button in (
+            self.transcript_diff_button,
+            self.transcript_edit_button,
+            self.transcript_undo_button,
+        ):
+            button.setProperty("role", "quiet")
+            button.hide()
+            transcript_actions.addWidget(button)
+        panel_layout.addWidget(heading)
+        panel_layout.addSpacing(6)
+        panel_layout.addWidget(self.evidence_image)
+        panel_layout.addWidget(self.evidence_title)
+        panel_layout.addWidget(self.evidence_metadata)
+        panel_layout.addWidget(self.evidence_version)
+        panel_layout.addLayout(transcript_actions)
+        panel_layout.addStretch(1)
+        self._detail_opacity = QGraphicsOpacityEffect(panel)
+        self._detail_opacity.setOpacity(1.0)
+        panel.setGraphicsEffect(self._detail_opacity)
+        self._detail_animation = QPropertyAnimation(self._detail_opacity, b"opacity", panel)
+        self._detail_animation.setDuration(220)
+        self._detail_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        return panel
+
+    @staticmethod
+    def _format_time(milliseconds: int) -> str:
+        total_seconds = max(0, milliseconds // 1000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _refresh_sessions(self, select_session_id: str | None = None) -> None:
+        selected_id = select_session_id or self._selected_session_id
+        self.session_library.blockSignals(True)
+        self.session_library.clear()
+        selected_item: QListWidgetItem | None = None
+        for session in self.service.list_sessions():
+            state = "记录中" if session.status == "recording" else "已完成"
+            item = QListWidgetItem(
+                f"{session.title}\n{state} · {self._format_time(session.duration_ms)}"
+                f" · {session.frame_count} 帧"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, session.id)
+            item.setToolTip(session.started_at_utc)
+            self.session_library.addItem(item)
+            if session.id == selected_id:
+                selected_item = item
+        self.session_library.blockSignals(False)
+        if selected_item is None and self.session_library.count():
+            selected_item = self.session_library.item(0)
+        if selected_item is not None:
+            self.session_library.setCurrentItem(selected_item)
+            self._open_session_item(selected_item)
+        else:
+            self._show_empty_timeline()
+
+    def _open_session_item(self, item: QListWidgetItem | None) -> None:
+        if item is None:
+            return
+        session_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self._selected_session_id = session_id
+        correction_settings = self.service.transcript_correction_settings(session_id)
+        self.correction_check.blockSignals(True)
+        self.correction_window_input.blockSignals(True)
+        self.correction_check.setChecked(correction_settings.enabled)
+        correction_index = self.correction_window_input.findData(
+            correction_settings.window_ms // 1000
+        )
+        self.correction_window_input.setCurrentIndex(max(0, correction_index))
+        self.correction_check.blockSignals(False)
+        self.correction_window_input.blockSignals(False)
+        window_duration = self.ZOOM_WINDOWS[self._zoom_key]
+        try:
+            timeline = self.service.open_session(
+                session_id,
+                window_start_ms=self._window_start_ms,
+                window_duration_ms=window_duration,
+            )
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        self._timeline = timeline
+        self._selected_frame = None
+        self._selected_transcript = None
+        self._render_timeline(timeline)
+
+    def _select_session_item(self, item: QListWidgetItem | None) -> None:
+        self._window_start_ms = 0
+        self._open_session_item(item)
+
+    def _set_zoom(self, zoom_key: str) -> None:
+        self._zoom_key = zoom_key
+        self._window_start_ms = 0
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
+
+    @Slot(int)
+    def _navigate_timeline(self, start_seconds: int) -> None:
+        next_start_ms = start_seconds * 1000
+        if next_start_ms == self._window_start_ms:
+            return
+        self._window_start_ms = next_start_ms
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
+
+    def _render_timeline(self, timeline: SessionTimeline) -> None:
+        session = timeline.session
+        self.workspace_breadcrumb.setText(f"会话 / {session.started_at_utc[:10]}")
+        self.workspace_title.setText(session.title)
+        state = "记录中" if session.status == "recording" else "已完成"
+        self.workspace_meta.setText(
+            f"{state} · {len(timeline.frames)} 张关键帧位于当前缩放窗口"
+        )
+        self.timeline_range.setText(
+            f"{self._format_time(timeline.window_start_ms)} — "
+            f"{self._format_time(min(timeline.window_end_ms, timeline.duration_ms))}"
+        )
+        window_duration = self.ZOOM_WINDOWS[self._zoom_key]
+        maximum_start_ms = (
+            0 if window_duration is None else max(0, timeline.duration_ms - window_duration)
+        )
+        self.timeline_navigator.blockSignals(True)
+        self.timeline_navigator.setRange(0, maximum_start_ms // 1000)
+        self.timeline_navigator.setValue(timeline.window_start_ms // 1000)
+        self.timeline_navigator.setEnabled(maximum_start_ms > 0)
+        self.timeline_navigator.blockSignals(False)
+
+        self._clear_layout(self.keyframe_layout)
+        if timeline.frames:
+            cursor_ms = timeline.window_start_ms
+            for frame in timeline.frames:
+                gap_seconds = max(0, (frame.ts_ms - cursor_ms) // 1000)
+                if gap_seconds:
+                    self.keyframe_layout.addStretch(gap_seconds)
+                button = EvidenceButton(
+                    f"{self._format_time(frame.ts_ms)}\n{frame.source_id}",
+                    animations=self._animations_enabled,
+                )
+                button.setObjectName(f"keyframe-{frame.id}")
+                button.setProperty("keyframe", True)
+                button.setProperty("selected", False)
+                button.setProperty("cited", frame.id in timeline.answer_frame_ids)
+                button.setToolTip(
+                    f"关键帧 #{frame.id} · {frame.source_id} · "
+                    f"{self._format_time(frame.ts_ms)}"
+                )
+                pixmap = QPixmap(str(frame.path))
+                if not pixmap.isNull():
+                    thumbnail = pixmap.scaled(
+                        QSize(82, 58),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    button.setIcon(QIcon(thumbnail))
+                    button.setIconSize(QSize(82, 58))
+                button.clicked.connect(
+                    lambda _checked=False, selected_frame=frame: self._select_frame(selected_frame)
+                )
+                self.keyframe_layout.addWidget(button)
+                cursor_ms = frame.ts_ms
+            tail_seconds = max(1, (timeline.window_end_ms - cursor_ms) // 1000)
+            self.keyframe_layout.addStretch(tail_seconds)
+        else:
+            empty = QLabel("当前缩放窗口内没有关键帧")
+            empty.setObjectName("emptyState")
+            self.keyframe_layout.addWidget(empty)
+            self.keyframe_layout.addStretch(1)
+
+        self._clear_layout(self.transcript_layout)
+        if timeline.transcripts:
+            cursor_ms = timeline.window_start_ms
+            for transcript in timeline.transcripts:
+                gap_seconds = max(0, (transcript.start_ms - cursor_ms) // 1000)
+                if gap_seconds:
+                    self.transcript_layout.addStretch(gap_seconds)
+                state_label = self.CORRECTION_STATE_LABELS.get(
+                    transcript.correction_state or ""
+                )
+                prefix = f"{state_label} · " if state_label else ""
+                button = EvidenceButton(
+                    f"{prefix}{self._format_time(transcript.start_ms)}–"
+                    f"{self._format_time(transcript.end_ms)}\n{transcript.text}",
+                    animations=self._animations_enabled,
+                )
+                button.setObjectName(f"transcript-{transcript.id}")
+                button.setProperty("transcript", True)
+                button.setProperty("selected", False)
+                button.setProperty(
+                    "cited", transcript.id in timeline.answer_transcript_ids
+                )
+                button.setProperty("correctionState", transcript.correction_state or "")
+                button.setToolTip(f"{transcript.source} · {transcript.text}")
+                button.clicked.connect(
+                    lambda _checked=False, item=transcript: self._select_transcript(item)
+                )
+                self.transcript_layout.addWidget(button)
+                cursor_ms = transcript.end_ms
+            tail_seconds = max(1, (timeline.window_end_ms - cursor_ms) // 1000)
+            self.transcript_layout.addStretch(tail_seconds)
+        else:
+            empty = QLabel("当前缩放窗口内没有字幕片段")
+            empty.setObjectName("emptyState")
+            self.transcript_layout.addWidget(empty)
+            self.transcript_layout.addStretch(1)
+
+        question_events = "  ·  ".join(
+            f"Q {self._format_time(question.asked_at_ms)} {question.question}"
+            for question in timeline.questions
+        )
+        self.event_text.setText(
+            f"会话开始 00:00  ·  当前窗口 "
+            f"{self._format_time(timeline.window_start_ms)}–"
+            f"{self._format_time(min(timeline.window_end_ms, timeline.duration_ms))}  ·  "
+            f"{question_events or '无问题锚点'}  ·  {state}"
+        )
+        self.evidence_image.clear()
+        self.evidence_image.setText("选择关键帧查看大图")
+        self.evidence_title.setText("尚未选择证据")
+        self.evidence_metadata.setText("来源与会话相对时间将在这里显示。")
+        self.evidence_version.hide()
+        self._show_transcript_actions(False)
+        self._animate_detail_change()
+
+    @staticmethod
+    def _clear_layout(layout: QHBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    @Slot()
+    def _select_frame(self, frame: TimelineFrameRecord) -> None:
+        self._selected_frame = frame
+        self._selected_transcript = None
+        self._set_selected_evidence_button(f"keyframe-{frame.id}")
+        self.evidence_image.setStyleSheet("background: #edeae1; color: #17201d;")
+        pixmap = QPixmap(str(frame.path))
+        if pixmap.isNull():
+            self.evidence_image.setText("关键帧文件不可读取")
+        else:
+            self.evidence_image.setPixmap(
+                pixmap.scaled(
+                    self.evidence_image.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        self.evidence_title.setText(f"关键帧 #{frame.id}")
+        self.evidence_metadata.setText(
+            f"来源：{frame.source_id}\n"
+            f"会话时间：{self._format_time(frame.ts_ms)}\n"
+            f"尺寸：{frame.width} × {frame.height}\n"
+            f"稳定 ID：{frame.id}"
+        )
+        self.evidence_version.hide()
+        self._show_transcript_actions(False)
+        self._animate_detail_change()
+
+    @Slot()
+    def _select_transcript(self, transcript: TimelineTranscriptRecord) -> None:
+        self._selected_frame = None
+        self._selected_transcript = transcript
+        self._set_selected_evidence_button(f"transcript-{transcript.id}")
+        self.evidence_image.setPixmap(QPixmap())
+        self.evidence_image.setStyleSheet(
+            "background: #172221; color: #dce8e3; padding: 18px; font-size: 15px;"
+        )
+        self.evidence_image.setText(f"“{transcript.text}”")
+        self.evidence_title.setText(f"字幕片段 #{transcript.id}")
+        self.evidence_metadata.setText(
+            f"来源：{transcript.source}\n"
+            f"会话时间：{self._format_time(transcript.start_ms)}–"
+            f"{self._format_time(transcript.end_ms)}\n"
+            f"稳定 ID：{transcript.id}"
+        )
+        state_label = self.CORRECTION_STATE_LABELS.get(transcript.correction_state or "")
+        if state_label:
+            self.evidence_version.setText(
+                f"字幕校订已启用 · 当前状态：{state_label}\nWhisper 原文保留为独立版本。"
+            )
+            self.evidence_version.show()
+        else:
+            self.evidence_version.hide()
+        editable = transcript.version_id is not None and transcript.version_kind != "recognizing"
+        self._show_transcript_actions(editable)
+        self.transcript_undo_button.setVisible(editable and transcript.version_kind == "correction")
+        self._animate_detail_change()
+
+    def _show_transcript_actions(self, visible: bool) -> None:
+        self.transcript_diff_button.setVisible(visible)
+        self.transcript_edit_button.setVisible(visible)
+        if not visible:
+            self.transcript_undo_button.hide()
+
+    @staticmethod
+    def _transcript_diff(original: str, current: str) -> str:
+        parts: list[str] = []
+        for tag, old_start, old_end, new_start, new_end in SequenceMatcher(
+            None, original, current
+        ).get_opcodes():
+            if tag == "equal":
+                parts.append(original[old_start:old_end])
+            elif tag == "delete":
+                parts.append(f"[-{original[old_start:old_end]}-]")
+            elif tag == "insert":
+                parts.append(f"{{+{current[new_start:new_end]}+}}")
+            else:
+                parts.append(f"[-{original[old_start:old_end]}-]")
+                parts.append(f"{{+{current[new_start:new_end]}+}}")
+        return "".join(parts)
+
+    def _set_selected_evidence_button(self, object_name: str) -> None:
+        for button in self.findChildren(QPushButton):
+            if not (
+                button.objectName().startswith("keyframe-")
+                or button.objectName().startswith("transcript-")
+            ):
+                continue
+            button.setProperty("selected", button.objectName() == object_name)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _animate_detail_change(self) -> None:
+        if not self._animations_enabled:
+            self._detail_opacity.setOpacity(1.0)
+            return
+        self._detail_animation.stop()
+        self._detail_animation.setStartValue(0.72)
+        self._detail_animation.setEndValue(1.0)
+        self._detail_animation.start()
+
+    def _show_empty_timeline(self) -> None:
+        self.workspace_breadcrumb.setText("会话 / 暂无会话")
+        self.workspace_title.setText("关键帧时间线")
+        self.workspace_meta.setText("开始一段会话后，关键帧会出现在这里。")
+        self.timeline_range.setText("00:00 — 00:00")
+        self._clear_layout(self.keyframe_layout)
+        empty = QLabel("暂无可浏览的会话")
+        empty.setObjectName("emptyState")
+        self.keyframe_layout.addWidget(empty)
+        self.keyframe_layout.addStretch(1)
+        self._clear_layout(self.transcript_layout)
+        transcript_empty = QLabel("暂无字幕片段")
+        transcript_empty.setObjectName("emptyState")
+        self.transcript_layout.addWidget(transcript_empty)
+        self.transcript_layout.addStretch(1)
+        self.timeline_navigator.setRange(0, 0)
+        self.timeline_navigator.setEnabled(False)
+        self.event_text.setText("尚未开始会话")
 
     def _build_answer_panel(self) -> QWidget:
         panel = QFrame()
@@ -314,15 +1013,28 @@ class MainWindow(QMainWindow):
         return panel
 
     def _connect_signals(self) -> None:
+        self.session_library.currentItemChanged.connect(
+            lambda current, _previous: self._select_session_item(current)
+        )
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self._stop)
+        self.pause_button.clicked.connect(self._toggle_pause)
+        self.capsule_ask_button.clicked.connect(self._focus_question)
         self.ask_button.clicked.connect(self._ask)
         self.question.returnPressed.connect(self._ask)
         self.summary_button.clicked.connect(self._summarize)
         self.test_provider_button.clicked.connect(self._test_provider)
         self.save_provider_button.clicked.connect(self._save_provider)
+        self.correction_check.toggled.connect(self._configure_correction)
+        self.correction_window_input.currentIndexChanged.connect(self._configure_correction)
+        self.transcript_diff_button.clicked.connect(self._show_transcript_diff)
+        self.transcript_edit_button.clicked.connect(self._edit_selected_transcript)
+        self.transcript_undo_button.clicked.connect(self._undo_selected_correction)
         self.output_source_button.clicked.connect(self._toggle_output_source)
         self.copy_output_button.clicked.connect(self._copy_output_source)
+        self.provider_toggle_button.clicked.connect(
+            lambda: self.provider_group.setVisible(not self.provider_group.isVisible())
+        )
         self.output.render_failed.connect(self._show_worker_warning)
         self.bridge.segment.connect(self._append_segment)
         self.bridge.worker_warning.connect(self._show_worker_warning)
@@ -401,7 +1113,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _start(self) -> None:
         try:
-            session_id = self.manager.start(
+            self._configure_correction()
+            session_id = self.service.start_session(
                 self.title_input.text(),
                 capture_system_audio=self.system_audio_check.isChecked(),
                 capture_microphone=self.microphone_check.isChecked(),
@@ -412,8 +1125,93 @@ class MainWindow(QMainWindow):
         self._set_status(f"记录中 · {session_id[:8]}", "recording")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.pause_button.setEnabled(callable(getattr(self.manager, "pause", None)))
         self.system_audio_check.setEnabled(False)
         self.microphone_check.setEnabled(False)
+        self.correction_check.setEnabled(False)
+        self.correction_window_input.setEnabled(False)
+        self.correction_model_input.setEnabled(False)
+        self._refresh_sessions(session_id)
+
+    @Slot()
+    def _configure_correction(self) -> None:
+        enabled = self.correction_check.isChecked()
+        window_seconds = int(self.correction_window_input.currentData())
+        configure_manager = getattr(self.manager, "configure_transcript_correction", None)
+        if callable(configure_manager):
+            configure_manager(
+                enabled=enabled,
+                window_seconds=window_seconds,
+                model=self.correction_model_input.text(),
+            )
+        if self._selected_session_id is not None:
+            self.service.configure_transcript_correction(
+                self._selected_session_id,
+                enabled=enabled,
+                window_seconds=window_seconds,
+            )
+            current = self.session_library.currentItem()
+            if current is not None:
+                self._open_session_item(current)
+
+    @Slot()
+    def _show_transcript_diff(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        self.evidence_version.setText(
+            "原文与当前版本差异：\n"
+            + self._transcript_diff(transcript.original_text, transcript.text)
+        )
+        self.evidence_version.show()
+
+    @Slot()
+    def _edit_selected_transcript(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self, "手动编辑字幕", "字幕内容", transcript.text
+        )
+        if not accepted:
+            return
+        try:
+            self.service.edit_transcript(transcript.id, text)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports validation failures
+            self._show_action_error(str(exc))
+            return
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
+
+    @Slot()
+    def _undo_selected_correction(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        self.service.undo_transcript_correction(transcript.id)
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
+
+    @Slot()
+    def _focus_question(self) -> None:
+        self.question.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    @Slot()
+    def _toggle_pause(self) -> None:
+        method_name = "resume" if self._paused else "pause"
+        method = getattr(self.manager, method_name, None)
+        if not callable(method):
+            return
+        try:
+            method()
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces adapter failures
+            self._show_action_error(str(exc))
+            return
+        self._paused = not self._paused
+        self.pause_button.setText("继续" if self._paused else "暂停")
+        self._set_status("已暂停" if self._paused else "记录中", "recording")
 
     @Slot()
     def _stop(self) -> None:
@@ -422,7 +1220,7 @@ class MainWindow(QMainWindow):
 
         def work() -> None:
             try:
-                session_id = self.manager.stop()
+                session_id = self.service.stop_session()
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
@@ -508,8 +1306,10 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str, str)
     def _append_segment(self, start_ms: int, _end_ms: int, source: str, text: str) -> None:
-        source_name = "系统" if source == "system" else "麦克风"
-        self.transcript.appendPlainText(f"[{start_ms / 1000:7.1f}s][{source_name}] {text}")
+        del start_ms, source, text
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
 
     @Slot(str)
     def _show_worker_warning(self, message: str) -> None:
@@ -556,22 +1356,32 @@ class MainWindow(QMainWindow):
         self._set_status(f"已结束 · {session_id[:8]}", "success")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
+        self.pause_button.setText("暂停")
+        self._paused = False
         self.system_audio_check.setEnabled(True)
         self.microphone_check.setEnabled(True)
+        self.correction_check.setEnabled(True)
+        self.correction_window_input.setEnabled(True)
+        self.correction_model_input.setEnabled(True)
+        self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        try:
-            self.manager.configure_provider(
-                model=self.model_input.text(),
-                base_url=self.base_url_input.text(),
-                api_key=self.api_key_input.text(),
-                api_mode=str(self.api_mode_input.currentData()),
-            )
-            self.manager.save_provider()
-        except Exception:
-            logger.exception("Could not save provider settings while closing")
-        if self.manager.is_recording:
-            self.manager.stop()
+        configure_provider = getattr(self.manager, "configure_provider", None)
+        save_provider = getattr(self.manager, "save_provider", None)
+        if callable(configure_provider) and callable(save_provider):
+            try:
+                configure_provider(
+                    model=self.model_input.text(),
+                    base_url=self.base_url_input.text(),
+                    api_key=self.api_key_input.text(),
+                    api_mode=str(self.api_mode_input.currentData()),
+                )
+                save_provider()
+            except Exception:
+                logger.exception("Could not save provider settings while closing")
+        if self.service.is_recording:
+            self.service.stop_session()
         event.accept()
 
 

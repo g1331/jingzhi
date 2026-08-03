@@ -15,6 +15,11 @@ from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
 from jingzhi.transcribe import TranscriptionWorker
+from jingzhi.transcript_correction import (
+    CORRECTION_WINDOW_SECONDS,
+    CorrectionWindowBatcher,
+    TranscriptCorrectionProcessor,
+)
 
 
 class SessionManager:
@@ -36,6 +41,13 @@ class SessionManager:
         self.workers: list[threading.Thread] = []
         self.chunk_queue: queue.Queue[AudioChunk | None] | None = None
         self.transcriber: TranscriptionWorker | None = None
+        self.correction_enabled = settings.transcript_correction_enabled
+        self.correction_window_seconds = settings.transcript_correction_window_seconds
+        self.correction_model = settings.transcript_correction_model
+        self.correction_queue: queue.Queue[tuple[str, int] | None] | None = None
+        self.correction_worker: threading.Thread | None = None
+        self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
+        self.correction_flush_event = threading.Event()
         self.llm_model = settings.llm_model
         self.llm_base_url = settings.llm_base_url
         self.llm_api_key = settings.llm_api_key
@@ -60,6 +72,38 @@ class SessionManager:
             base_url=self.llm_base_url,
             api_mode=self.llm_api_mode,
         )
+
+    def transcript_correction_model(self) -> OpenAIContextModel:
+        return OpenAIContextModel(
+            self.correction_model,
+            api_key=self.llm_api_key,
+            base_url=self.llm_base_url,
+            api_mode=self.llm_api_mode,
+        )
+
+    def configure_transcript_correction(
+        self, *, enabled: bool, window_seconds: int, model: str
+    ) -> None:
+        if window_seconds not in CORRECTION_WINDOW_SECONDS:
+            raise ValueError("Correction window must be 15, 30, or 60 seconds")
+        model = model.strip()
+        if not model:
+            raise ValueError("Correction model is required")
+        if window_seconds != self.correction_window_seconds:
+            if self.is_recording:
+                raise RuntimeError("Cannot change the correction window during a recording")
+            self.correction_batcher = CorrectionWindowBatcher(window_seconds)
+        self.correction_enabled = enabled
+        self.correction_window_seconds = window_seconds
+        self.correction_model = model
+        if self.session_id is not None:
+            self.database.configure_transcript_correction(
+                self.session_id,
+                enabled=enabled,
+                window_ms=window_seconds * 1000,
+            )
+            if enabled:
+                self._start_correction_worker()
 
     def save_provider(self) -> None:
         self.provider_settings_store.save(
@@ -96,6 +140,14 @@ class SessionManager:
         self.clock = clock
         self.stop_event = stop_event
         self.chunk_queue = chunk_queue
+        self.database.configure_transcript_correction(
+            session_id,
+            enabled=self.correction_enabled,
+            window_ms=self.correction_window_seconds * 1000,
+        )
+        self.correction_flush_event.clear()
+        if self.correction_enabled:
+            self._start_correction_worker()
         self.workers = [
             ScreenCaptureWorker(
                 database=self.database,
@@ -143,12 +195,64 @@ class SessionManager:
             device=self.settings.whisper_device,
             compute_type=self.settings.whisper_compute_type,
             on_segment=self.on_segment,
+            on_persisted_segment=self._enqueue_correction,
+            on_recognition_started=(
+                (lambda start, end, source: self.on_segment(start, end, source, ""))
+                if self.on_segment
+                else None
+            ),
             on_error=self.on_error,
         )
         self.transcriber.start()
         for worker in self.workers:
             worker.start()
         return session_id
+
+    def _start_correction_worker(self) -> None:
+        if self.correction_worker is not None and self.correction_worker.is_alive():
+            return
+        self.correction_queue = queue.Queue()
+
+        def work() -> None:
+            assert self.correction_queue is not None
+            while True:
+                item = self.correction_queue.get()
+                try:
+                    if item is None:
+                        return
+                    session_id, window_start_ms = item
+                    window_ms = self.correction_window_seconds * 1000
+                    ready_at_ms = (
+                        window_start_ms + window_ms + round(self.settings.audio_chunk_s * 1000)
+                    )
+                    now_ms = self.clock.now_ms() if self.clock is not None else ready_at_ms
+                    wait_seconds = max(0, ready_at_ms - now_ms) / 1000
+                    self.correction_flush_event.wait(wait_seconds)
+                    settings = self.database.transcript_correction_settings(session_id)
+                    if not settings.enabled:
+                        continue
+                    result = TranscriptCorrectionProcessor(
+                        self.database, self.transcript_correction_model()
+                    ).run(session_id, window_start_ms=window_start_ms)
+                    if result.state == "failed" and self.on_error:
+                        self.on_error(
+                            f"Transcript correction failed via {result.error_source}: {result.error}"
+                        )
+                    if self.on_segment:
+                        self.on_segment(window_start_ms, window_start_ms, "", "")
+                finally:
+                    self.correction_queue.task_done()
+
+        self.correction_worker = threading.Thread(
+            target=work, name="transcript-correction", daemon=True
+        )
+        self.correction_worker.start()
+
+    def _enqueue_correction(self, session_id: str, _segment_id: int, start_ms: int) -> None:
+        if not self.correction_enabled or self.correction_queue is None:
+            return
+        for item in self.correction_batcher.add_segment(session_id, start_ms):
+            self.correction_queue.put(item)
 
     def test_provider(self) -> str:
         return self._context_model().test_connection()
@@ -165,16 +269,30 @@ class SessionManager:
         if self.transcriber and self.transcriber.is_alive():
             self.chunk_queue.put(None)
             self.transcriber.join(timeout=120)
+        self.correction_flush_event.set()
+        if self.correction_worker and self.correction_worker.is_alive():
+            assert self.correction_queue is not None
+            self.correction_queue.put(None)
+            self.correction_worker.join(timeout=120)
         ended_at = datetime.now(UTC).isoformat()
         assert session_id is not None
         all_workers_stopped = all(not worker.is_alive() for worker in self.workers)
         transcriber_stopped = self.transcriber is None or not self.transcriber.is_alive()
-        status = "complete" if all_workers_stopped and transcriber_stopped else "interrupted"
+        correction_stopped = self.correction_worker is None or not self.correction_worker.is_alive()
+        status = (
+            "complete"
+            if all_workers_stopped and transcriber_stopped and correction_stopped
+            else "interrupted"
+        )
         self.database.finish_session(session_id, ended_at, status)
         self.stop_event = None
         self.workers = []
         self.chunk_queue = None
         self.transcriber = None
+        self.correction_queue = None
+        self.correction_worker = None
+        self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
+        self.correction_flush_event.clear()
         return session_id
 
     def answer(self, question: str) -> str:
