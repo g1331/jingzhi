@@ -54,13 +54,15 @@ uv run ruff format src tests
 
 正文只在需要解释原因、迁移方式或风险时添加。多行正文必须使用真实换行，不得写入字面量 `\n`。
 
+Dependabot 自动生成的依赖更新使用 `构建(依赖)` 前缀，不要求关联人工 Issue；其他提交不得使用这一例外。
+
 ## Pull Request
 
-- PR 标题与提交标题使用相同格式，并关联一个主要 Issue。
+- PR 标题与提交标题使用相同格式，并关联一个主要 Issue；经过 GitHub 身份校验的 Dependabot PR 除外。
 - PR 正文必须包含 `Closes #<编号>`、修改内容、验证结果和剩余风险。
 - 一个 PR 只交付一个主要 Issue；前置 Issue 应先单独完成。
 - 合并前必须通过 `CI` 和 `PR title` 检查。
-- 仓库使用 squash merge；进入 `main` 的最终提交以 PR 标题为准。
+- 仓库使用 squash merge；进入 `main` 的最终提交采用该 PR 的单一提交标题和正文，多提交 PR 则采用 PR 标题。
 - 合并后删除功能分支。
 
 ## 领域与架构
