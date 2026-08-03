@@ -128,6 +128,95 @@ def _write_flac(
     sf.write(path, np.clip(mono, -1.0, 1.0), output_sample_rate, format="FLAC", subtype="PCM_16")
 
 
+class QuestionVoiceRecorder:
+    """Records one press-to-talk question clip from the default microphone."""
+
+    def __init__(self, requested_sample_rate: int, storage_sample_rate: int) -> None:
+        self.requested_sample_rate = requested_sample_rate
+        self.storage_sample_rate = storage_sample_rate
+        self._path: Path | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._error: Exception | None = None
+
+    def start(self, path: Path) -> None:
+        if self._thread is not None:
+            raise RuntimeError("A question voice recording is already active")
+        self._path = path
+        self._stop_event.clear()
+        self._ready_event.clear()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._record, name="question-voice-capture", daemon=True
+        )
+        self._thread.start()
+        if not self._ready_event.wait(timeout=5):
+            self._stop_event.set()
+            raise RuntimeError("Microphone did not become ready")
+        if self._error is not None:
+            error = self._error
+            self._thread = None
+            raise error
+
+    def _record(self) -> None:
+        blocks: list[np.ndarray] = []
+        try:
+            with SoundDeviceMicrophoneRecorder(
+                self.requested_sample_rate, blocksize=2048
+            ) as recorder:
+                active_sample_rate = int(recorder.sample_rate)
+                self._ready_event.set()
+                while not self._stop_event.is_set():
+                    block = recorder.record(2048)
+                    if block.size:
+                        blocks.append(block)
+            if not blocks:
+                raise RuntimeError("Question voice recording is too short")
+            assert self._path is not None
+            _write_flac(
+                self._path,
+                np.concatenate(blocks),
+                active_sample_rate,
+                self.storage_sample_rate,
+            )
+        except Exception as exc:  # noqa: BLE001 - transferred to the UI thread
+            self._error = exc
+        finally:
+            self._ready_event.set()
+
+    def stop(self) -> Path:
+        thread = self._thread
+        path = self._path
+        if thread is None or path is None:
+            raise RuntimeError("No question voice recording is active")
+        self._stop_event.set()
+        thread.join(timeout=10)
+        self._thread = None
+        self._path = None
+        if thread.is_alive():
+            raise RuntimeError("Question voice recording did not stop")
+        if self._error is not None:
+            raise self._error
+        if not path.exists():
+            raise RuntimeError("Question voice recording was not saved")
+        return path
+
+    def cancel(self) -> None:
+        thread = self._thread
+        path = self._path
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join(timeout=10)
+        self._thread = None
+        self._path = None
+        if thread.is_alive():
+            raise RuntimeError("Question voice recording did not stop")
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 class AudioCaptureWorker(threading.Thread):
     def __init__(
         self,

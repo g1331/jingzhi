@@ -49,21 +49,61 @@ class QuestionAnsweringService:
         self.model = model
         self.connection = connection
 
+    def create_anchor(
+        self, session_id: str, asked_at_ms: int, *, lookback_ms: int = 2 * 60_000
+    ) -> int:
+        if lookback_ms <= 0:
+            raise ValueError("Question range must be greater than zero")
+        return self.database.create_question(
+            session_id,
+            asked_at_ms,
+            "",
+            max(0, asked_at_ms - lookback_ms),
+            asked_at_ms,
+            state="draft",
+        )
+
+    def set_anchor_range(self, question_id: int, lookback_ms: int) -> None:
+        if lookback_ms <= 0:
+            raise ValueError("Question range must be greater than zero")
+        question = self.database.question(question_id)
+        if question is None or question.state != "draft":
+            raise RuntimeError("The pending question anchor is unavailable")
+        self.database.update_question_range(
+            question_id, max(0, question.asked_at_ms - lookback_ms), question.asked_at_ms
+        )
+
+    def cancel_anchor(self, question_id: int) -> bool:
+        return self.database.delete_pending_question(question_id)
+
+    def submit(self, question_id: int, question: str) -> AnswerVersionRecord:
+        question = question.strip()
+        if not question:
+            raise ValueError("Question is required")
+        anchor = self.database.question(question_id)
+        if (
+            anchor is None
+            or anchor.state != "draft"
+            or anchor.context_start_ms is None
+            or anchor.context_end_ms is None
+        ):
+            raise RuntimeError("The pending question anchor is unavailable")
+        self.database.submit_question(question_id, question)
+        context = ContextAssembler(self.database).for_anchor(
+            anchor.session_id, anchor.context_start_ms, anchor.context_end_ms
+        )
+        return self._answer(question_id, question, context)
+
     def ask(
         self,
         session_id: str,
         asked_at_ms: int,
         question: str,
         *,
-        lookback_ms: int = 8 * 60_000,
+        lookback_ms: int = 2 * 60_000,
     ) -> AnswerVersionRecord:
-        context = ContextAssembler(self.database).around_question(
-            session_id, asked_at_ms, lookback_ms=lookback_ms
-        )
-        question_id = self.database.create_question(
-            session_id, asked_at_ms, question, context.start_ms, context.end_ms
-        )
-        return self._answer(question_id, question, context)
+        question_id = self.create_anchor(session_id, asked_at_ms, lookback_ms=lookback_ms)
+        return self.submit(question_id, question)
 
     def reanswer(self, question_id: int) -> AnswerVersionRecord:
         question = self.database.question(question_id)
@@ -172,6 +212,24 @@ class JingzhiApplicationService:
 
     def stop_session(self) -> str | None:
         return self.recorder.stop()
+
+    def begin_question(self, lookback_ms: int = 2 * 60_000) -> int:
+        return self.recorder.capture_question_anchor(lookback_ms)
+
+    def set_question_range(self, lookback_ms: int) -> None:
+        self.recorder.set_question_range(lookback_ms)
+
+    def cancel_question(self) -> bool:
+        return self.recorder.cancel_question()
+
+    def submit_question(self, question: str) -> str:
+        return self.recorder.answer(question)
+
+    def start_question_voice(self) -> None:
+        self.recorder.start_question_voice()
+
+    def finish_question_voice(self) -> str:
+        return self.recorder.finish_question_voice()
 
     def list_sessions(self) -> list[SessionRecord]:
         return self.database.list_sessions()

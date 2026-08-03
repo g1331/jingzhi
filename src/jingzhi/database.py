@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS questions (
     answer TEXT,
     context_start_ms INTEGER,
     context_end_ms INTEGER,
-    error TEXT
+    error TEXT,
+    state TEXT NOT NULL DEFAULT 'submitted' CHECK (state IN ('draft', 'submitted'))
 );
 
 CREATE TABLE IF NOT EXISTS answer_versions (
@@ -173,7 +174,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -301,6 +302,7 @@ class QuestionRecord:
     question: str
     context_start_ms: int | None
     context_end_ms: int | None
+    state: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +369,13 @@ class Database:
         if "source_id" not in frame_columns:
             connection.execute(
                 "ALTER TABLE frames ADD COLUMN source_id TEXT NOT NULL DEFAULT 'display:primary'"
+            )
+        question_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(questions)").fetchall()
+        }
+        if "state" not in question_columns:
+            connection.execute(
+                "ALTER TABLE questions ADD COLUMN state TEXT NOT NULL DEFAULT 'submitted'"
             )
         applied_at = datetime.now(UTC).isoformat()
         connection.execute(
@@ -558,10 +567,11 @@ class Database:
             rows = connection.execute(
                 """SELECT id, asked_at_ms, question
                    FROM questions
-                   WHERE session_id = ? AND asked_at_ms BETWEEN ? AND ?
+                   WHERE session_id = ? AND state = 'submitted'
+                     AND asked_at_ms BETWEEN ? AND ?
                    ORDER BY asked_at_ms, id""",
                 (session_id, start_ms, end_ms),
-            ).fetchall()
+            )
         return [TimelineQuestionRecord(**dict(row)) for row in rows]
 
     def add_audio_chunk(
@@ -884,21 +894,53 @@ class Database:
         question: str,
         context_start_ms: int,
         context_end_ms: int,
+        *,
+        state: str = "submitted",
     ) -> int:
+        if state not in {"draft", "submitted"}:
+            raise ValueError(f"Unsupported question state: {state}")
         with self.connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO questions(
-                       session_id, asked_at_ms, question, context_start_ms, context_end_ms
-                   ) VALUES (?, ?, ?, ?, ?)""",
-                (session_id, asked_at_ms, question, context_start_ms, context_end_ms),
+                       session_id, asked_at_ms, question, context_start_ms, context_end_ms, state
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, asked_at_ms, question, context_start_ms, context_end_ms, state),
             )
             return int(cursor.lastrowid)
+
+    def update_question_range(self, question_id: int, start_ms: int, end_ms: int) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE questions SET context_start_ms = ?, context_end_ms = ?
+                   WHERE id = ? AND state = 'draft'""",
+                (start_ms, end_ms, question_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("The pending question anchor is unavailable")
+
+    def submit_question(self, question_id: int, question: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE questions SET question = ?, state = 'submitted'
+                   WHERE id = ? AND state = 'draft'""",
+                (question, question_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("The pending question anchor is unavailable")
+
+    def delete_pending_question(self, question_id: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM questions WHERE id = ? AND state = 'draft'",
+                (question_id,),
+            )
+            return cursor.rowcount == 1
 
     def question(self, question_id: int) -> QuestionRecord | None:
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT id, session_id, asked_at_ms, question,
-                          context_start_ms, context_end_ms
+                          context_start_ms, context_end_ms, state
                    FROM questions WHERE id = ?""",
                 (question_id,),
             ).fetchone()
@@ -908,7 +950,8 @@ class Database:
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT id FROM questions
-                   WHERE session_id = ? ORDER BY asked_at_ms DESC, id DESC LIMIT 1""",
+                   WHERE session_id = ? AND state = 'submitted'
+                   ORDER BY asked_at_ms DESC, id DESC LIMIT 1""",
                 (session_id,),
             ).fetchone()
         return int(row["id"]) if row is not None else None

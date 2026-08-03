@@ -7,14 +7,14 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from jingzhi.application import ModelConnectionSnapshot, QuestionAnsweringService
-from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk
+from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk, QuestionVoiceRecorder
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
 from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
-from jingzhi.transcribe import TranscriptionWorker
+from jingzhi.transcribe import TranscriptionWorker, WhisperQuestionTranscriber
 from jingzhi.transcript_correction import (
     CORRECTION_WINDOW_SECONDS,
     CorrectionWindowBatcher,
@@ -54,7 +54,9 @@ class SessionManager:
         self.llm_api_mode = settings.llm_api_mode
         self.provider_settings_store = ProviderSettingsStore(settings.data_dir)
         self.last_question_id: int | None = None
-        self.pending_question_anchor_ms: int | None = None
+        self.pending_question_id: int | None = None
+        self.question_voice_recorder: QuestionVoiceRecorder | None = None
+        self.question_transcriber: WhisperQuestionTranscriber | None = None
 
     def configure_provider(self, *, model: str, base_url: str, api_key: str, api_mode: str) -> None:
         model = model.strip()
@@ -142,7 +144,7 @@ class SessionManager:
         self.clock = clock
         self.stop_event = stop_event
         self.last_question_id = None
-        self.pending_question_anchor_ms = None
+        self.pending_question_id = None
         self.chunk_queue = chunk_queue
         self.database.configure_transcript_correction(
             session_id,
@@ -262,6 +264,7 @@ class SessionManager:
         return self._context_model().test_connection()
 
     def stop(self) -> str | None:
+        self.cancel_question()
         if not self.is_recording:
             return None
         assert self.stop_event is not None
@@ -306,23 +309,74 @@ class SessionManager:
             ModelConnectionSnapshot(self.llm_model, self.llm_base_url, self.llm_api_mode),
         )
 
-    def capture_question_anchor(self) -> int:
+    def capture_question_anchor(self, lookback_ms: int = 2 * 60_000) -> int:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
-        self.pending_question_anchor_ms = self.clock.now_ms()
-        return self.pending_question_anchor_ms
+        if self.pending_question_id is None:
+            self.pending_question_id = self._question_service().create_anchor(
+                self.session_id, self.clock.now_ms(), lookback_ms=lookback_ms
+            )
+        return self.pending_question_id
+
+    def set_question_range(self, lookback_ms: int) -> None:
+        if self.pending_question_id is None:
+            raise RuntimeError("There is no pending question anchor")
+        self._question_service().set_anchor_range(self.pending_question_id, lookback_ms)
+
+    def cancel_question(self) -> bool:
+        voice_recorder = self.question_voice_recorder
+        self.question_voice_recorder = None
+        if voice_recorder is not None:
+            voice_recorder.cancel()
+        if self.pending_question_id is None:
+            return False
+        question_id = self.pending_question_id
+        self.pending_question_id = None
+        return self._question_service().cancel_anchor(question_id)
+
+    def start_question_voice(self) -> None:
+        if self.session_id is None or self.clock is None:
+            raise RuntimeError("Start a study session before asking a question")
+        self.capture_question_anchor()
+        if self.question_voice_recorder is not None:
+            raise RuntimeError("A question voice recording is already active")
+        recorder = QuestionVoiceRecorder(
+            self.settings.audio_capture_rate, self.settings.audio_storage_rate
+        )
+        path = (
+            self.settings.data_dir
+            / "sessions"
+            / self.session_id
+            / "questions"
+            / f"{self.clock.now_ms():012d}.flac"
+        )
+        recorder.start(path)
+        self.question_voice_recorder = recorder
+
+    def finish_question_voice(self) -> str:
+        recorder = self.question_voice_recorder
+        if recorder is None:
+            raise RuntimeError("No question voice recording is active")
+        self.question_voice_recorder = None
+        path = recorder.stop()
+        if self.question_transcriber is None:
+            self.question_transcriber = WhisperQuestionTranscriber(
+                self.settings.whisper_model,
+                self.settings.whisper_device,
+                self.settings.whisper_compute_type,
+            )
+        try:
+            return self.question_transcriber.transcribe(path)
+        finally:
+            path.unlink(missing_ok=True)
 
     def answer(self, question: str) -> str:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
-        asked_at_ms = self.pending_question_anchor_ms
-        if asked_at_ms is None:
-            asked_at_ms = self.clock.now_ms()
-        self.pending_question_anchor_ms = None
-        try:
-            result = self._question_service().ask(self.session_id, asked_at_ms, question)
-        finally:
-            self.last_question_id = self.database.latest_question_id(self.session_id)
+        question_id = self.capture_question_anchor()
+        self.pending_question_id = None
+        self.last_question_id = question_id
+        result = self._question_service().submit(question_id, question)
         assert result.answer is not None
         return result.answer
 
