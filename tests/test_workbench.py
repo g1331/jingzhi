@@ -85,7 +85,7 @@ def test_legacy_database_migrates_frames_without_losing_data(tmp_path: Path) -> 
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["version"] for row in versions] == [1, 2, 3]
 
 
 def test_application_service_browses_sessions_and_scaled_keyframes_without_hardware(

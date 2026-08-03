@@ -11,6 +11,13 @@ from jingzhi.database import (
     TimelineFrameRecord,
     TimelineQuestionRecord,
     TimelineTranscriptRecord,
+    TranscriptCorrectionRunRecord,
+    TranscriptCorrectionSettingsRecord,
+    TranscriptVersionRecord,
+)
+from jingzhi.transcript_correction import (
+    TranscriptCorrectionModel,
+    TranscriptCorrectionProcessor,
 )
 
 
@@ -51,10 +58,12 @@ class JingzhiApplicationService:
         *,
         recorder: RecordingAdapter,
         now: Callable[[], datetime] | None = None,
+        correction_model: TranscriptCorrectionModel | None = None,
     ) -> None:
         self.database = database
         self.recorder = recorder
         self._now = now or (lambda: datetime.now(UTC))
+        self.correction_model = correction_model
 
     @property
     def is_recording(self) -> bool:
@@ -100,12 +109,22 @@ class JingzhiApplicationService:
         return SessionTimeline(
             session=session,
             frames=tuple(self.database.timeline_frames(session_id, start_ms, end_ms)),
-            transcripts=tuple(self.database.timeline_transcripts(session_id, start_ms, end_ms)),
+            transcripts=tuple(self._timeline_transcripts(session_id, start_ms, end_ms)),
             questions=tuple(self.database.timeline_questions(session_id, start_ms, end_ms)),
             duration_ms=duration_ms,
             window_start_ms=start_ms,
             window_end_ms=end_ms,
         )
+
+    def _timeline_transcripts(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineTranscriptRecord]:
+        transcripts = self.database.timeline_transcripts(session_id, start_ms, end_ms)
+        settings = self.database.transcript_correction_settings(session_id)
+        if settings.enabled:
+            transcripts.extend(self.database.recognizing_transcripts(session_id, start_ms, end_ms))
+            transcripts.sort(key=lambda item: (item.start_ms, item.id))
+        return transcripts
 
     def _current_duration(self, session: SessionRecord) -> int:
         if session.status != "recording":
@@ -117,3 +136,41 @@ class JingzhiApplicationService:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         return max(session.duration_ms, int((now - started).total_seconds() * 1000))
+
+    def configure_transcript_correction(
+        self, session_id: str, *, enabled: bool, window_seconds: int
+    ) -> None:
+        self.database.configure_transcript_correction(
+            session_id, enabled=enabled, window_ms=window_seconds * 1000
+        )
+
+    def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
+        return self.database.transcript_versions(segment_id)
+
+    def transcript_correction_settings(self, session_id: str) -> TranscriptCorrectionSettingsRecord:
+        return self.database.transcript_correction_settings(session_id)
+
+    def edit_transcript(self, segment_id: int, text: str) -> int:
+        version_id = self.database.add_transcript_version(segment_id, "user_edit", text)
+        assert version_id is not None
+        return version_id
+
+    def undo_transcript_correction(self, segment_id: int) -> None:
+        self.database.undo_transcript_correction(segment_id)
+
+    def run_transcript_correction(
+        self, session_id: str, *, window_start_ms: int
+    ) -> TranscriptCorrectionRunRecord:
+        settings = self.database.transcript_correction_settings(session_id)
+        if not settings.enabled:
+            raise RuntimeError("Transcript correction is disabled")
+        model = self.correction_model
+        if model is None:
+            factory = getattr(self.recorder, "transcript_correction_model", None)
+            if callable(factory):
+                model = factory()
+        if model is None:
+            raise RuntimeError("Transcript correction model is not configured")
+        return TranscriptCorrectionProcessor(self.database, model).run(
+            session_id, window_start_ms=window_start_ms
+        )

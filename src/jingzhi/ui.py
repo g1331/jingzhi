@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import threading
+from difflib import SequenceMatcher
 from typing import ClassVar
 
 from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QSize, Qt, Signal, Slot
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -38,6 +40,7 @@ from jingzhi.config import Settings
 from jingzhi.database import TimelineFrameRecord, TimelineTranscriptRecord
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
+from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +225,8 @@ QPushButton[transcript="true"][cited="true"][selected="true"] {
 }
 QPushButton[correctionState="corrected"] { color: #9ee7ca; }
 QPushButton[correctionState="pending"] { color: #ffd59a; }
+QPushButton[correctionState="recognizing"] { color: #a9c7ff; }
+QPushButton[correctionState="edited"] { color: #e7b36a; }
 QLabel#transcriptChip { background: #182221; border: 1px solid #33413e; padding: 7px; }
 QLabel#eventChip { color: #a7b5b0; background: #171f20; padding: 7px; }
 QFrame#recordingCapsule {
@@ -244,6 +249,12 @@ class UiBridge(QObject):
 
 
 class MainWindow(QMainWindow):
+    CORRECTION_STATE_LABELS: ClassVar[dict[str, str]] = {
+        "recognizing": "识别中",
+        "pending": "待校订",
+        "corrected": "已校订",
+        "edited": "用户已编辑",
+    }
     ZOOM_WINDOWS: ClassVar[dict[str, int | None]] = {
         "whole": None,
         "5-minutes": 5 * 60_000,
@@ -276,6 +287,7 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self._selected_session_id: str | None = None
         self._selected_frame: TimelineFrameRecord | None = None
+        self._selected_transcript: TimelineTranscriptRecord | None = None
         self._timeline: SessionTimeline | None = None
         self._zoom_key = "whole"
         self._window_start_ms = 0
@@ -446,6 +458,19 @@ class MainWindow(QMainWindow):
         self.model_input.setPlaceholderText("支持图片输入的模型名称")
         self.test_provider_button = QPushButton("测试连接")
         self.save_provider_button = QPushButton("保存配置")
+        self.correction_check = QCheckBox("启用字幕校订")
+        self.correction_check.setChecked(self.settings.transcript_correction_enabled)
+        self.correction_window_input = QComboBox()
+        for seconds in CORRECTION_WINDOW_SECONDS:
+            self.correction_window_input.addItem(f"{seconds} 秒", seconds)
+        correction_index = self.correction_window_input.findData(
+            self.settings.transcript_correction_window_seconds
+        )
+        self.correction_window_input.setCurrentIndex(max(0, correction_index))
+        self.correction_model_input = QLineEdit(
+            getattr(self.manager, "correction_model", self.settings.transcript_correction_model)
+        )
+        self.correction_model_input.setPlaceholderText("字幕校订角色使用的小模型")
 
         provider_layout.addWidget(QLabel("Base URL"), 0, 0)
         provider_layout.addWidget(self.base_url_input, 0, 1)
@@ -460,11 +485,19 @@ class MainWindow(QMainWindow):
         provider_buttons.addWidget(self.test_provider_button)
         provider_buttons.addWidget(self.save_provider_button)
         provider_layout.addLayout(provider_buttons, 0, 4, 2, 1)
+        provider_layout.addWidget(self.correction_check, 2, 0, 1, 2)
+        provider_layout.addWidget(QLabel("校订窗口"), 2, 2)
+        provider_layout.addWidget(self.correction_window_input, 2, 3)
+        provider_layout.addWidget(QLabel("校订模型"), 3, 0)
+        provider_layout.addWidget(self.correction_model_input, 3, 1, 1, 3)
         hint = QLabel(
-            "返回网页源码通常表示 Base URL 或接口类型不匹配。API Key 保存到 Windows 凭据管理器。"
+            "返回网页源码通常表示 Base URL 或接口类型不匹配；API Key 保存到 Windows "
+            "凭据管理器。启用字幕校订会按所选窗口发送相邻字幕和带来源时间标签的代表性"
+            "关键帧；关闭时只使用本地 Whisper 原文。"
         )
         hint.setObjectName("hint")
-        provider_layout.addWidget(hint, 2, 1, 1, 3)
+        hint.setWordWrap(True)
+        provider_layout.addWidget(hint, 4, 0, 1, 4)
         return provider_group
 
     def _build_timeline_panel(self) -> QWidget:
@@ -590,12 +623,25 @@ class MainWindow(QMainWindow):
         self.evidence_version.setObjectName("hint")
         self.evidence_version.setWordWrap(True)
         self.evidence_version.hide()
+        transcript_actions = QHBoxLayout()
+        self.transcript_diff_button = QPushButton("查看差异")
+        self.transcript_edit_button = QPushButton("手动编辑")
+        self.transcript_undo_button = QPushButton("撤销校订")
+        for button in (
+            self.transcript_diff_button,
+            self.transcript_edit_button,
+            self.transcript_undo_button,
+        ):
+            button.setProperty("role", "quiet")
+            button.hide()
+            transcript_actions.addWidget(button)
         panel_layout.addWidget(heading)
         panel_layout.addSpacing(6)
         panel_layout.addWidget(self.evidence_image)
         panel_layout.addWidget(self.evidence_title)
         panel_layout.addWidget(self.evidence_metadata)
         panel_layout.addWidget(self.evidence_version)
+        panel_layout.addLayout(transcript_actions)
         panel_layout.addStretch(1)
         self._detail_opacity = QGraphicsOpacityEffect(panel)
         self._detail_opacity.setOpacity(1.0)
@@ -644,6 +690,16 @@ class MainWindow(QMainWindow):
             return
         session_id = str(item.data(Qt.ItemDataRole.UserRole))
         self._selected_session_id = session_id
+        correction_settings = self.service.transcript_correction_settings(session_id)
+        self.correction_check.blockSignals(True)
+        self.correction_window_input.blockSignals(True)
+        self.correction_check.setChecked(correction_settings.enabled)
+        correction_index = self.correction_window_input.findData(
+            correction_settings.window_ms // 1000
+        )
+        self.correction_window_input.setCurrentIndex(max(0, correction_index))
+        self.correction_check.blockSignals(False)
+        self.correction_window_input.blockSignals(False)
         window_duration = self.ZOOM_WINDOWS[self._zoom_key]
         try:
             timeline = self.service.open_session(
@@ -656,6 +712,7 @@ class MainWindow(QMainWindow):
             return
         self._timeline = timeline
         self._selected_frame = None
+        self._selected_transcript = None
         self._render_timeline(timeline)
 
     def _select_session_item(self, item: QListWidgetItem | None) -> None:
@@ -749,8 +806,9 @@ class MainWindow(QMainWindow):
                 gap_seconds = max(0, (transcript.start_ms - cursor_ms) // 1000)
                 if gap_seconds:
                     self.transcript_layout.addStretch(gap_seconds)
-                state_labels = {"pending": "待校订", "corrected": "已校订"}
-                state_label = state_labels.get(transcript.correction_state or "")
+                state_label = self.CORRECTION_STATE_LABELS.get(
+                    transcript.correction_state or ""
+                )
                 prefix = f"{state_label} · " if state_label else ""
                 button = EvidenceButton(
                     f"{prefix}{self._format_time(transcript.start_ms)}–"
@@ -793,6 +851,7 @@ class MainWindow(QMainWindow):
         self.evidence_title.setText("尚未选择证据")
         self.evidence_metadata.setText("来源与会话相对时间将在这里显示。")
         self.evidence_version.hide()
+        self._show_transcript_actions(False)
         self._animate_detail_change()
 
     @staticmethod
@@ -807,6 +866,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _select_frame(self, frame: TimelineFrameRecord) -> None:
         self._selected_frame = frame
+        self._selected_transcript = None
         self._set_selected_evidence_button(f"keyframe-{frame.id}")
         self.evidence_image.setStyleSheet("background: #edeae1; color: #17201d;")
         pixmap = QPixmap(str(frame.path))
@@ -828,11 +888,13 @@ class MainWindow(QMainWindow):
             f"稳定 ID：{frame.id}"
         )
         self.evidence_version.hide()
+        self._show_transcript_actions(False)
         self._animate_detail_change()
 
     @Slot()
     def _select_transcript(self, transcript: TimelineTranscriptRecord) -> None:
         self._selected_frame = None
+        self._selected_transcript = transcript
         self._set_selected_evidence_button(f"transcript-{transcript.id}")
         self.evidence_image.setPixmap(QPixmap())
         self.evidence_image.setStyleSheet(
@@ -846,8 +908,7 @@ class MainWindow(QMainWindow):
             f"{self._format_time(transcript.end_ms)}\n"
             f"稳定 ID：{transcript.id}"
         )
-        state_labels = {"pending": "待校订", "corrected": "已校订"}
-        state_label = state_labels.get(transcript.correction_state or "")
+        state_label = self.CORRECTION_STATE_LABELS.get(transcript.correction_state or "")
         if state_label:
             self.evidence_version.setText(
                 f"字幕校订已启用 · 当前状态：{state_label}\nWhisper 原文保留为独立版本。"
@@ -855,7 +916,33 @@ class MainWindow(QMainWindow):
             self.evidence_version.show()
         else:
             self.evidence_version.hide()
+        editable = transcript.version_id is not None and transcript.version_kind != "recognizing"
+        self._show_transcript_actions(editable)
+        self.transcript_undo_button.setVisible(editable and transcript.version_kind == "correction")
         self._animate_detail_change()
+
+    def _show_transcript_actions(self, visible: bool) -> None:
+        self.transcript_diff_button.setVisible(visible)
+        self.transcript_edit_button.setVisible(visible)
+        if not visible:
+            self.transcript_undo_button.hide()
+
+    @staticmethod
+    def _transcript_diff(original: str, current: str) -> str:
+        parts: list[str] = []
+        for tag, old_start, old_end, new_start, new_end in SequenceMatcher(
+            None, original, current
+        ).get_opcodes():
+            if tag == "equal":
+                parts.append(original[old_start:old_end])
+            elif tag == "delete":
+                parts.append(f"[-{original[old_start:old_end]}-]")
+            elif tag == "insert":
+                parts.append(f"{{+{current[new_start:new_end]}+}}")
+            else:
+                parts.append(f"[-{original[old_start:old_end]}-]")
+                parts.append(f"{{+{current[new_start:new_end]}+}}")
+        return "".join(parts)
 
     def _set_selected_evidence_button(self, object_name: str) -> None:
         for button in self.findChildren(QPushButton):
@@ -938,6 +1025,11 @@ class MainWindow(QMainWindow):
         self.summary_button.clicked.connect(self._summarize)
         self.test_provider_button.clicked.connect(self._test_provider)
         self.save_provider_button.clicked.connect(self._save_provider)
+        self.correction_check.toggled.connect(self._configure_correction)
+        self.correction_window_input.currentIndexChanged.connect(self._configure_correction)
+        self.transcript_diff_button.clicked.connect(self._show_transcript_diff)
+        self.transcript_edit_button.clicked.connect(self._edit_selected_transcript)
+        self.transcript_undo_button.clicked.connect(self._undo_selected_correction)
         self.output_source_button.clicked.connect(self._toggle_output_source)
         self.copy_output_button.clicked.connect(self._copy_output_source)
         self.provider_toggle_button.clicked.connect(
@@ -1021,6 +1113,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _start(self) -> None:
         try:
+            self._configure_correction()
             session_id = self.service.start_session(
                 self.title_input.text(),
                 capture_system_audio=self.system_audio_check.isChecked(),
@@ -1035,7 +1128,71 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(callable(getattr(self.manager, "pause", None)))
         self.system_audio_check.setEnabled(False)
         self.microphone_check.setEnabled(False)
+        self.correction_check.setEnabled(False)
+        self.correction_window_input.setEnabled(False)
+        self.correction_model_input.setEnabled(False)
         self._refresh_sessions(session_id)
+
+    @Slot()
+    def _configure_correction(self) -> None:
+        enabled = self.correction_check.isChecked()
+        window_seconds = int(self.correction_window_input.currentData())
+        configure_manager = getattr(self.manager, "configure_transcript_correction", None)
+        if callable(configure_manager):
+            configure_manager(
+                enabled=enabled,
+                window_seconds=window_seconds,
+                model=self.correction_model_input.text(),
+            )
+        if self._selected_session_id is not None:
+            self.service.configure_transcript_correction(
+                self._selected_session_id,
+                enabled=enabled,
+                window_seconds=window_seconds,
+            )
+            current = self.session_library.currentItem()
+            if current is not None:
+                self._open_session_item(current)
+
+    @Slot()
+    def _show_transcript_diff(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        self.evidence_version.setText(
+            "原文与当前版本差异：\n"
+            + self._transcript_diff(transcript.original_text, transcript.text)
+        )
+        self.evidence_version.show()
+
+    @Slot()
+    def _edit_selected_transcript(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self, "手动编辑字幕", "字幕内容", transcript.text
+        )
+        if not accepted:
+            return
+        try:
+            self.service.edit_transcript(transcript.id, text)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports validation failures
+            self._show_action_error(str(exc))
+            return
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
+
+    @Slot()
+    def _undo_selected_correction(self) -> None:
+        transcript = self._selected_transcript
+        if transcript is None:
+            return
+        self.service.undo_transcript_correction(transcript.id)
+        current = self.session_library.currentItem()
+        if current is not None:
+            self._open_session_item(current)
 
     @Slot()
     def _focus_question(self) -> None:
@@ -1204,6 +1361,9 @@ class MainWindow(QMainWindow):
         self._paused = False
         self.system_audio_check.setEnabled(True)
         self.microphone_check.setEnabled(True)
+        self.correction_check.setEnabled(True)
+        self.correction_window_input.setEnabled(True)
+        self.correction_model_input.setEnabled(True)
         self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]

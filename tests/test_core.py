@@ -6,9 +6,16 @@ from PIL import Image
 
 from jingzhi.capture.audio import _prepare_mono_audio
 from jingzhi.capture.screen import average_hash
+from jingzhi.config import Settings
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel, ProviderRequestError
+from jingzhi.session import SessionManager
+from jingzhi.transcript_correction import (
+    CorrectionFrame,
+    CorrectionRequest,
+    CorrectionSegment,
+)
 
 
 def test_average_hash_distinguishes_opposite_images() -> None:
@@ -114,3 +121,48 @@ def test_provider_html_response_becomes_concise_error(monkeypatch) -> None:
     assert "HTML 页面" in message
     assert "wide-content" not in message
     assert len(message) < 240
+
+
+def test_correction_adapter_sends_source_time_labels_and_parses_version_map(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[dict] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text='{"7":"换入变量"}')
+
+    frame_path = tmp_path / "frame.webp"
+    Image.new("RGB", (32, 32), "white").save(frame_path)
+    model = OpenAIContextModel("correction-small", api_key="secret")
+    monkeypatch.setattr(model, "_client", lambda: SimpleNamespace(responses=FakeResponses()))
+    segment = CorrectionSegment(7, 1_000, 2_000, "system", "换入便量")
+    request = CorrectionRequest(
+        session_id="session",
+        window_start_ms=0,
+        window_end_ms=15_000,
+        target_segments=(segment,),
+        context_segments=(segment,),
+        frames=(CorrectionFrame(3, "display:2", 1_500, frame_path),),
+    )
+
+    corrected = model.correct(request)
+
+    assert corrected == {7: "换入变量"}
+    content = calls[0]["input"][0]["content"]
+    text_parts = [item["text"] for item in content if item["type"] == "input_text"]
+    assert any("display:2" in text and "1500ms" in text for text in text_parts)
+
+
+def test_transcript_correction_uses_its_own_model_role(tmp_path: Path) -> None:
+    manager = SessionManager(
+        Settings(
+            data_dir=tmp_path,
+            llm_model="question-model",
+            transcript_correction_model="correction-small",
+        )
+    )
+
+    assert manager._context_model().model == "question-model"
+    assert manager.transcript_correction_model().model == "correction-small"

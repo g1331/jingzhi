@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from jingzhi.transcript_correction import CORRECTION_WINDOW_MS
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -56,6 +58,58 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 CREATE INDEX IF NOT EXISTS transcript_session_time
 ON transcript_segments(session_id, start_ms, end_ms);
 
+CREATE TABLE IF NOT EXISTS transcript_versions (
+    id INTEGER PRIMARY KEY,
+    segment_id INTEGER NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('original', 'correction', 'user_edit')),
+    text TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    model TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS transcript_original_version
+ON transcript_versions(segment_id) WHERE kind = 'original';
+CREATE INDEX IF NOT EXISTS transcript_version_history
+ON transcript_versions(segment_id, id);
+
+CREATE VIEW IF NOT EXISTS effective_transcript_versions AS
+SELECT id, segment_id, kind, text, created_at_utc, model, active
+FROM (
+    SELECT version.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY segment_id
+               ORDER BY CASE kind
+                   WHEN 'user_edit' THEN 3
+                   WHEN 'correction' THEN 2
+                   ELSE 1 END DESC,
+                   id DESC
+           ) AS priority_rank
+    FROM transcript_versions AS version
+    WHERE active = 1
+)
+WHERE priority_rank = 1;
+
+CREATE TABLE IF NOT EXISTS transcript_correction_settings (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    window_ms INTEGER NOT NULL CHECK (window_ms IN (15000, 30000, 60000))
+);
+
+CREATE TABLE IF NOT EXISTS transcript_correction_runs (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    window_start_ms INTEGER NOT NULL,
+    window_end_ms INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('running', 'corrected', 'failed')),
+    model TEXT NOT NULL,
+    started_at_utc TEXT NOT NULL,
+    completed_at_utc TEXT,
+    error_source TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS transcript_correction_run_window
+ON transcript_correction_runs(session_id, window_start_ms, window_end_ms, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
     segment_id UNINDEXED, session_id UNINDEXED, text, tokenize='unicode61'
 );
@@ -86,7 +140,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -133,6 +187,9 @@ class TimelineTranscriptRecord:
     end_ms: int
     text: str
     correction_state: str | None = None
+    version_id: int | None = None
+    version_kind: str = "original"
+    original_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +218,48 @@ class TranscriptRecord:
     text: str
 
 
+@dataclass(frozen=True, slots=True)
+class TranscriptVersionRecord:
+    id: int
+    segment_id: int
+    kind: str
+    text: str
+    created_at_utc: str
+    model: str | None
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionSegmentRecord:
+    id: int
+    start_ms: int
+    end_ms: int
+    source: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionFrameRecord:
+    id: int
+    source_id: str
+    ts_ms: int
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptCorrectionSettingsRecord:
+    enabled: bool
+    window_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptCorrectionRunRecord:
+    id: int
+    state: str
+    error_source: str | None
+    error: str | None
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -179,6 +278,13 @@ class Database:
                 "ALTER TABLE frames ADD COLUMN source_id TEXT NOT NULL DEFAULT 'display:primary'"
             )
         applied_at = datetime.now(UTC).isoformat()
+        connection.execute(
+            """INSERT OR IGNORE INTO transcript_versions(
+                   segment_id, kind, text, created_at_utc, active
+               )
+               SELECT id, 'original', text, ?, 1 FROM transcript_segments""",
+            (applied_at,),
+        )
         connection.executemany(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
             [(version, applied_at) for version in range(1, LATEST_SCHEMA_VERSION + 1)],
@@ -294,13 +400,52 @@ class Database:
     ) -> list[TimelineTranscriptRecord]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT id, source, start_ms, end_ms, text
-                   FROM transcript_segments
-                   WHERE session_id = ? AND end_ms >= ? AND start_ms <= ?
-                   ORDER BY start_ms, id""",
+                """SELECT segment.id, segment.source, segment.start_ms, segment.end_ms,
+                          effective.text, effective.id AS version_id,
+                          effective.kind AS version_kind, original.text AS original_text,
+                          CASE
+                              WHEN settings.enabled IS NULL OR settings.enabled = 0 THEN NULL
+                              WHEN effective.kind = 'user_edit' THEN 'edited'
+                              WHEN effective.kind = 'correction' THEN 'corrected'
+                              ELSE 'pending'
+                          END AS correction_state
+                   FROM transcript_segments AS segment
+                   JOIN transcript_versions AS original
+                     ON original.segment_id = segment.id AND original.kind = 'original'
+                   JOIN effective_transcript_versions AS effective
+                     ON effective.segment_id = segment.id
+                   LEFT JOIN transcript_correction_settings AS settings
+                     ON settings.session_id = segment.session_id
+                   WHERE segment.session_id = ?
+                     AND segment.end_ms >= ? AND segment.start_ms <= ?
+                   ORDER BY segment.start_ms, segment.id""",
                 (session_id, start_ms, end_ms),
             ).fetchall()
         return [TimelineTranscriptRecord(**dict(row)) for row in rows]
+
+    def recognizing_transcripts(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineTranscriptRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, source, start_ms, end_ms FROM audio_chunks
+                   WHERE session_id = ? AND state = 'pending'
+                     AND end_ms >= ? AND start_ms <= ?
+                   ORDER BY start_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [
+            TimelineTranscriptRecord(
+                id=-int(row["id"]),
+                source=row["source"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                text="正在识别…",
+                correction_state="recognizing",
+                version_kind="recognizing",
+            )
+            for row in rows
+        ]
 
     def timeline_questions(
         self, session_id: str, start_ms: int, end_ms: int
@@ -346,6 +491,12 @@ class Database:
                 (session_id, chunk_id, source, start_ms, end_ms, text, language, confidence),
             )
             segment_id = int(cursor.lastrowid)
+            connection.execute(
+                """INSERT INTO transcript_versions(
+                       segment_id, kind, text, created_at_utc, active
+                   ) VALUES (?, 'original', ?, ?, 1)""",
+                (segment_id, text, datetime.now(UTC).isoformat()),
+            )
             connection.execute(
                 "INSERT INTO transcript_fts(segment_id, session_id, text) VALUES (?, ?, ?)",
                 (segment_id, session_id, text),
@@ -402,6 +553,188 @@ class Database:
                 (session_id,),
             ).fetchall()
         return [TranscriptRecord(**dict(row)) for row in rows]
+
+    def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, segment_id, kind, text, created_at_utc, model, active
+                   FROM transcript_versions WHERE segment_id = ? ORDER BY id""",
+                (segment_id,),
+            ).fetchall()
+        return [
+            TranscriptVersionRecord(
+                id=row["id"],
+                segment_id=row["segment_id"],
+                kind=row["kind"],
+                text=row["text"],
+                created_at_utc=row["created_at_utc"],
+                model=row["model"],
+                active=bool(row["active"]),
+            )
+            for row in rows
+        ]
+
+    def add_transcript_version(
+        self, segment_id: int, kind: str, text: str, *, model: str | None = None
+    ) -> int | None:
+        if kind not in {"correction", "user_edit"}:
+            raise ValueError(f"Unsupported transcript version kind: {kind}")
+        text = text.strip()
+        if not text:
+            raise ValueError("Transcript text is required")
+        with self.connect() as connection:
+            if kind == "correction":
+                user_edit = connection.execute(
+                    """SELECT 1 FROM transcript_versions
+                       WHERE segment_id = ? AND kind = 'user_edit' AND active = 1""",
+                    (segment_id,),
+                ).fetchone()
+                if user_edit is not None:
+                    return None
+                duplicate = connection.execute(
+                    """SELECT id FROM transcript_versions
+                       WHERE segment_id = ? AND kind = 'correction'
+                         AND text = ? AND active = 1
+                       ORDER BY id DESC LIMIT 1""",
+                    (segment_id, text),
+                ).fetchone()
+                if duplicate is not None:
+                    return int(duplicate["id"])
+            cursor = connection.execute(
+                """INSERT INTO transcript_versions(
+                       segment_id, kind, text, created_at_utc, model, active
+                   ) VALUES (?, ?, ?, ?, ?, 1)""",
+                (segment_id, kind, text, datetime.now(UTC).isoformat(), model),
+            )
+            return int(cursor.lastrowid)
+
+    def undo_transcript_correction(self, segment_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE transcript_versions SET active = 0
+                   WHERE segment_id = ? AND kind = 'correction'""",
+                (segment_id,),
+            )
+
+    def configure_transcript_correction(
+        self, session_id: str, *, enabled: bool, window_ms: int
+    ) -> None:
+        if window_ms not in CORRECTION_WINDOW_MS:
+            raise ValueError("Correction window must be 15, 30, or 60 seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO transcript_correction_settings(session_id, enabled, window_ms)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       enabled = excluded.enabled, window_ms = excluded.window_ms""",
+                (session_id, int(enabled), window_ms),
+            )
+
+    def transcript_correction_settings(self, session_id: str) -> TranscriptCorrectionSettingsRecord:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT enabled, window_ms FROM transcript_correction_settings
+                   WHERE session_id = ?""",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return TranscriptCorrectionSettingsRecord(False, 30_000)
+        return TranscriptCorrectionSettingsRecord(bool(row["enabled"]), int(row["window_ms"]))
+
+    def correction_segments(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[CorrectionSegmentRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT segment.id, segment.start_ms, segment.end_ms, segment.source,
+                          version.text
+                   FROM transcript_segments AS segment
+                   JOIN effective_transcript_versions AS version
+                     ON version.segment_id = segment.id
+                   WHERE segment.session_id = ?
+                     AND segment.end_ms >= ? AND segment.start_ms < ?
+                   ORDER BY segment.start_ms, segment.id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [CorrectionSegmentRecord(**dict(row)) for row in rows]
+
+    def representative_frames(
+        self, session_id: str, start_ms: int, end_ms: int, *, limit: int = 6
+    ) -> list[CorrectionFrameRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, source_id, ts_ms, path, perceptual_hash
+                   FROM frames
+                   WHERE session_id = ? AND ts_ms BETWEEN ? AND ?
+                   ORDER BY source_id, ts_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        if not rows:
+            return []
+
+        latest_by_source: dict[str, sqlite3.Row] = {}
+        change_candidates: list[tuple[int, sqlite3.Row]] = []
+        previous_hashes: dict[str, int] = {}
+        for row in rows:
+            source_id = str(row["source_id"])
+            latest_by_source[source_id] = row
+            try:
+                image_hash = int(row["perceptual_hash"], 16)
+            except (TypeError, ValueError):
+                image_hash = 0
+            previous_hash = previous_hashes.get(source_id)
+            if previous_hash is not None:
+                change_candidates.append(((image_hash ^ previous_hash).bit_count(), row))
+            previous_hashes[source_id] = image_hash
+
+        selected = {int(row["id"]): row for row in latest_by_source.values()}
+        for _distance, row in sorted(
+            change_candidates,
+            key=lambda item: (item[0], item[1]["ts_ms"], item[1]["id"]),
+            reverse=True,
+        ):
+            if len(selected) >= min(limit, len(latest_by_source) + 2):
+                break
+            selected.setdefault(int(row["id"]), row)
+        selected_rows = sorted(selected.values(), key=lambda row: (row["ts_ms"], row["id"]))[:limit]
+        return [
+            CorrectionFrameRecord(
+                id=row["id"],
+                source_id=row["source_id"],
+                ts_ms=row["ts_ms"],
+                path=Path(row["path"]),
+            )
+            for row in selected_rows
+        ]
+
+    def start_correction_run(self, session_id: str, start_ms: int, end_ms: int, model: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO transcript_correction_runs(
+                       session_id, window_start_ms, window_end_ms, state, model, started_at_utc
+                   ) VALUES (?, ?, ?, 'running', ?, ?)""",
+                (session_id, start_ms, end_ms, model, datetime.now(UTC).isoformat()),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_correction_run(
+        self,
+        run_id: int,
+        state: str,
+        *,
+        error_source: str | None = None,
+        error: str | None = None,
+    ) -> TranscriptCorrectionRunRecord:
+        if state not in {"corrected", "failed"}:
+            raise ValueError(f"Unsupported correction run state: {state}")
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE transcript_correction_runs
+                   SET state = ?, completed_at_utc = ?, error_source = ?, error = ?
+                   WHERE id = ?""",
+                (state, datetime.now(UTC).isoformat(), error_source, error, run_id),
+            )
+        return TranscriptCorrectionRunRecord(run_id, state, error_source, error)
 
     def add_question(
         self,

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from jingzhi.context import QuestionContext
+from jingzhi.transcript_correction import CorrectionRequest
 
 
 class ProviderRequestError(RuntimeError):
@@ -141,6 +142,57 @@ class OpenAIContextModel:
             raise
         except Exception as exc:
             raise self._provider_error(exc) from exc
+
+    def correct(self, request: CorrectionRequest) -> dict[int, str]:
+        segment_lines = "\n".join(
+            f"[{item.id}][{item.start_ms}–{item.end_ms}ms][{item.source}] {item.text}"
+            for item in request.context_segments
+        )
+        target_ids = [item.id for item in request.target_segments]
+        prompt = (
+            "校订指定字幕片段，只修正识别错误，不扩写或总结。相邻字幕仅供上下文参考。"
+            "图片前的来源与会话时间标签是视觉证据位置。返回严格 JSON 对象，键为字幕片段 "
+            f"ID，值为校订文本；必须只包含这些 ID：{target_ids}。\n\n字幕：\n{segment_lines}"
+        )
+        response_content: list[dict[str, str]] = [{"type": "input_text", "text": prompt}]
+        chat_content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for frame in request.frames:
+            if not frame.path.is_file():
+                continue
+            label = f"关键帧来源：{frame.source_id}；会话时间：{frame.ts_ms}ms"
+            response_content.append({"type": "input_text", "text": label})
+            response_content.append(self._image_part(frame.path))
+            chat_content.append({"type": "text", "text": label})
+            chat_content.append(self._chat_image_part(frame.path))
+        try:
+            client = self._client()
+            if self.api_mode == "responses":
+                response = client.responses.create(
+                    model=self.model,
+                    input=[{"role": "user", "content": response_content}],
+                )
+                raw = response.output_text.strip()
+            else:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": chat_content}],
+                )
+                raw = self._chat_text(response).strip()
+        except ProviderRequestError:
+            raise
+        except Exception as exc:
+            raise self._provider_error(exc) from exc
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        try:
+            parsed = json.loads(raw)
+            corrected = {int(segment_id): str(text).strip() for segment_id, text in parsed.items()}
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            preview = re.sub(r"\s+", " ", raw)[:240]
+            raise ProviderRequestError(f"字幕校订模型未返回要求的 JSON：{preview}") from exc
+        if any(not text for text in corrected.values()):
+            raise ProviderRequestError("字幕校订模型返回了空文本")
+        return corrected
 
     def summarize(self, transcript: str) -> dict[str, Any]:
         prompt = (

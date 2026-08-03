@@ -219,6 +219,56 @@ def test_session_selection_thumbnail_zoom_and_detail_switching(tmp_path: Path) -
     window.close()
 
 
+def test_transcript_detail_supports_diff_undo_and_user_edit(tmp_path: Path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "versions.sqlite3")
+    session_id = database.create_session("字幕版本", "2026-08-03T09:00:00+00:00")
+    chunk_id = database.add_audio_chunk(session_id, "system", 0, 8_000, tmp_path / "audio.wav")
+    segment_id = database.add_transcript(
+        session_id,
+        chunk_id,
+        "system",
+        1_000,
+        3_000,
+        "换入便量",
+        "zh",
+        -0.2,
+    )
+    database.set_chunk_state(chunk_id, "transcribed")
+    database.add_transcript_version(
+        segment_id, "correction", "换入变量", model="correction-small"
+    )
+    database.configure_transcript_correction(session_id, enabled=True, window_ms=30_000)
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+
+    transcript_button = window.findChild(QPushButton, f"transcript-{segment_id}")
+    assert transcript_button is not None
+    transcript_button.click()
+    window.transcript_diff_button.click()
+    assert "[-便-]{+变+}" in window.evidence_version.text()
+    assert window.transcript_undo_button.isVisible()
+
+    window.transcript_undo_button.click()
+    assert service.open_session(session_id).transcripts[0].text == "换入便量"
+
+    transcript_button = window.findChild(QPushButton, f"transcript-{segment_id}")
+    assert transcript_button is not None
+    transcript_button.click()
+    monkeypatch.setattr(
+        "jingzhi.ui.QInputDialog.getMultiLineText",
+        lambda *_args, **_kwargs: ("用户确认：换入变量", True),
+    )
+    window.transcript_edit_button.click()
+    edited = service.open_session(session_id).transcripts[0]
+    assert edited.text == "用户确认：换入变量"
+    assert edited.version_kind == "user_edit"
+
+    window.close()
+
+
 def test_dense_timeline_remains_visible_at_required_workspace_sizes(tmp_path: Path) -> None:
     application = QApplication.instance() or QApplication([])
     database = Database(tmp_path / "dense.sqlite3")
