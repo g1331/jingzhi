@@ -166,6 +166,46 @@ class RecordingAdapter(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerEvidenceSummary:
+    state: str
+    frame_count: int
+    transcript_count: int
+    start_ms: int | None
+    end_ms: int | None
+    stable_ids: tuple[str, ...]
+
+
+ANSWER_BOUNDARY_HEADINGS = ("会话证据确认", "补充解释", "无法确认")
+
+
+def present_answer(answer: str, summary: AnswerEvidenceSummary | None) -> str:
+    content = answer.strip()
+    if not content:
+        return "## 无法确认\n\n模型没有返回可展示的回答。"
+
+    has_exact_evidence = bool(
+        summary and summary.state == "exact" and (summary.frame_count or summary.transcript_count)
+    )
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    allowed_headings = {f"## {heading}" for heading in ANSWER_BOUNDARY_HEADINGS}
+    has_boundary = bool(
+        lines
+        and lines[0] in allowed_headings
+        and all(line in allowed_headings for line in lines if line.startswith("## "))
+    )
+    if has_exact_evidence and has_boundary:
+        return content
+    if summary is not None and summary.state == "unavailable":
+        reason = "此历史回答的精确会话证据不可恢复，不能重新判断哪些内容得到过证据确认。"
+    elif not has_exact_evidence:
+        reason = "当前回答没有可核验的会话证据。"
+    else:
+        reason = "模型回答未标明依据边界，以下内容不能视为会话证据确认。"
+    quoted = "\n".join(f"> {line}" if line else ">" for line in content.splitlines())
+    return f"## 无法确认\n\n{reason}\n\n### 模型原始回复\n\n{quoted}"
+
+
+@dataclass(frozen=True, slots=True)
 class SessionTimeline:
     session: SessionRecord
     frames: tuple[TimelineFrameRecord, ...]
@@ -177,7 +217,7 @@ class SessionTimeline:
     answer_frame_ids: frozenset[int] = frozenset()
     answer_transcript_ids: frozenset[int] = frozenset()
     selected_answer_id: int | None = None
-    answer_evidence_state: str | None = None
+    answer_evidence_summary: AnswerEvidenceSummary | None = None
 
 
 class JingzhiApplicationService:
@@ -273,24 +313,40 @@ class JingzhiApplicationService:
         transcripts = self._timeline_transcripts(session_id, start_ms, end_ms)
         answer_frame_ids: frozenset[int] = frozenset()
         answer_transcript_ids: frozenset[int] = frozenset()
-        if selected_answer is not None and selected_answer.evidence_state == "exact":
-            evidence = self.database.answer_evidence(selected_answer.id)
-            answer_frame_ids = frozenset(
-                item.frame_id
-                for item in evidence
-                if item.kind == "frame" and item.frame_id is not None
+        answer_evidence_summary: AnswerEvidenceSummary | None = None
+        if selected_answer is not None:
+            evidence = (
+                self.database.answer_evidence(selected_answer.id)
+                if selected_answer.evidence_state == "exact"
+                else []
             )
-            version_ids = tuple(
-                item.transcript_version_id
-                for item in evidence
-                if item.kind == "transcript" and item.transcript_version_id is not None
+            if selected_answer.evidence_state == "exact":
+                answer_frame_ids = frozenset(
+                    item.frame_id
+                    for item in evidence
+                    if item.kind == "frame" and item.frame_id is not None
+                )
+                version_ids = tuple(
+                    item.transcript_version_id
+                    for item in evidence
+                    if item.kind == "transcript" and item.transcript_version_id is not None
+                )
+                cited_transcripts = self.database.timeline_transcript_versions(
+                    session_id, version_ids, start_ms, end_ms
+                )
+                cited_by_segment = {item.id: item for item in cited_transcripts}
+                transcripts = [cited_by_segment.get(item.id, item) for item in transcripts]
+                answer_transcript_ids = frozenset(cited_by_segment)
+            evidence_start_ms = min((item.start_ms for item in evidence), default=None)
+            evidence_end_ms = max((item.end_ms for item in evidence), default=None)
+            answer_evidence_summary = AnswerEvidenceSummary(
+                state=selected_answer.evidence_state,
+                frame_count=sum(item.kind == "frame" for item in evidence),
+                transcript_count=sum(item.kind == "transcript" for item in evidence),
+                start_ms=evidence_start_ms,
+                end_ms=evidence_end_ms,
+                stable_ids=tuple(item.stable_id for item in evidence),
             )
-            cited_transcripts = self.database.timeline_transcript_versions(
-                session_id, version_ids, start_ms, end_ms
-            )
-            cited_by_segment = {item.id: item for item in cited_transcripts}
-            transcripts = [cited_by_segment.get(item.id, item) for item in transcripts]
-            answer_transcript_ids = frozenset(cited_by_segment)
 
         return SessionTimeline(
             session=session,
@@ -303,9 +359,7 @@ class JingzhiApplicationService:
             answer_frame_ids=answer_frame_ids,
             answer_transcript_ids=answer_transcript_ids,
             selected_answer_id=selected_answer.id if selected_answer is not None else None,
-            answer_evidence_state=(
-                selected_answer.evidence_state if selected_answer is not None else None
-            ),
+            answer_evidence_summary=answer_evidence_summary,
         )
 
     def _timeline_transcripts(

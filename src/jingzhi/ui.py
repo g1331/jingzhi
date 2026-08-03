@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from jingzhi.application import JingzhiApplicationService, SessionTimeline
+from jingzhi.application import JingzhiApplicationService, SessionTimeline, present_answer
 from jingzhi.config import Settings
 from jingzhi.database import SessionAnswerRecord, TimelineFrameRecord, TimelineTranscriptRecord
 from jingzhi.rich_text import MarkdownDocument
@@ -249,6 +249,9 @@ QLabel#answerEvidenceStatus {
     border-radius: 6px; padding: 5px 8px; font-size: 11px;
 }
 QLabel#answerEvidenceStatus[state="unavailable"] {
+    color: #f2d49d; background: #2b2316; border-color: #765522;
+}
+QLabel#answerEvidenceStatus[state="insufficient"] {
     color: #f2d49d; background: #2b2316; border-color: #765522;
 }
 
@@ -778,24 +781,37 @@ class MainWindow(QMainWindow):
             self.speak_button.setEnabled(False)
             return
 
-        if timeline.answer_evidence_state == "unavailable":
+        summary = timeline.answer_evidence_summary
+        if summary is None or summary.state == "unavailable":
             self.answer_evidence_status.setText(
                 "此历史回答的精确证据不可恢复；未按问题时间范围推测引用。"
             )
+            self.answer_evidence_status.setToolTip("")
             evidence_state = "unavailable"
-        else:
+        elif summary.frame_count or summary.transcript_count:
+            assert summary.start_ms is not None and summary.end_ms is not None
             self.answer_evidence_status.setText(
-                "已在时间线上高亮此回答实际引用的关键帧和字幕版本。"
+                f"会话证据 · {summary.frame_count} 张关键帧 · "
+                f"{summary.transcript_count} 条字幕 · "
+                f"{self._format_time(summary.start_ms)}–{self._format_time(summary.end_ms)}"
+            )
+            self.answer_evidence_status.setToolTip(
+                "稳定证据标识：\n" + "\n".join(summary.stable_ids)
             )
             evidence_state = "exact"
+        else:
+            self.answer_evidence_status.setText("会话证据不足 · 0 张关键帧 · 0 条字幕")
+            self.answer_evidence_status.setToolTip("当前回答没有稳定证据标识。")
+            evidence_state = "insufficient"
         self.answer_evidence_status.setProperty("state", evidence_state)
         self.answer_evidence_status.style().unpolish(self.answer_evidence_status)
         self.answer_evidence_status.style().polish(self.answer_evidence_status)
         self.answer_evidence_status.show()
 
-        content = answer.answer or (
-            f"请求失败：{answer.error}" if answer.error else "此回答没有内容。"
-        )
+        if answer.answer:
+            content = present_answer(answer.answer, summary)
+        else:
+            content = f"请求失败：{answer.error}" if answer.error else "此回答没有内容。"
         self._last_answer = content
         self.output.set_markdown(content)
         self.speak_button.setEnabled(bool(answer.answer and answer.answer.strip()))
