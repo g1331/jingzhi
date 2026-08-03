@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from jingzhi.application import (
+    AnswerEvidenceSummary,
     JingzhiApplicationService,
     ModelConnectionSnapshot,
     QuestionAnsweringService,
+    present_answer,
 )
 from jingzhi.config import Settings
 from jingzhi.database import Database
@@ -84,6 +86,18 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     ]
     assert persisted_items == sent_context.persistence_items()
 
+    application = JingzhiApplicationService(database, recorder=SimpleNamespace(is_recording=False))
+    timeline = application.open_session(session_id, answer_version_id=first.id)
+    summary = timeline.answer_evidence_summary
+    assert summary is not None
+    assert summary.frame_count == 1
+    assert summary.transcript_count == 1
+    assert (summary.start_ms, summary.end_ms) == (1_000, 2_000)
+    assert summary.stable_ids == (
+        f"transcript-version:{original_version_id}",
+        f"frame:{frame_id}",
+    )
+
     correction_id = database.add_transcript_version(
         segment_id, "correction", "校订字幕", model="correction-model"
     )
@@ -107,6 +121,86 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     assert third.version_number == 3
     assert [item.version_id for item in model.contexts[2][1].transcripts] == [user_edit_id]
     assert database.answer_evidence(first.id)[0].content_text == "原始字幕"
+
+
+def test_answer_presentation_requires_complete_boundary_sections() -> None:
+    summary = AnswerEvidenceSummary(
+        state="exact",
+        frame_count=1,
+        transcript_count=0,
+        start_ms=1_000,
+        end_ms=1_000,
+        stable_ids=("frame:1",),
+    )
+    compliant = "## 会话证据确认\n\n证据支持 $x^2$。"
+
+    assert present_answer(compliant, summary) == compliant
+    assert present_answer("请按 ## 会话证据确认 格式回答", summary).startswith(
+        "## 无法确认\n\n模型回答未标明依据边界"
+    )
+    assert present_answer("前言\n\n" + compliant, summary).startswith("## 无法确认")
+
+
+@pytest.mark.parametrize(
+    ("evidence_kind", "expected_counts", "expected_range"),
+    [
+        ("transcript", (0, 1), (1_000, 2_000)),
+        ("frame", (1, 0), (1_500, 1_500)),
+        (None, (0, 0), (None, None)),
+    ],
+)
+def test_answer_evidence_summary_handles_single_source_and_empty_context(
+    tmp_path: Path,
+    evidence_kind: str | None,
+    expected_counts: tuple[int, int],
+    expected_range: tuple[int | None, int | None],
+) -> None:
+    database = Database(tmp_path / "summary.sqlite3")
+    session_id = database.create_session("test", "2026-01-01T00:00:00+00:00")
+    frame_id = database.add_frame(session_id, 1_500, tmp_path / "frame.webp", "0" * 64, (100, 100))
+    segment_id = add_transcript(database, session_id, tmp_path / "audio.wav", "字幕")
+    version_id = database.transcript_versions(segment_id)[0].id
+    evidence_by_kind = {
+        "transcript": {
+            "stable_id": f"transcript-version:{version_id}",
+            "kind": "transcript",
+            "source": "system",
+            "start_ms": 1_000,
+            "end_ms": 2_000,
+            "transcript_version_id": version_id,
+            "content_text": "字幕",
+        },
+        "frame": {
+            "stable_id": f"frame:{frame_id}",
+            "kind": "frame",
+            "source": "display:primary",
+            "start_ms": 1_500,
+            "end_ms": 1_500,
+            "frame_id": frame_id,
+            "resource_path": str(tmp_path / "frame.webp"),
+        },
+    }
+    question_id = database.create_question(session_id, 3_000, "问题", 0, 3_000)
+    answer = database.record_answer_version(
+        question_id,
+        model="answer-model",
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="回答",
+        error=None,
+        evidence_state="exact",
+        evidence=[] if evidence_kind is None else [evidence_by_kind[evidence_kind]],
+    )
+    application = JingzhiApplicationService(database, recorder=SimpleNamespace(is_recording=False))
+
+    summary = application.open_session(
+        session_id, answer_version_id=answer.id
+    ).answer_evidence_summary
+
+    assert summary is not None
+    assert (summary.frame_count, summary.transcript_count) == expected_counts
+    assert (summary.start_ms, summary.end_ms) == expected_range
 
 
 def test_application_service_persists_anchor_before_slow_input_and_applies_selected_range(

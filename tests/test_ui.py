@@ -373,6 +373,12 @@ def test_answer_selection_updates_exact_evidence_across_zoom_and_unavailable_his
     assert second_transcript.property("cited") is False
     assert "回答 1 使用的原始字幕" in first_transcript.text()
     assert status.property("state") == "exact"
+    assert status.text() == "会话证据 · 1 张关键帧 · 1 条字幕 · 00:15–00:21"
+    assert status.toolTip() == (
+        f"稳定证据标识：\ntranscript-version:{transcript_version_ids[0]}\nframe:{frame_ids[0]}"
+    )
+    assert "## 无法确认" in window.output.raw.toPlainText()
+    assert "模型回答未标明依据边界" in window.output.raw.toPlainText()
 
     selector.setCurrentIndex(selector.findData(answer_ids[1]))
     application.processEvents()
@@ -441,6 +447,38 @@ def test_answer_selection_updates_exact_evidence_across_zoom_and_unavailable_his
     assert selector.count() == 4
     assert selector.currentData() == new_answer.id
     assert window.findChild(QPushButton, f"keyframe-{frame_ids[1]}").property("cited") is True
+    window.close()
+
+
+def test_answer_without_evidence_is_explicitly_unconfirmed(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "no-evidence.sqlite3")
+    session_id = database.create_session("无证据回答", "2026-08-03T09:00:00+00:00")
+    question_id = database.create_question(session_id, 5_000, "发生了什么？", 0, 5_000)
+    database.record_answer_version(
+        question_id,
+        model="answer-model",
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="模型没有按约定标注这段回答。",
+        error=None,
+        evidence_state="exact",
+        evidence=[],
+    )
+    database.finish_session(session_id, "2026-08-03T09:00:05+00:00", "complete")
+    window = MainWindow(
+        Settings(data_dir=tmp_path),
+        service=JingzhiApplicationService(database, recorder=NoHardwareRecorder()),
+    )
+    window.show()
+    application.processEvents()
+
+    status = window.findChild(QLabel, "answerEvidenceStatus")
+    assert status.property("state") == "insufficient"
+    assert status.text() == "会话证据不足 · 0 张关键帧 · 0 条字幕"
+    assert "## 无法确认" in window.output.raw.toPlainText()
+    assert "当前回答没有可核验的会话证据" in window.output.raw.toPlainText()
     window.close()
 
 

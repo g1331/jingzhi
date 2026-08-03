@@ -98,6 +98,11 @@ def test_provider_api_modes_route_without_network(monkeypatch, api_mode: str) ->
     assert answer.text in {"response answer", "chat answer"}
     assert model.base_url == "https://provider.example/v1"
     assert calls[0]["model"] == "vision-model"
+    request_text = str(calls[0].get("input", calls[0].get("messages")))
+    assert "会话证据确认" in request_text
+    assert "补充解释" in request_text
+    assert "无法确认" in request_text
+    assert "当前没有可用的会话证据" in request_text
 
 
 def test_provider_html_response_becomes_concise_error(monkeypatch) -> None:
