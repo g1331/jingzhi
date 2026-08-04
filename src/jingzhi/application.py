@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -21,36 +21,20 @@ from jingzhi.database import (
     TranscriptCorrectionSettingsRecord,
     TranscriptVersionRecord,
 )
-from jingzhi.llm import AnswerModelResult
+from jingzhi.model_roles import RoleName
+from jingzhi.model_routing import InvocationEvidence, ModelRouter
 from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
     TranscriptCorrectionProcessor,
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ModelConnectionSnapshot:
-    model: str
-    base_url: str
-    api_mode: str
-
-
-class AnswerModel(Protocol):
-    def answer(self, question: str, context: QuestionContext) -> AnswerModelResult: ...
-
-
 class QuestionAnsweringService:
     """Owns question anchors, exact model evidence, and immutable answer versions."""
 
-    def __init__(
-        self,
-        database: Database,
-        model: AnswerModel,
-        connection: ModelConnectionSnapshot,
-    ) -> None:
+    def __init__(self, database: Database, router: ModelRouter) -> None:
         self.database = database
-        self.model = model
-        self.connection = connection
+        self.router = router
 
     def create_anchor(
         self, session_id: str, asked_at_ms: int, *, lookback_ms: int = 2 * 60_000
@@ -122,33 +106,72 @@ class QuestionAnsweringService:
     def _answer(
         self, question_id: int, question: str, context: QuestionContext
     ) -> AnswerVersionRecord:
-        connection_json = json.dumps(asdict(self.connection), ensure_ascii=False, sort_keys=True)
         evidence = context.persistence_items()
+        invocation_evidence = tuple(
+            InvocationEvidence(
+                stable_id=item["stable_id"],
+                kind=item["kind"],
+                source=item["source"],
+                start_ms=item["start_ms"],
+                end_ms=item["end_ms"],
+                transcript_version_id=item.get("transcript_version_id"),
+                frame_id=item.get("frame_id"),
+            )
+            for item in evidence
+        )
+        anchor = self.database.question(question_id)
+        if anchor is None:
+            raise RuntimeError("Question anchor is unavailable")
         try:
-            result = self.model.answer(question, context)
+            routed = self.router.invoke(
+                RoleName.INSTANT_ANSWER,
+                lambda model: model.answer(question, context),
+                session_id=anchor.session_id,
+                evidence=invocation_evidence,
+            )
         except Exception as exc:
+            invocation = getattr(exc, "last_invocation", None)
+            if invocation is None:
+                raise
             self.database.record_answer_version(
                 question_id,
-                model=self.connection.model,
-                connection_json=connection_json,
+                model=invocation.model,
+                connection_json=self._connection_json(invocation),
                 request_status="failed",
-                request_id=getattr(exc, "request_id", None),
+                request_id=invocation.request_id,
                 answer=None,
                 error=str(exc),
                 evidence_state="exact",
                 evidence=evidence,
             )
             raise
+        result = routed.value
         return self.database.record_answer_version(
             question_id,
-            model=result.model or self.connection.model,
-            connection_json=connection_json,
+            model=result.model or routed.invocation.model,
+            connection_json=self._connection_json(routed.invocation),
             request_status="succeeded",
             request_id=result.request_id,
             answer=result.text,
             error=None,
             evidence_state="exact",
             evidence=evidence,
+        )
+
+    @staticmethod
+    def _connection_json(invocation) -> str:
+        return json.dumps(
+            {
+                "connection_id": invocation.connection_id,
+                "connection_name": invocation.connection_name,
+                "base_url": invocation.base_url,
+                "api_mode": invocation.api_mode,
+                "role": invocation.role,
+                "reasoning_level": invocation.reasoning_level,
+                "fallback_reason": invocation.fallback_reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
         )
 
 

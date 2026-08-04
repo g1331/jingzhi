@@ -8,13 +8,14 @@ import pytest
 from jingzhi.application import (
     AnswerEvidenceSummary,
     JingzhiApplicationService,
-    ModelConnectionSnapshot,
     QuestionAnsweringService,
     present_answer,
 )
 from jingzhi.config import Settings
 from jingzhi.database import Database
 from jingzhi.llm import AnswerModelResult
+from jingzhi.model_routing import ModelRouter
+from jingzhi.provider_settings import default_saved_settings
 from jingzhi.session import SessionManager
 
 
@@ -29,6 +30,15 @@ class RecordingAnswerModel:
             f"request-{len(self.contexts)}",
             "resolved-answer-model",
         )
+
+
+def answer_service(database: Database, model) -> QuestionAnsweringService:
+    router = ModelRouter(
+        database,
+        default_saved_settings("answer-model"),
+        adapter_factory=lambda _connection, _model, _reasoning: model,
+    )
+    return QuestionAnsweringService(database, router)
 
 
 def add_transcript(database: Database, session_id: str, path: Path, text: str) -> int:
@@ -50,11 +60,7 @@ def test_answer_persists_exact_model_evidence_and_reanswer_uses_latest_version(
     segment_id = add_transcript(database, session_id, tmp_path / "audio.wav", "原始字幕")
     original_version_id = database.transcript_versions(segment_id)[0].id
     model = RecordingAnswerModel()
-    service = QuestionAnsweringService(
-        database,
-        model,
-        ModelConnectionSnapshot("answer-model", "https://example.test/v1", "responses"),
-    )
+    service = answer_service(database, model)
 
     first = service.ask(session_id, 3_000, "发生了什么？", lookback_ms=3_000)
 
@@ -212,11 +218,7 @@ def test_application_service_persists_anchor_before_slow_input_and_applies_selec
     manager.session_id = session_id
     manager.clock = SimpleNamespace(now_ms=lambda: next(times))
     model = RecordingAnswerModel()
-    question_service = QuestionAnsweringService(
-        manager.database,
-        model,
-        ModelConnectionSnapshot("answer-model", "", "responses"),
-    )
+    question_service = answer_service(manager.database, model)
     monkeypatch.setattr(manager, "_question_service", lambda: question_service)
     service = JingzhiApplicationService(manager.database, recorder=manager)
 
@@ -252,11 +254,7 @@ def test_repeated_trigger_reuses_pending_anchor_and_cancel_deletes_it_without_mo
     monkeypatch.setattr(
         manager,
         "_question_service",
-        lambda: QuestionAnsweringService(
-            manager.database,
-            model,
-            ModelConnectionSnapshot("answer-model", "", "responses"),
-        ),
+        lambda: answer_service(manager.database, model),
     )
     service = JingzhiApplicationService(manager.database, recorder=manager)
 
@@ -339,11 +337,7 @@ def test_failed_request_remains_the_current_reanswer_target(monkeypatch, tmp_pat
         def answer(self, question, context):
             raise RuntimeError("upstream failed")
 
-    service = QuestionAnsweringService(
-        manager.database,
-        FailingModel(),
-        ModelConnectionSnapshot("answer-model", "", "responses"),
-    )
+    service = answer_service(manager.database, FailingModel())
     monkeypatch.setattr(manager, "_question_service", lambda: service)
 
     with pytest.raises(RuntimeError, match="upstream failed"):
@@ -355,19 +349,11 @@ def test_failed_request_remains_the_current_reanswer_target(monkeypatch, tmp_pat
 def test_reanswer_persisted_question_after_application_restart(monkeypatch, tmp_path: Path) -> None:
     database = Database(tmp_path / "jingzhi.sqlite3")
     session_id = database.create_session("test", "2026-01-01T00:00:00+00:00")
-    first_service = QuestionAnsweringService(
-        database,
-        RecordingAnswerModel(),
-        ModelConnectionSnapshot("answer-model", "", "responses"),
-    )
+    first_service = answer_service(database, RecordingAnswerModel())
     first = first_service.ask(session_id, 1_000, "持久化问题")
 
     restarted = SessionManager(Settings(data_dir=tmp_path))
-    second_service = QuestionAnsweringService(
-        restarted.database,
-        RecordingAnswerModel(),
-        ModelConnectionSnapshot("answer-model", "", "responses"),
-    )
+    second_service = answer_service(restarted.database, RecordingAnswerModel())
     monkeypatch.setattr(restarted, "_question_service", lambda: second_service)
 
     answer = restarted.reanswer_question(first.question_id)
@@ -392,11 +378,7 @@ def test_failed_request_persists_connection_error_and_request_id(tmp_path: Path)
         def answer(self, question, context):
             raise RequestFailure("upstream failed")
 
-    service = QuestionAnsweringService(
-        database,
-        FailingModel(),
-        ModelConnectionSnapshot("answer-model", "https://example.test/v1", "responses"),
-    )
+    service = answer_service(database, FailingModel())
 
     try:
         service.ask(session_id, 1_000, "失败问题")

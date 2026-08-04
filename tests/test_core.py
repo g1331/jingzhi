@@ -10,6 +10,8 @@ from jingzhi.config import Settings
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel, ProviderRequestError
+from jingzhi.model_roles import RoleName
+from jingzhi.provider_settings import default_saved_settings
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import (
     CorrectionFrame,
@@ -164,10 +166,9 @@ def test_transcript_correction_uses_its_own_model_role(tmp_path: Path) -> None:
     manager = SessionManager(
         Settings(
             data_dir=tmp_path,
-            llm_model="question-model",
-            transcript_correction_model="correction-small",
+            provider_settings=default_saved_settings("question-model", "correction-small"),
         )
     )
 
-    assert manager._context_model().model == "question-model"
+    assert manager.model_role(RoleName.INSTANT_ANSWER).model == "question-model"
     assert manager.transcript_correction_model().model == "correction-small"
