@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -1035,4 +1036,67 @@ def test_quick_question_controls_range_cancel_voice_and_manual_speech(
     assert recorder.cancel_calls == 2
     assert window.question.text() == ""
     assert window.voice_button.text() == "按住说话"
+    window.close()
+
+
+def test_session_library_search_filter_pin_delete_and_restore(tmp_path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    database = Database(tmp_path / "library.sqlite3")
+    first_id = database.create_session("路线图会议", "2026-08-03T10:00:00+00:00")
+    database.finish_session(first_id, "2026-08-03T11:00:00+00:00", "complete")
+    second_id = database.create_session("普通会话", "2026-08-02T10:00:00+00:00")
+    database.finish_session(second_id, "2026-08-02T11:00:00+00:00", "complete")
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder(), now=lambda: now)
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+    assert window._maintenance_timer.isActive()
+
+    assert window.session_library.count() == 2
+    window.session_search.setText("路线图")
+    application.processEvents()
+    assert window.session_library.count() == 1
+    assert first_id == window.session_library.currentItem().data(Qt.ItemDataRole.UserRole)
+
+    window.session_pin_button.click()
+    assert "已固定" in window.session_library.currentItem().text()
+    monkeypatch.setattr(
+        "jingzhi.ui.QMessageBox.question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.session_delete_button.click()
+    assert window.session_library.count() == 0
+
+    window.session_search.clear()
+    window.session_filter.setCurrentIndex(3)
+    application.processEvents()
+    assert window.session_library.count() == 1
+    assert "回收区" in window.session_library.currentItem().text()
+    window.session_restore_button.click()
+    application.processEvents()
+    assert window.session_filter.currentData() == "all"
+    assert window.session_library.count() == 2
+    assert {
+        window.session_library.item(index).data(Qt.ItemDataRole.UserRole) for index in range(2)
+    } == {
+        first_id,
+        second_id,
+    }
+    window.close()
+
+
+def test_interrupted_session_timeline_retains_status(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "interrupted-ui.sqlite3")
+    database.create_session("中断会话", "2026-08-04T10:00:00+00:00")
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+
+    window.session_library.setCurrentItem(window.session_library.item(0))
+    application.processEvents()
+
+    assert "已中断" in window.workspace_meta.text()
     window.close()

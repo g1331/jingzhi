@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from jingzhi.capture.devices import RecordingSelection
@@ -13,6 +13,7 @@ from jingzhi.database import (
     AnswerVersionRecord,
     Database,
     SessionAnswerRecord,
+    SessionNotificationKind,
     SessionRecord,
     TimelineFrameRecord,
     TimelineQuestionRecord,
@@ -245,6 +246,13 @@ class SessionTimeline:
     answer_evidence_summary: AnswerEvidenceSummary | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionNotification:
+    session_id: str
+    title: str
+    kind: SessionNotificationKind
+
+
 class JingzhiApplicationService:
     """Application boundary used by the Qt UI and hardware-free use-case tests."""
 
@@ -260,10 +268,26 @@ class JingzhiApplicationService:
         self.recorder = recorder
         self._now = now or (lambda: datetime.now(UTC))
         self.correction_model = correction_model
+        active_session_id = getattr(recorder, "session_id", None) if recorder.is_recording else None
+        self.database.interrupt_recording_sessions(
+            self._now_utc().isoformat(), exclude_session_id=active_session_id
+        )
 
     @property
     def is_recording(self) -> bool:
         return self.recorder.is_recording
+
+    def session_storage_busy_reason(self, session_id: str) -> str | None:
+        if getattr(self.recorder, "session_id", None) != session_id:
+            return None
+        busy_reason = getattr(self.recorder, "storage_busy_reason", None)
+        if callable(busy_reason):
+            reason = busy_reason()
+            if reason:
+                return str(reason)
+        if self.recorder.is_recording:
+            return "正在记录会话"
+        return None
 
     def start_session(
         self,
@@ -294,8 +318,164 @@ class JingzhiApplicationService:
     def finish_question_voice(self) -> str:
         return self.recorder.finish_question_voice()
 
-    def list_sessions(self) -> list[SessionRecord]:
-        return self.database.list_sessions()
+    def list_sessions(
+        self,
+        *,
+        query: str = "",
+        status: str = "all",
+        newest_first: bool = True,
+    ) -> list[SessionRecord]:
+        current_session_id = (
+            getattr(self.recorder, "session_id", None) if self.recorder.is_recording else None
+        )
+        records = self.database.list_sessions(
+            query=query,
+            status="all" if status == "unfinished" else status,
+            newest_first=newest_first,
+            current_session_id=current_session_id,
+        )
+        if status == "unfinished":
+            return [item for item in records if item.status in {"recording", "interrupted"}]
+        return records
+
+    @storage_writer("固定会话")
+    def pin_session(self, session_id: str, pinned: bool) -> None:
+        now = self._now_utc().isoformat()
+        if not self.database.set_session_pinned(
+            session_id,
+            pinned_at_utc=now if pinned else None,
+            retention_started_at_utc=now,
+        ):
+            raise KeyError(f"Unknown active session: {session_id}")
+
+    @storage_writer("移入回收区")
+    def delete_session(self, session_id: str) -> None:
+        busy_reason = self.session_storage_busy_reason(session_id)
+        if busy_reason:
+            raise RuntimeError(f"会话仍在写入：{busy_reason}")
+        now = self._now_utc()
+        if not self.database.move_session_to_trash(
+            session_id, now.isoformat(), (now + timedelta(days=7)).isoformat()
+        ):
+            raise KeyError(f"Unknown deletable session: {session_id}")
+
+    @storage_writer("恢复会话")
+    def restore_session(self, session_id: str) -> None:
+        if not self.database.restore_session(session_id, self._now_utc().isoformat()):
+            raise KeyError(f"Unknown trashed session: {session_id}")
+
+    @storage_writer("完成中断会话")
+    def complete_interrupted_session(self, session_id: str) -> None:
+        busy_reason = self.session_storage_busy_reason(session_id)
+        if busy_reason:
+            raise RuntimeError(f"会话仍在写入：{busy_reason}")
+        if not self.database.complete_interrupted_session(session_id, self._now_utc().isoformat()):
+            raise KeyError(f"Unknown interrupted session: {session_id}")
+
+    @storage_writer("执行会话清理")
+    def run_session_maintenance(self) -> tuple[SessionNotification, ...]:
+        now = self._now_utc()
+        notices: list[SessionNotification] = []
+
+        def append_final_delete_failure(session_id: str, title: str) -> None:
+            if self.database.record_final_delete_failure(session_id, now.isoformat()):
+                notices.append(
+                    SessionNotification(
+                        session_id, title, SessionNotificationKind.FINAL_DELETE_FAILED
+                    )
+                )
+
+        for pending in self.database.pending_media_deletions():
+            if self.session_storage_busy_reason(pending.session_id):
+                continue
+            try:
+                finalized = self.database.finalize_pending_media_deletion(pending.session_id)
+            except OSError:
+                append_final_delete_failure(pending.session_id, pending.title)
+                continue
+            if finalized:
+                notices.append(
+                    SessionNotification(
+                        pending.session_id,
+                        pending.title,
+                        SessionNotificationKind.PERMANENTLY_DELETED,
+                    )
+                )
+
+        for session in self.database.list_sessions():
+            if (
+                self.session_storage_busy_reason(session.id)
+                or session.pinned
+                or session.status == "recording"
+            ):
+                continue
+            anchor_text = (
+                session.retention_started_at_utc or session.ended_at_utc or session.started_at_utc
+            )
+            due_at = self._as_utc(datetime.fromisoformat(anchor_text)) + timedelta(days=30)
+            remaining = due_at - now
+            if remaining <= timedelta(0):
+                expires_at = now + timedelta(days=7)
+                if self.database.move_session_to_trash(
+                    session.id,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                    allow_pinned=False,
+                    expected_session=session,
+                ) and self.database.record_session_notification(
+                    session.id,
+                    SessionNotificationKind.MOVED_TO_TRASH,
+                    now.isoformat(),
+                    expected_trashed=True,
+                ):
+                    notices.append(
+                        SessionNotification(
+                            session.id, session.title, SessionNotificationKind.MOVED_TO_TRASH
+                        )
+                    )
+                continue
+            kind = None
+            if remaining <= timedelta(days=1):
+                kind = SessionNotificationKind.RETENTION_1D
+            elif remaining <= timedelta(days=7):
+                kind = SessionNotificationKind.RETENTION_7D
+            if kind and self.database.record_session_notification(
+                session.id,
+                kind,
+                now.isoformat(),
+                expected_session=session,
+            ):
+                notices.append(SessionNotification(session.id, session.title, kind))
+
+        for session in self.database.list_sessions(status="trash"):
+            if self.session_storage_busy_reason(session.id):
+                continue
+            if session.trash_expires_at_utc is None:
+                continue
+            expires_at = self._as_utc(datetime.fromisoformat(session.trash_expires_at_utc))
+            if expires_at > now:
+                continue
+            try:
+                deleted = self.database.permanently_delete_session(session.id)
+            except OSError:
+                append_final_delete_failure(session.id, session.title)
+                continue
+            if deleted:
+                notices.append(
+                    SessionNotification(
+                        session.id, session.title, SessionNotificationKind.PERMANENTLY_DELETED
+                    )
+                )
+        return tuple(notices)
+
+    def _now_utc(self) -> datetime:
+        return self._as_utc(self._now())
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     def open_session(
         self,

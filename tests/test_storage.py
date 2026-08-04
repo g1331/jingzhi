@@ -130,6 +130,15 @@ def test_existing_session_migration_copies_all_data_rewrites_paths_and_survives_
     store = _store(tmp_path)
     paths = store.resolve()
     session_id = _seed_data_directory(paths.data_dir)
+    staged = paths.data_dir / "sessions" / session_id / f".{session_id}.deleting"
+    staged.mkdir(parents=True)
+    (staged / "frame.webp").write_bytes(b"pending")
+    with sqlite3.connect(paths.data_dir / "jingzhi.sqlite3") as connection:
+        connection.execute(
+            """INSERT INTO pending_media_deletions(session_id, title, path)
+               VALUES (?, ?, ?)""",
+            (session_id, "迁移中的删除", str(staged)),
+        )
     manager = StorageManager(paths, store)
     target = tmp_path / "moved-data"
 
@@ -146,8 +155,15 @@ def test_existing_session_migration_copies_all_data_rewrites_paths_and_survives_
     with sqlite3.connect(target / "jingzhi.sqlite3") as connection:
         frame_path = Path(connection.execute("SELECT path FROM frames").fetchone()[0])
         audio_path = Path(connection.execute("SELECT path FROM audio_chunks").fetchone()[0])
+        pending_path = Path(
+            connection.execute(
+                "SELECT path FROM pending_media_deletions WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+        )
     assert frame_path == target / "sessions" / session_id / "frames" / "display-01" / "frame.webp"
     assert audio_path == target / "sessions" / session_id / "audio" / "system" / "chunk.flac"
+    assert pending_path == target / "sessions" / session_id / f".{session_id}.deleting"
+    assert (pending_path / "frame.webp").read_bytes() == b"pending"
     assert paths.data_dir.exists()
 
 

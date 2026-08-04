@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from jingzhi.transcript_correction import CORRECTION_WINDOW_MS
@@ -18,7 +21,28 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT NOT NULL,
     started_at_utc TEXT NOT NULL,
     ended_at_utc TEXT,
-    status TEXT NOT NULL CHECK (status IN ('recording', 'complete', 'interrupted'))
+    status TEXT NOT NULL CHECK (status IN ('recording', 'complete', 'interrupted')),
+    pinned_at_utc TEXT,
+    retention_started_at_utc TEXT,
+    trashed_at_utc TEXT,
+    trash_expires_at_utc TEXT
+);
+
+CREATE TABLE IF NOT EXISTS session_notifications (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'retention_7d', 'retention_1d', 'moved_to_trash',
+        'permanently_deleted', 'final_delete_failed'
+    )),
+    notified_at_utc TEXT NOT NULL,
+    PRIMARY KEY(session_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS pending_media_deletions (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    path TEXT NOT NULL,
+    failure_notified_at_utc TEXT
 );
 
 CREATE TABLE IF NOT EXISTS frames (
@@ -227,7 +251,16 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 10
+
+
+class SessionNotificationKind(StrEnum):
+    RETENTION_7D = "retention_7d"
+    RETENTION_1D = "retention_1d"
+    MOVED_TO_TRASH = "moved_to_trash"
+    PERMANENTLY_DELETED = "permanently_deleted"
+    FINAL_DELETE_FAILED = "final_delete_failed"
+
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -236,6 +269,10 @@ SELECT
     sessions.started_at_utc,
     sessions.ended_at_utc,
     sessions.status,
+    sessions.pinned_at_utc,
+    sessions.retention_started_at_utc,
+    sessions.trashed_at_utc,
+    sessions.trash_expires_at_utc,
     (SELECT COUNT(*) FROM frames WHERE session_id = sessions.id) AS frame_count,
     COALESCE((SELECT MAX(ts_ms) FROM frames WHERE session_id = sessions.id), 0)
         AS last_frame_ms,
@@ -295,6 +332,17 @@ class SessionRecord:
     status: str
     duration_ms: int
     frame_count: int
+    pinned: bool
+    retention_started_at_utc: str | None
+    trashed_at_utc: str | None
+    trash_expires_at_utc: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingMediaDeletion:
+    session_id: str
+    title: str
+    path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +542,30 @@ class Database:
             connection.execute(
                 "ALTER TABLE questions ADD COLUMN state TEXT NOT NULL DEFAULT 'submitted'"
             )
+        session_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        for name in (
+            "pinned_at_utc",
+            "retention_started_at_utc",
+            "trashed_at_utc",
+            "trash_expires_at_utc",
+        ):
+            if name not in session_columns:
+                connection.execute(f"ALTER TABLE sessions ADD COLUMN {name} TEXT")
+        pending_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(pending_media_deletions)").fetchall()
+        }
+        if "failure_notified_at_utc" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE pending_media_deletions ADD COLUMN failure_notified_at_utc TEXT"
+            )
+        connection.execute(
+            """UPDATE sessions
+               SET retention_started_at_utc = COALESCE(ended_at_utc, started_at_utc)
+               WHERE status != 'recording' AND retention_started_at_utc IS NULL"""
+        )
         applied_at = datetime.now(UTC).isoformat()
         connection.execute(
             """INSERT OR IGNORE INTO transcript_versions(
@@ -540,8 +612,10 @@ class Database:
     def finish_session(self, session_id: str, ended_at_utc: str, status: str) -> None:
         with self.connect() as connection:
             connection.execute(
-                "UPDATE sessions SET ended_at_utc = ?, status = ? WHERE id = ?",
-                (ended_at_utc, status, session_id),
+                """UPDATE sessions
+                   SET ended_at_utc = ?, status = ?, retention_started_at_utc = ?
+                   WHERE id = ?""",
+                (ended_at_utc, status, ended_at_utc, session_id),
             )
 
     def add_frame(
@@ -563,10 +637,47 @@ class Database:
             )
             return int(cursor.lastrowid)
 
-    def list_sessions(self) -> list[SessionRecord]:
+    def list_sessions(
+        self,
+        *,
+        query: str = "",
+        status: str = "all",
+        newest_first: bool = True,
+        current_session_id: str | None = None,
+    ) -> list[SessionRecord]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if status == "trash":
+            clauses.append("sessions.trashed_at_utc IS NOT NULL")
+        else:
+            clauses.append("sessions.trashed_at_utc IS NULL")
+            if status != "all":
+                clauses.append("sessions.status = ?")
+                parameters.append(status)
+        if query.strip():
+            pattern = f"%{query.strip()}%"
+            clauses.append(
+                """(sessions.title LIKE ? OR EXISTS (
+                       SELECT 1
+                       FROM transcript_segments AS searchable_segment
+                       JOIN effective_transcript_versions AS searchable_version
+                         ON searchable_version.segment_id = searchable_segment.id
+                       WHERE searchable_segment.session_id = sessions.id
+                         AND searchable_version.text LIKE ?
+                   ))"""
+            )
+            parameters.extend((pattern, pattern))
+        direction = "DESC" if newest_first else "ASC"
+        order = (
+            " ORDER BY CASE WHEN sessions.id = ? THEN 0 ELSE 1 END, "
+            f"CASE WHEN sessions.pinned_at_utc IS NOT NULL THEN 0 ELSE 1 END, "
+            f"sessions.started_at_utc {direction}, sessions.id"
+        )
+        parameters.append(current_session_id)
         with self.connect() as connection:
             rows = connection.execute(
-                SESSION_SUMMARY_QUERY + " ORDER BY sessions.started_at_utc DESC, sessions.id"
+                SESSION_SUMMARY_QUERY + " WHERE " + " AND ".join(clauses) + order,
+                parameters,
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
@@ -599,7 +710,245 @@ class Database:
             status=row["status"],
             duration_ms=duration_ms,
             frame_count=int(row["frame_count"]),
+            pinned=row["pinned_at_utc"] is not None,
+            retention_started_at_utc=row["retention_started_at_utc"],
+            trashed_at_utc=row["trashed_at_utc"],
+            trash_expires_at_utc=row["trash_expires_at_utc"],
         )
+
+    def interrupt_recording_sessions(
+        self, ended_at_utc: str, *, exclude_session_id: str | None = None
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE sessions
+                   SET status = 'interrupted', ended_at_utc = ?, retention_started_at_utc = ?
+                   WHERE status = 'recording' AND id IS NOT ?""",
+                (ended_at_utc, ended_at_utc, exclude_session_id),
+            )
+
+    def complete_interrupted_session(self, session_id: str, completed_at_utc: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE sessions SET status = 'complete', ended_at_utc = ?,
+                          retention_started_at_utc = ?
+                   WHERE id = ? AND status = 'interrupted' AND trashed_at_utc IS NULL""",
+                (completed_at_utc, completed_at_utc, session_id),
+            )
+        return cursor.rowcount == 1
+
+    def set_session_pinned(
+        self,
+        session_id: str,
+        pinned_at_utc: str | None,
+        retention_started_at_utc: str,
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE sessions
+                   SET pinned_at_utc = ?,
+                       retention_started_at_utc = CASE WHEN ? IS NULL THEN ?
+                                                     ELSE retention_started_at_utc END
+                   WHERE id = ? AND trashed_at_utc IS NULL""",
+                (pinned_at_utc, pinned_at_utc, retention_started_at_utc, session_id),
+            )
+            if cursor.rowcount and pinned_at_utc is None:
+                connection.execute(
+                    "DELETE FROM session_notifications WHERE session_id = ?", (session_id,)
+                )
+        return cursor.rowcount == 1
+
+    def move_session_to_trash(
+        self,
+        session_id: str,
+        trashed_at_utc: str,
+        expires_at_utc: str,
+        *,
+        allow_pinned: bool = True,
+        expected_session: SessionRecord | None = None,
+    ) -> bool:
+        conditions = ["id = ?", "trashed_at_utc IS NULL", "status != 'recording'"]
+        parameters: list[object] = [session_id]
+        if not allow_pinned:
+            conditions.append("pinned_at_utc IS NULL")
+        if expected_session is not None:
+            conditions.append("status = ?")
+            parameters.append(expected_session.status)
+            if expected_session.retention_started_at_utc is None:
+                conditions.append("retention_started_at_utc IS NULL")
+            else:
+                conditions.append("retention_started_at_utc = ?")
+                parameters.append(expected_session.retention_started_at_utc)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""UPDATE sessions SET trashed_at_utc = ?, trash_expires_at_utc = ?
+                   WHERE {" AND ".join(conditions)}""",
+                (trashed_at_utc, expires_at_utc, *parameters),
+            )
+        return cursor.rowcount == 1
+
+    def restore_session(self, session_id: str, restored_at_utc: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE sessions
+                   SET trashed_at_utc = NULL, trash_expires_at_utc = NULL,
+                       retention_started_at_utc = ?
+                   WHERE id = ? AND trashed_at_utc IS NOT NULL
+                     AND trash_expires_at_utc > ?""",
+                (restored_at_utc, session_id, restored_at_utc),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "DELETE FROM session_notifications WHERE session_id = ?", (session_id,)
+                )
+        return cursor.rowcount == 1
+
+    def record_session_notification(
+        self,
+        session_id: str,
+        kind: SessionNotificationKind,
+        notified_at_utc: str,
+        *,
+        expected_session: SessionRecord | None = None,
+        expected_trashed: bool | None = None,
+    ) -> bool:
+        with self.connect() as connection:
+            if expected_session is None and expected_trashed is None:
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO session_notifications(session_id, kind, notified_at_utc)
+                       VALUES (?, ?, ?)""",
+                    (session_id, kind.value, notified_at_utc),
+                )
+            else:
+                conditions = ["id = ?"]
+                parameters: list[object] = [session_id]
+                if expected_session is not None:
+                    conditions.extend(
+                        [
+                            "status = ?",
+                            "status != 'recording'",
+                            "pinned_at_utc IS NULL",
+                        ]
+                    )
+                    parameters.append(expected_session.status)
+                    if expected_session.retention_started_at_utc is None:
+                        conditions.append("retention_started_at_utc IS NULL")
+                    else:
+                        conditions.append("retention_started_at_utc = ?")
+                        parameters.append(expected_session.retention_started_at_utc)
+                if expected_trashed is True:
+                    conditions.append("trashed_at_utc IS NOT NULL")
+                elif expected_trashed is False or expected_session is not None:
+                    conditions.append("trashed_at_utc IS NULL")
+                cursor = connection.execute(
+                    f"""INSERT OR IGNORE INTO session_notifications(session_id, kind, notified_at_utc)
+                       SELECT ?, ?, ?
+                       WHERE EXISTS (SELECT 1 FROM sessions WHERE {" AND ".join(conditions)})""",
+                    (session_id, kind.value, notified_at_utc, *parameters),
+                )
+        return cursor.rowcount == 1
+
+    def record_final_delete_failure(self, session_id: str, notified_at_utc: str) -> bool:
+        with self.connect() as connection:
+            pending = connection.execute(
+                "SELECT 1 FROM pending_media_deletions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if pending is not None:
+                cursor = connection.execute(
+                    """UPDATE pending_media_deletions
+                       SET failure_notified_at_utc = ?
+                       WHERE session_id = ? AND failure_notified_at_utc IS NULL""",
+                    (notified_at_utc, session_id),
+                )
+                return cursor.rowcount == 1
+            session = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND trashed_at_utc IS NOT NULL",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                return False
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO session_notifications(
+                       session_id, kind, notified_at_utc
+                   ) VALUES (?, ?, ?)""",
+                (session_id, SessionNotificationKind.FINAL_DELETE_FAILED.value, notified_at_utc),
+            )
+        return cursor.rowcount == 1
+
+    def pending_media_deletions(self) -> tuple[PendingMediaDeletion, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT session_id, title, path FROM pending_media_deletions ORDER BY session_id"
+            ).fetchall()
+        pending: list[PendingMediaDeletion] = []
+        for row in rows:
+            path = Path(row["path"])
+            if not path.is_absolute():
+                path = self.path.parent / path
+            pending.append(PendingMediaDeletion(row["session_id"], row["title"], path))
+        return tuple(pending)
+
+    def finalize_pending_media_deletion(self, session_id: str) -> bool:
+        pending = next(
+            (item for item in self.pending_media_deletions() if item.session_id == session_id),
+            None,
+        )
+        if pending is None:
+            return False
+        if pending.path.exists():
+            shutil.rmtree(pending.path)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM pending_media_deletions WHERE session_id = ?", (session_id,)
+            )
+        return cursor.rowcount == 1
+
+    def permanently_delete_session(self, session_id: str) -> bool:
+        session = self.get_session(session_id)
+        if session is None or session.trashed_at_utc is None:
+            return False
+        media_dir = self.path.parent / "sessions" / session_id
+        staged_dir = media_dir.with_name(f".{session_id}.deleting")
+        if media_dir.exists():
+            if staged_dir.exists():
+                raise OSError("会话媒体正在等待删除")
+            os.replace(media_dir, staged_dir)
+        elif not staged_dir.exists():
+            staged_dir = None
+        try:
+            with self.connect() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM sessions WHERE id = ? AND trashed_at_utc IS NOT NULL",
+                    (session_id,),
+                )
+                if cursor.rowcount != 1:
+                    deleted = False
+                else:
+                    connection.execute(
+                        "DELETE FROM transcript_fts WHERE session_id = ?", (session_id,)
+                    )
+                    if staged_dir is not None:
+                        connection.execute(
+                            """INSERT OR REPLACE INTO pending_media_deletions(session_id, title, path)
+                               VALUES (?, ?, ?)""",
+                            (
+                                session_id,
+                                session.title,
+                                str(staged_dir.relative_to(self.path.parent)),
+                            ),
+                        )
+                    deleted = True
+        except Exception:
+            if staged_dir is not None and staged_dir.exists() and not media_dir.exists():
+                os.replace(staged_dir, media_dir)
+            raise
+        if not deleted:
+            if staged_dir is not None and staged_dir.exists() and not media_dir.exists():
+                os.replace(staged_dir, media_dir)
+            return False
+        if staged_dir is not None:
+            self.finalize_pending_media_deletion(session_id)
+        return True
 
     def timeline_frames(
         self, session_id: str, start_ms: int, end_ms: int

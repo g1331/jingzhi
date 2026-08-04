@@ -390,6 +390,8 @@ class StorageManager:
                 rows = connection.execute(f"SELECT id, path FROM {table}").fetchall()
                 for identifier, stored_path in rows:
                     path = Path(stored_path)
+                    if not path.is_absolute():
+                        continue
                     try:
                         relative = path.resolve().relative_to(old_dir.resolve())
                     except ValueError:
@@ -398,6 +400,21 @@ class StorageManager:
                         f"UPDATE {table} SET path = ? WHERE id = ?",
                         (str(new_dir / relative), identifier),
                     )
+            rows = connection.execute(
+                "SELECT session_id, path FROM pending_media_deletions"
+            ).fetchall()
+            for session_id, stored_path in rows:
+                path = Path(stored_path)
+                if not path.is_absolute():
+                    continue
+                try:
+                    relative = path.resolve().relative_to(old_dir.resolve())
+                except ValueError:
+                    continue
+                connection.execute(
+                    "UPDATE pending_media_deletions SET path = ? WHERE session_id = ?",
+                    (str(new_dir / relative), session_id),
+                )
             connection.commit()
         finally:
             connection.close()

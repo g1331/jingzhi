@@ -186,6 +186,13 @@ class SessionManager:
             return "字幕转写仍在写入数据"
         if self.correction_worker is not None and self.correction_worker.is_alive():
             return "字幕校订仍在写入数据"
+        write_thread_names = {
+            "answer-question",
+            "reanswer-question",
+            "summarize-session",
+        }
+        if any(thread.name in write_thread_names for thread in threading.enumerate()):
+            return "问答任务仍在写入会话数据"
         return None
 
     def whisper_model_in_use(self, repository_id: str) -> bool:
