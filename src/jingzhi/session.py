@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from jingzhi.application import QuestionAnsweringService
+from jingzhi.application import QuestionAnsweringService, RecordingStatus
 from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk, QuestionVoiceRecorder
 from jingzhi.capture.devices import (
     DeviceCatalog,
     RecordingSelection,
+    ResolvedRecordingSelection,
     WindowsDeviceCatalog,
 )
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
-from jingzhi.database import Database
+from jingzhi.database import Database, SourceEventRecord, TimelineEventKind
 from jingzhi.model_roles import ModelRole, RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
@@ -41,6 +43,8 @@ from jingzhi.whisper_settings import (
     resolve_whisper_settings,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class SessionManager:
     def __init__(
@@ -49,6 +53,7 @@ class SessionManager:
         *,
         on_segment: Callable[[int, int, str, str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_source_event: Callable[[SourceEventRecord], None] | None = None,
         device_catalog: DeviceCatalog | None = None,
         whisper_capabilities: WhisperCapabilities | None = None,
     ) -> None:
@@ -56,12 +61,20 @@ class SessionManager:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.database = Database(self.settings.data_dir / "jingzhi.sqlite3")
         self.on_segment = on_segment
+        self.on_source_event = on_source_event
         self.on_error = on_error
         self.device_catalog = device_catalog or WindowsDeviceCatalog()
         self.session_id: str | None = None
         self.clock: SessionClock | None = None
         self.stop_event: threading.Event | None = None
         self.workers: list[threading.Thread] = []
+        self.pause_event = threading.Event()
+        self.recording_selection: ResolvedRecordingSelection | None = None
+        self._pause_event_id: int | None = None
+        self._failed_sources: set[str] = set()
+        self._source_event_keys: set[tuple[str, str, int]] = set()
+        self._lifecycle_lock = threading.RLock()
+        self._source_event_lock = threading.RLock()
         self.chunk_queue: queue.Queue[AudioChunk | None] | None = None
         self.transcriber: TranscriptionWorker | None = None
         self.correction_enabled = settings.transcript_correction_enabled
@@ -175,6 +188,25 @@ class SessionManager:
     def is_recording(self) -> bool:
         return self.session_id is not None and self.stop_event is not None
 
+    @property
+    def is_paused(self) -> bool:
+        return self.is_recording and self.pause_event.is_set()
+
+    def recording_status(self) -> RecordingStatus:
+        selection = self.recording_selection
+        if not self.is_recording or self.clock is None:
+            return RecordingStatus("idle", 0, 0, False, False)
+        with self._source_event_lock:
+            failed_sources = frozenset(self._failed_sources)
+        return RecordingStatus(
+            "paused" if self.is_paused else "recording",
+            self.clock.now_ms(),
+            len(selection.displays) if selection is not None else 0,
+            selection is not None and selection.system_audio is not None,
+            selection is not None and selection.microphone is not None,
+            failed_sources,
+        )
+
     def storage_busy_reason(self) -> str | None:
         if self.is_recording:
             return "正在录制会话"
@@ -195,6 +227,40 @@ class SessionManager:
             return "问答任务仍在写入会话数据"
         return None
 
+    def _source_failure(
+        self, source: str, kind: str, start_ms: int, end_ms: int, message: str
+    ) -> None:
+        session_id = self.session_id
+        if session_id is None:
+            return
+        end_ms = max(start_ms, end_ms)
+        key = (source, kind, start_ms)
+        try:
+            with self._source_event_lock:
+                if key in self._source_event_keys:
+                    return
+                event_id = self.database.record_source_event(
+                    session_id, source, kind, start_ms, end_ms, message
+                )
+                self._source_event_keys.add(key)
+                self._failed_sources.add(source)
+        except Exception as exc:  # persistence boundary must not kill capture workers
+            logger.exception("Could not persist source failure for %s", source)
+            if self.on_error:
+                try:
+                    self.on_error(f"来源故障无法写入本地存储：{source}；{exc}")
+                except Exception:
+                    logger.exception("Source failure persistence error callback failed")
+            return
+        event = self.database.source_event(event_id)
+        if event is not None and self.on_source_event:
+            self.on_source_event(event)
+        if self.on_error:
+            self.on_error(
+                f"来源故障：{source}，会话时间 {start_ms / 1000:.1f}–{end_ms / 1000:.1f} 秒；"
+                f"{message}。确认数据缺失后才会写入时间线。"
+            )
+
     def whisper_model_in_use(self, repository_id: str) -> bool:
         active_repository = canonical_whisper_repository_id(self.actual_whisper_settings.model)
         if repository_id != active_repository:
@@ -208,6 +274,15 @@ class SessionManager:
 
     @storage_writer("开始会话")
     def start(
+        self,
+        title: str,
+        *,
+        selection: RecordingSelection | None = None,
+    ) -> str:
+        with self._lifecycle_lock:
+            return self._start_unlocked(title, selection=selection)
+
+    def _start_unlocked(
         self,
         title: str,
         *,
@@ -251,6 +326,7 @@ class SessionManager:
             ),
             snapshot,
         )
+        self.recording_selection = resolved_selection
         clock = SessionClock.start()
         session_id = self.database.create_session(
             title.strip() or "Untitled session", clock.started_at_utc
@@ -265,6 +341,10 @@ class SessionManager:
         self.last_question_id = None
         self.pending_question_id = None
         self.chunk_queue = chunk_queue
+        self.pause_event.clear()
+        self._pause_event_id = None
+        self._failed_sources.clear()
+        self._source_event_keys.clear()
         resolved_whisper = resolve_whisper_settings(
             self.whisper_settings, self.whisper_capabilities
         )
@@ -291,9 +371,11 @@ class SessionManager:
                 display=display,
                 output_dir=session_dir / "frames" / f"display-{index:02d}",
                 stop_event=stop_event,
+                pause_event=self.pause_event,
                 interval_s=self.settings.screen_interval_s,
                 hash_distance=self.settings.screen_hash_distance,
                 on_error=self.on_error,
+                on_failure=self._source_failure,
             )
             for index, display in enumerate(resolved_selection.displays, start=1)
         ]
@@ -312,11 +394,13 @@ class SessionManager:
                         device_catalog=self.device_catalog,
                         output_dir=session_dir / "audio",
                         stop_event=stop_event,
+                        pause_event=self.pause_event,
                         chunk_queue=chunk_queue,
                         sample_rate=self.settings.audio_capture_rate,
                         storage_sample_rate=self.settings.audio_storage_rate,
                         chunk_s=self.settings.audio_chunk_s,
                         on_error=self.on_error,
+                        on_failure=self._source_failure,
                     )
                 )
         self.transcriber = TranscriptionWorker(
@@ -400,6 +484,13 @@ class SessionManager:
 
     @storage_writer("结束会话")
     def stop(self) -> str | None:
+        with self._lifecycle_lock:
+            return self._stop_unlocked()
+
+    def _stop_unlocked(self) -> str | None:
+        if self.is_paused:
+            assert self.clock is not None
+            self._close_pause(self.clock.now_ms())
         self.cancel_question()
         if not self.is_recording:
             return None
@@ -439,6 +530,42 @@ class SessionManager:
             self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
             self.correction_flush_event.clear()
         return session_id
+
+    @storage_writer("暂停会话")
+    def pause(self) -> bool:
+        with self._lifecycle_lock:
+            if not self.is_recording or self.is_paused:
+                return False
+            assert self.session_id is not None
+            assert self.clock is not None
+            start_ms = self.clock.now_ms()
+            event_id = self.database.add_timeline_event(
+                self.session_id,
+                TimelineEventKind.PAUSE,
+                None,
+                start_ms,
+                start_ms,
+                "用户主动暂停，所有来源停止采集",
+            )
+            self._pause_event_id = event_id
+            self.pause_event.set()
+            return True
+
+    @storage_writer("恢复会话")
+    def resume(self) -> bool:
+        with self._lifecycle_lock:
+            if not self.is_recording or not self.is_paused:
+                return False
+            assert self.clock is not None
+            self._close_pause(self.clock.now_ms())
+            return True
+
+    def _close_pause(self, end_ms: int) -> None:
+        event_id = self._pause_event_id
+        if event_id is not None and not self.database.finish_timeline_event(event_id, end_ms):
+            raise RuntimeError(f"Unable to close pause timeline event {event_id}")
+        self.pause_event.clear()
+        self._pause_event_id = None
 
     def _question_service(self) -> QuestionAnsweringService:
         return QuestionAnsweringService(self.database, self._model_router())

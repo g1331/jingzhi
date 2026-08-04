@@ -67,6 +67,7 @@ from jingzhi.database import (
     SessionAnswerRecord,
     SessionNotificationKind,
     SessionRecord,
+    SourceEventRecord,
     TimelineFrameRecord,
     TimelineTranscriptRecord,
 )
@@ -309,6 +310,7 @@ QLabel#emptyState { color: #71827c; font-size: 12px; }
 class UiBridge(QObject):
     segment = Signal(int, int, str, str)
     worker_warning = Signal(str)
+    source_event = Signal(object)
     action_error = Signal(str)
     answer = Signal(int, str)
 
@@ -316,6 +318,8 @@ class UiBridge(QObject):
     voice_error = Signal(int, str)
     summary = Signal(str)
     stopped = Signal(str)
+    stop_failed = Signal(str)
+    pause_finished = Signal(bool)
     provider_tested = Signal(str)
     maintenance_finished = Signal(object)
     maintenance_failed = Signal(str)
@@ -652,10 +656,13 @@ class MainWindow(QMainWindow):
                     start, end, source, text
                 ),
                 on_error=self.bridge.worker_warning.emit,
+                on_source_event=self.bridge.source_event.emit,
             )
             service = JingzhiApplicationService(manager.database, recorder=manager)
         self.service = service
         self.manager = service.recorder
+        if hasattr(self.manager, "on_source_event"):
+            self.manager.on_source_event = self.bridge.source_event.emit
         self.settings = settings
         self._selected_session_id: str | None = None
         self._reanswer_question_id: int | None = None
@@ -672,9 +679,11 @@ class MainWindow(QMainWindow):
         self._zoom_key = "whole"
         self._window_start_ms = 0
         self._paused = False
+        self._stop_in_flight = False
         self._question_active = False
         self._question_generation = 0
         self._active_question_id: int | None = None
+        self._prompted_source_event_ids: set[int] = set()
 
         self._last_answer = ""
         self._speech: QTextToSpeech | None = None
@@ -689,6 +698,11 @@ class MainWindow(QMainWindow):
         self._maintenance_timer.setInterval(60_000)
         self._maintenance_timer.timeout.connect(self._run_session_maintenance)
         self._maintenance_timer.start()
+        self._recording_status_timer = QTimer(self)
+        self._recording_status_timer.setInterval(500)
+        self._recording_status_timer.timeout.connect(self._refresh_recording_status)
+        self._recording_status_timer.start()
+        self._refresh_recording_status()
         self._refresh_sessions()
         QTimer.singleShot(0, self._run_session_maintenance)
         self._whisper_dialog: WhisperSettingsDialog | None = None
@@ -1260,6 +1274,18 @@ class MainWindow(QMainWindow):
         self._show_selected_answer(timeline)
         self._refresh_reanswer_target()
         self._refresh_invocation_audit()
+        self._prompt_pending_source_events(session_id)
+
+    def _prompt_pending_source_events(self, session_id: str) -> None:
+        try:
+            events = self.service.source_events(session_id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        for event in events:
+            if event.data_loss_confirmed or event.id in self._prompted_source_event_ids:
+                continue
+            self._source_event_reported(event)
 
     def _populate_answer_selector(self, answers: list[SessionAnswerRecord]) -> None:
         self.answer_selector.blockSignals(True)
@@ -1515,6 +1541,39 @@ class MainWindow(QMainWindow):
             return
         self._refresh_sessions(record.id)
 
+    def _refresh_recording_status(self) -> None:
+        if not getattr(self.service, "is_recording", False):
+            if self._stop_in_flight:
+                self.start_button.setEnabled(False)
+            else:
+                session_id = getattr(self.manager, "session_id", None)
+                busy_reason = None
+                storage_busy = getattr(self.service, "session_storage_busy_reason", None)
+                if session_id is not None and callable(storage_busy):
+                    busy_reason = storage_busy(session_id)
+                self.start_button.setEnabled(busy_reason is None)
+            self._paused = False
+            self.pause_button.setEnabled(False)
+            self.pause_button.setText("暂停")
+            return
+        if not self.stop_button.isEnabled():
+            self.pause_button.setEnabled(False)
+            return
+        status = self.service.recording_status()
+        self._paused = status.state == "paused"
+        self.pause_button.setEnabled(self.stop_button.isEnabled() and self.service.supports_pause)
+        self.pause_button.setText("继续" if self._paused else "暂停")
+        details = [self._format_time(status.duration_ms)]
+        details.append(f"{status.display_count} 屏")
+        if status.system_audio:
+            details.append("系统声音")
+        if status.microphone:
+            details.append("麦克风")
+        if status.failed_sources:
+            details.append("来源故障：" + "、".join(sorted(status.failed_sources)))
+        prefix = "已暂停" if self._paused else "记录中"
+        self._set_status(f"{prefix} · " + " · ".join(details), "recording")
+
     def _active_session_id(self) -> str | None:
         if not getattr(self.manager, "is_recording", False):
             return None
@@ -1684,11 +1743,24 @@ class MainWindow(QMainWindow):
             f"Q {self._format_time(question.asked_at_ms)} {question.question}"
             for question in timeline.questions
         )
+        timeline_event_items = []
+        for event in timeline.events:
+            label = "暂停" if event.kind == "pause" else "数据缺口"
+            source = f" · {event.source}" if event.source else ""
+            message = f"：{event.message}" if event.kind == "data_gap" else ""
+            timeline_event_items.append(
+                f"{label} {self._format_time(event.start_ms)}–"
+                f"{self._format_time(event.end_ms)}{source}{message}"
+            )
+        event_summary = (
+            "  ·  ".join(item for item in (question_events, *timeline_event_items) if item)
+            or "无事件"
+        )
         self.event_text.setText(
             f"会话开始 00:00  ·  当前窗口 "
             f"{self._format_time(timeline.window_start_ms)}–"
             f"{self._format_time(min(timeline.window_end_ms, timeline.duration_ms))}  ·  "
-            f"{question_events or '无问题锚点'}  ·  {state}"
+            f"{event_summary}  ·  {state}"
         )
         self.evidence_image.clear()
         self.evidence_image.setText("选择关键帧查看大图")
@@ -1970,6 +2042,9 @@ class MainWindow(QMainWindow):
         self.capsule_ask_button.clicked.connect(self._focus_question)
         self.ask_button.clicked.connect(self._ask)
         self.reanswer_button.clicked.connect(self._reanswer)
+        self.bridge.segment.connect(self._append_segment)
+        self.bridge.worker_warning.connect(self._show_worker_warning)
+        self.bridge.source_event.connect(self._source_event_reported)
         self.answer_selector.currentIndexChanged.connect(self._select_answer)
 
         self.question.focused.connect(self._capture_question_anchor)
@@ -2001,14 +2076,14 @@ class MainWindow(QMainWindow):
         self.whisper_settings_button.clicked.connect(self._show_whisper_settings)
         self.storage_settings_button.clicked.connect(self._show_storage_settings)
         self.output.render_failed.connect(self._show_worker_warning)
-        self.bridge.segment.connect(self._append_segment)
-        self.bridge.worker_warning.connect(self._show_worker_warning)
         self.bridge.action_error.connect(self._show_action_error)
         self.bridge.answer.connect(self._show_answer)
         self.bridge.voice_transcript.connect(self._show_voice_transcript)
         self.bridge.voice_error.connect(self._show_voice_error)
         self.bridge.summary.connect(self._show_summary)
         self.bridge.stopped.connect(self._recording_stopped)
+        self.bridge.stop_failed.connect(self._stop_failed)
+        self.bridge.pause_finished.connect(self._pause_operation_finished)
         self.bridge.provider_tested.connect(self._provider_tested)
         self.bridge.maintenance_finished.connect(self._maintenance_finished)
         self.bridge.maintenance_failed.connect(self._maintenance_failed)
@@ -2110,6 +2185,7 @@ class MainWindow(QMainWindow):
         self.microphone_check.setEnabled(False)
         self.correction_check.setEnabled(False)
         self.correction_window_input.setEnabled(False)
+        self._refresh_recording_status()
         self._refresh_sessions(session_id)
 
     @Slot()
@@ -2277,29 +2353,42 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _toggle_pause(self) -> None:
-        method_name = "resume" if self._paused else "pause"
-        method = getattr(self.manager, method_name, None)
-        if not callable(method):
+        if not self.service.supports_pause:
             return
-        try:
-            method()
-        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces adapter failures
-            self._show_action_error(str(exc))
-            return
-        self._paused = not self._paused
-        self.pause_button.setText("继续" if self._paused else "暂停")
-        self._set_status("已暂停" if self._paused else "记录中", "recording")
+        method = self.service.resume_session if self._paused else self.service.pause_session
+        self.pause_button.setEnabled(False)
+
+        def work() -> None:
+            try:
+                changed = bool(method())
+            except Exception as exc:  # noqa: BLE001 - UI boundary surfaces adapter failures
+                self.bridge.action_error.emit(str(exc))
+                changed = False
+            self.bridge.pause_finished.emit(changed)
+
+        threading.Thread(target=work, name="pause-session", daemon=True).start()
+
+    @Slot(bool)
+    def _pause_operation_finished(self, changed: bool) -> None:
+        if changed:
+            self._refresh_recording_status()
+        if self.stop_button.isEnabled() and self.service.is_recording:
+            self.pause_button.setEnabled(self.service.supports_pause)
+        else:
+            self.pause_button.setEnabled(False)
 
     @Slot()
     def _stop(self) -> None:
+        self._stop_in_flight = True
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
         self._set_status("正在结束并处理剩余字幕…", "idle")
 
         def work() -> None:
             try:
                 session_id = self.service.stop_session()
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
-                self.bridge.action_error.emit(str(exc))
+                self.bridge.stop_failed.emit(str(exc))
             else:
                 self.bridge.stopped.emit(session_id or "")
 
@@ -2587,6 +2676,37 @@ class MainWindow(QMainWindow):
         self.notice_text.setText(self._compact_message(message))
         self.notice.show()
 
+    @Slot(object)
+    def _source_event_reported(self, event: SourceEventRecord) -> None:
+        if event.data_loss_confirmed or event.id in self._prompted_source_event_ids:
+            return
+        self._prompted_source_event_ids.add(event.id)
+        response = QMessageBox.question(
+            self,
+            "确认数据缺口",
+            f"{event.source} 在 {self._format_time(event.start_ms)}–"
+            f"{self._format_time(event.end_ms)} 报告：{event.message}\n\n"
+            "是否确认这段时间存在数据缺失？确认后会写入统一时间线。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            self._prompted_source_event_ids.discard(event.id)
+            return
+        try:
+            self.service.confirm_data_gap(event.session_id, event.id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary surfaces persistence failures
+            self._show_action_error(str(exc))
+            self._prompted_source_event_ids.discard(event.id)
+            return
+        current = self.session_library.currentItem()
+        if current is not None and current.data(Qt.ItemDataRole.UserRole) == event.session_id:
+            self._open_session_item(current)
+        self._show_worker_warning(
+            f"已确认数据缺口：{event.source} · {self._format_time(event.start_ms)}–"
+            f"{self._format_time(event.end_ms)}"
+        )
+
     @Slot(str)
     def _show_action_error(self, message: str) -> None:
         compact = self._compact_message(message)
@@ -2600,6 +2720,9 @@ class MainWindow(QMainWindow):
         self.test_provider_button.setEnabled(True)
         self.voice_button.setEnabled(True)
         self.voice_button.setText("按住说话")
+        if self.service.is_recording:
+            self.stop_button.setEnabled(True)
+            self.pause_button.setEnabled(self.service.supports_pause)
         self._refresh_invocation_audit()
 
     @Slot(int, str)
@@ -2657,14 +2780,31 @@ class MainWindow(QMainWindow):
         self._refresh_invocation_audit()
 
     @Slot(str)
+    def _stop_failed(self, message: str) -> None:
+        self._stop_in_flight = False
+        self._show_action_error(message)
+        if self.service.is_recording:
+            self.stop_button.setEnabled(True)
+            self.pause_button.setEnabled(self.service.supports_pause)
+        else:
+            self._refresh_recording_status()
+
+    @Slot(str)
     def _recording_stopped(self, session_id: str) -> None:
+        self._stop_in_flight = False
         self._question_active = False
         self._question_generation += 1
         self.question.clear()
         self.voice_button.setEnabled(True)
         self.voice_button.setText("按住说话")
-        self._set_status(f"已结束 · {session_id[:8]}", "success")
-        self.start_button.setEnabled(True)
+        session = self.service.database.get_session(session_id)
+        interrupted = session is not None and session.status == "interrupted"
+        self._set_status(
+            f"{'已结束但仍有线程运行' if interrupted else '已结束'} · {session_id[:8]}",
+            "error" if interrupted else "success",
+        )
+        if interrupted:
+            self._show_worker_warning("会话已标记为中断；仍运行的线程将自行退出后再允许清理。")
         self.stop_button.setEnabled(False)
         self.pause_button.setEnabled(False)
         self.pause_button.setText("暂停")
@@ -2673,6 +2813,7 @@ class MainWindow(QMainWindow):
         self.microphone_check.setEnabled(True)
         self.correction_check.setEnabled(True)
         self.correction_window_input.setEnabled(True)
+        self._refresh_recording_status()
         self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
