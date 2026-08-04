@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 from jingzhi.application import JingzhiApplicationService
 from jingzhi.config import Settings
 from jingzhi.database import Database
-from jingzhi.provider_settings import ProviderSettingsStore
+from jingzhi.model_roles import RoleName
+from jingzhi.provider_settings import ProviderSettingsStore, default_saved_settings
 from jingzhi.ui import EvidenceButton, MainWindow
 
 
@@ -120,7 +121,7 @@ def test_html_warning_is_compacted_and_does_not_change_window_width(tmp_path) ->
     window.close()
 
 
-def test_saving_provider_keeps_correction_model(tmp_path, monkeypatch) -> None:
+def test_saving_provider_keeps_role_models(tmp_path, monkeypatch) -> None:
     stored_secret: dict[str, str] = {}
     monkeypatch.setattr(
         keyring,
@@ -135,23 +136,48 @@ def test_saving_provider_keeps_correction_model(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(keyring, "delete_password", lambda _service, _username: None)
     application = QApplication.instance() or QApplication([])
     window = MainWindow(
-        Settings(
-            data_dir=tmp_path,
-            llm_model="main-model",
-            transcript_correction_model="main-model",
-        )
+        Settings(data_dir=tmp_path, provider_settings=default_saved_settings("main-model"))
     )
-    window.model_input.setText("main-model")
-    window.correction_model_input.setText("luna")
+    window.role_model_inputs[RoleName.INSTANT_ANSWER].setText("main-model")
+    window.role_model_inputs[RoleName.TRANSCRIPT_CORRECTION].setText("luna")
 
     window._save_provider()
     application.processEvents()
 
     saved = ProviderSettingsStore(tmp_path).load()
-    assert saved.model == "main-model"
-    assert saved.correction_model == "luna"
+    roles = {role.name: role for role in saved.roles}
+    assert roles[RoleName.INSTANT_ANSWER].model == "main-model"
+    assert roles[RoleName.TRANSCRIPT_CORRECTION].model == "luna"
     window.manager.save_provider = lambda: None
     window.close()
+
+
+def test_cross_connection_fallback_requires_explicit_authorization(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path, provider_settings=default_saved_settings()))
+    window._add_provider_connection()
+    primary_id = window._provider_connections[0].id
+    backup_id = window._provider_connections[-1].id
+    role = RoleName.INSTANT_ANSWER
+    first_fallback = window.role_fallback_connection_inputs[role]
+    first_fallback.setCurrentIndex(first_fallback.findData(primary_id))
+    window.role_fallback_model_inputs[role].setText("answer-small")
+    second_fallback = window.role_second_fallback_connection_inputs[role]
+    second_fallback.setCurrentIndex(second_fallback.findData(backup_id))
+    window.role_second_fallback_model_inputs[role].setText("answer-backup")
+    window.role_second_cross_auth_checks[role].setChecked(False)
+    assert window._configure_provider_from_form() is True
+    configured = window.manager.provider_settings
+    instant = next(item for item in configured.roles if item.name == role)
+    assert [item.model for item in instant.fallbacks] == ["answer-small", "answer-backup"]
+    assert instant.fallbacks[1].cross_connection_authorized is False
+    window.role_second_cross_auth_checks[role].setChecked(True)
+    assert window._configure_provider_from_form() is True
+    instant = next(item for item in window.manager.provider_settings.roles if item.name == role)
+    assert instant.fallbacks[1].cross_connection_authorized is True
+    window.manager.save_provider = lambda: None
+    window.close()
+    application.processEvents()
 
 
 def test_session_selection_thumbnail_zoom_and_detail_switching(tmp_path: Path) -> None:

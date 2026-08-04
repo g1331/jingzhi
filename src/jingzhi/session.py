@@ -6,13 +6,14 @@ import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from jingzhi.application import ModelConnectionSnapshot, QuestionAnsweringService
+from jingzhi.application import QuestionAnsweringService
 from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk, QuestionVoiceRecorder
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
 from jingzhi.database import Database
-from jingzhi.llm import OpenAIContextModel
+from jingzhi.model_roles import ModelRole, RoleName
+from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
 from jingzhi.transcribe import TranscriptionWorker, WhisperQuestionTranscriber
 from jingzhi.transcript_correction import (
@@ -43,63 +44,54 @@ class SessionManager:
         self.transcriber: TranscriptionWorker | None = None
         self.correction_enabled = settings.transcript_correction_enabled
         self.correction_window_seconds = settings.transcript_correction_window_seconds
-        self.correction_model = settings.transcript_correction_model
+        self.provider_settings = settings.provider_settings
         self.correction_queue: queue.Queue[tuple[str, int] | None] | None = None
         self.correction_worker: threading.Thread | None = None
         self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
         self.correction_flush_event = threading.Event()
-        self.llm_model = settings.llm_model
-        self.llm_base_url = settings.llm_base_url
-        self.llm_api_key = settings.llm_api_key
-        self.llm_api_mode = settings.llm_api_mode
         self.provider_settings_store = ProviderSettingsStore(settings.data_dir)
         self.last_question_id: int | None = None
         self.pending_question_id: int | None = None
         self.question_voice_recorder: QuestionVoiceRecorder | None = None
         self.question_transcriber: WhisperQuestionTranscriber | None = None
 
-    def configure_provider(self, *, model: str, base_url: str, api_key: str, api_mode: str) -> None:
-        model = model.strip()
-        if not model:
-            raise ValueError("Model is required")
-        if api_mode not in {"responses", "chat_completions"}:
-            raise ValueError("API mode must be responses or chat_completions")
-        self.llm_model = model
-        self.llm_base_url = base_url.strip()
-        self.llm_api_key = api_key.strip()
-        self.llm_api_mode = api_mode
+    def configure_provider(self, settings: SavedProviderSettings) -> None:
+        connection_ids = {connection.id for connection in settings.connections}
+        if not connection_ids:
+            raise ValueError("At least one model connection is required")
+        roles = {role.name: role for role in settings.roles}
+        missing = set(RoleName) - roles.keys()
+        if missing:
+            names = ", ".join(sorted(role.value for role in missing))
+            raise ValueError(f"Model roles are missing: {names}")
+        for role in roles.values():
+            if role.connection_id not in connection_ids:
+                raise ValueError(f"Unknown connection for role {role.name.value}")
+            if not role.model.strip():
+                raise ValueError(f"Model is required for role {role.name.value}")
+        self.provider_settings = settings
 
-    def _context_model(self) -> OpenAIContextModel:
-        return OpenAIContextModel(
-            self.llm_model,
-            api_key=self.llm_api_key,
-            base_url=self.llm_base_url,
-            api_mode=self.llm_api_mode,
-        )
+    def model_role(self, name: RoleName) -> ModelRole:
+        for role in self.provider_settings.roles:
+            if role.name == name:
+                return role
+        raise RuntimeError(f"Model role is not configured: {name.value}")
 
-    def transcript_correction_model(self) -> OpenAIContextModel:
-        return OpenAIContextModel(
-            self.correction_model,
-            api_key=self.llm_api_key,
-            base_url=self.llm_base_url,
-            api_mode=self.llm_api_mode,
-        )
+    def _model_router(self) -> ModelRouter:
+        return ModelRouter(self.database, self.provider_settings)
 
-    def configure_transcript_correction(
-        self, *, enabled: bool, window_seconds: int, model: str
-    ) -> None:
+    def transcript_correction_model(self) -> RoutedTranscriptCorrectionModel:
+        return RoutedTranscriptCorrectionModel(self._model_router())
+
+    def configure_transcript_correction(self, *, enabled: bool, window_seconds: int) -> None:
         if window_seconds not in CORRECTION_WINDOW_SECONDS:
             raise ValueError("Correction window must be 15, 30, or 60 seconds")
-        model = model.strip()
-        if not model:
-            raise ValueError("Correction model is required")
         if window_seconds != self.correction_window_seconds:
             if self.is_recording:
                 raise RuntimeError("Cannot change the correction window during a recording")
             self.correction_batcher = CorrectionWindowBatcher(window_seconds)
         self.correction_enabled = enabled
         self.correction_window_seconds = window_seconds
-        self.correction_model = model
         if self.session_id is not None:
             self.database.configure_transcript_correction(
                 self.session_id,
@@ -110,15 +102,7 @@ class SessionManager:
                 self._start_correction_worker()
 
     def save_provider(self) -> None:
-        self.provider_settings_store.save(
-            SavedProviderSettings(
-                base_url=self.llm_base_url,
-                api_key=self.llm_api_key,
-                model=self.llm_model,
-                correction_model=self.correction_model,
-                api_mode=self.llm_api_mode,
-            )
-        )
+        self.provider_settings_store.save(self.provider_settings)
 
     @property
     def is_recording(self) -> bool:
@@ -269,7 +253,10 @@ class SessionManager:
             self.correction_queue.put(item)
 
     def test_provider(self) -> str:
-        return self._context_model().test_connection()
+        result = self._model_router().invoke(
+            RoleName.UTILITY, lambda model: model.test_connection(), session_id=self.session_id
+        )
+        return result.value
 
     def stop(self) -> str | None:
         self.cancel_question()
@@ -311,11 +298,7 @@ class SessionManager:
         return session_id
 
     def _question_service(self) -> QuestionAnsweringService:
-        return QuestionAnsweringService(
-            self.database,
-            self._context_model(),
-            ModelConnectionSnapshot(self.llm_model, self.llm_base_url, self.llm_api_mode),
-        )
+        return QuestionAnsweringService(self.database, self._model_router())
 
     def capture_question_anchor(self, lookback_ms: int = 2 * 60_000) -> int:
         if self.session_id is None or self.clock is None:
@@ -409,13 +392,30 @@ class SessionManager:
     def summarize(self) -> dict:
         if self.session_id is None:
             raise RuntimeError("There is no current session")
+        transcripts = self.database.all_effective_transcripts(self.session_id)
         transcript = "\n".join(
-            f"[{item.start_ms / 1000:.1f}s][{item.source}] {item.text}"
-            for item in self.database.all_transcripts(self.session_id)
+            f"[{item.start_ms / 1000:.1f}s][{item.source}] {item.text}" for item in transcripts
         )
         if not transcript:
             raise RuntimeError("No transcript is available yet")
-        result = self._context_model().summarize(transcript)
+        evidence = tuple(
+            InvocationEvidence(
+                stable_id=f"transcript-version:{item.version_id}",
+                kind="transcript",
+                source=item.source,
+                start_ms=item.start_ms,
+                end_ms=item.end_ms,
+                transcript_version_id=item.version_id,
+            )
+            for item in transcripts
+        )
+        routed = self._model_router().invoke(
+            RoleName.DEEP_ANALYSIS,
+            lambda model: model.summarize(transcript),
+            session_id=self.session_id,
+            evidence=evidence,
+        )
+        result = routed.value
         created_at = datetime.now(UTC).isoformat()
         for kind in ("summary", "knowledge_points", "mistakes"):
             self.database.add_artifact(
@@ -423,6 +423,6 @@ class SessionManager:
                 kind,
                 created_at,
                 json.dumps(result.get(kind), ensure_ascii=False),
-                self.llm_model,
+                routed.invocation.model,
             )
         return result

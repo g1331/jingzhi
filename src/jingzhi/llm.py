@@ -34,13 +34,22 @@ class OpenAIContextModel:
         api_key: str,
         base_url: str = "",
         api_mode: str = "responses",
+        reasoning_effort: str | None = None,
     ) -> None:
         if api_mode not in {"responses", "chat_completions"}:
             raise ValueError(f"Unsupported API mode: {api_mode}")
+        if reasoning_effort not in {None, "low", "medium", "high"}:
+            raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
         self.model = model
         self.api_key = api_key.strip()
         self.base_url = base_url.strip().rstrip("/")
         self.api_mode = api_mode
+        self.reasoning_effort = reasoning_effort
+
+    def _responses_options(self) -> dict[str, Any]:
+        if self.reasoning_effort is None:
+            return {}
+        return {"reasoning": {"effort": self.reasoning_effort}}
 
     def _client(self):
         if not self.api_key:
@@ -139,6 +148,7 @@ class OpenAIContextModel:
                 response = client.responses.create(
                     model=self.model,
                     input=[{"role": "user", "content": content}],
+                    **self._responses_options(),
                 )
                 return AnswerModelResult(
                     response.output_text,
@@ -172,7 +182,9 @@ class OpenAIContextModel:
         try:
             client = self._client()
             if self.api_mode == "responses":
-                response = client.responses.create(model=self.model, input="只回复 OK")
+                response = client.responses.create(
+                    model=self.model, input="只回复 OK", **self._responses_options()
+                )
                 return response.output_text.strip()
             response = client.chat.completions.create(
                 model=self.model,
@@ -211,6 +223,7 @@ class OpenAIContextModel:
                 response = client.responses.create(
                     model=self.model,
                     input=[{"role": "user", "content": response_content}],
+                    **self._responses_options(),
                 )
                 raw = response.output_text.strip()
             else:
@@ -247,7 +260,9 @@ class OpenAIContextModel:
         try:
             client = self._client()
             if self.api_mode == "responses":
-                response = client.responses.create(model=self.model, input=prompt)
+                response = client.responses.create(
+                    model=self.model, input=prompt, **self._responses_options()
+                )
                 raw = response.output_text.strip()
             else:
                 response = client.chat.completions.create(

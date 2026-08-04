@@ -5,6 +5,8 @@ import os
 import re
 import sys
 import threading
+import uuid
+from dataclasses import replace
 from difflib import SequenceMatcher
 from typing import ClassVar
 
@@ -44,6 +46,14 @@ from jingzhi.database import (
     TimelineFrameRecord,
     TimelineTranscriptRecord,
 )
+from jingzhi.model_roles import (
+    ModelConnection,
+    ModelFallback,
+    ModelRole,
+    ReasoningLevel,
+    RoleName,
+)
+from jingzhi.provider_settings import SavedProviderSettings
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
@@ -318,6 +328,10 @@ class MainWindow(QMainWindow):
         self._reanswer_question_id: int | None = None
         self._selected_answer_version_id: int | None = None
         self._answers_by_id: dict[int, SessionAnswerRecord] = {}
+        provider_settings = getattr(self.manager, "provider_settings", settings.provider_settings)
+        self._provider_connections = list(provider_settings.connections)
+        self._provider_roles = {role.name: role for role in provider_settings.roles}
+        self._active_connection_index = 0
 
         self._selected_frame: TimelineFrameRecord | None = None
         self._selected_transcript: TimelineTranscriptRecord | None = None
@@ -469,14 +483,27 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_provider_panel(self) -> QWidget:
-        provider_group = QGroupBox("模型连接")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumHeight(300)
+        scroll.setMaximumHeight(360)
+        provider_group = QGroupBox("模型连接与角色")
+        provider_group.setMinimumHeight(700)
         provider_layout = QGridLayout(provider_group)
-        provider_layout.setHorizontalSpacing(10)
-        provider_layout.setVerticalSpacing(8)
-        provider_layout.setColumnStretch(1, 4)
-        provider_layout.setColumnStretch(3, 2)
+        provider_layout.setHorizontalSpacing(8)
+        provider_layout.setVerticalSpacing(7)
+        provider_layout.setColumnStretch(1, 2)
+        provider_layout.setColumnStretch(2, 3)
 
-        self.base_url_input = QLineEdit(getattr(self.manager, "llm_base_url", ""))
+        self.connection_selector = QComboBox()
+        for connection in self._provider_connections:
+            self.connection_selector.addItem(connection.name, connection.id)
+        self.add_connection_button = QPushButton("新增连接")
+        self.remove_connection_button = QPushButton("删除连接")
+        active = self._provider_connections[0]
+        self.connection_name_input = QLineEdit(active.name)
+        self.base_url_input = QLineEdit(active.base_url)
         self.base_url_input.setPlaceholderText(
             "例如 https://provider.example/v1；官方 OpenAI 可留空"
         )
@@ -484,16 +511,11 @@ class MainWindow(QMainWindow):
         self.api_mode_input = QComboBox()
         self.api_mode_input.addItem("Responses API", "responses")
         self.api_mode_input.addItem("Chat Completions", "chat_completions")
-        mode_index = self.api_mode_input.findData(
-            getattr(self.manager, "llm_api_mode", "responses")
-        )
-        self.api_mode_input.setCurrentIndex(max(0, mode_index))
-        self.api_key_input = QLineEdit(getattr(self.manager, "llm_api_key", ""))
+        self.api_mode_input.setCurrentIndex(max(0, self.api_mode_input.findData(active.api_mode)))
+        self.api_key_input = QLineEdit(active.api_key)
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_input.setPlaceholderText("保存配置时写入 Windows 凭据管理器")
-        self.model_input = QLineEdit(getattr(self.manager, "llm_model", ""))
-        self.model_input.setPlaceholderText("支持图片输入的模型名称")
-        self.test_provider_button = QPushButton("测试连接")
+        self.test_provider_button = QPushButton("测试实用角色")
         self.save_provider_button = QPushButton("保存配置")
         self.correction_check = QCheckBox("启用字幕校订")
         self.correction_check.setChecked(self.settings.transcript_correction_enabled)
@@ -504,38 +526,108 @@ class MainWindow(QMainWindow):
             self.settings.transcript_correction_window_seconds
         )
         self.correction_window_input.setCurrentIndex(max(0, correction_index))
-        self.correction_model_input = QLineEdit(
-            getattr(self.manager, "correction_model", self.settings.transcript_correction_model)
-        )
-        self.correction_model_input.setPlaceholderText("字幕校订角色使用的小模型")
 
-        provider_layout.addWidget(QLabel("Base URL"), 0, 0)
-        provider_layout.addWidget(self.base_url_input, 0, 1)
-        provider_layout.addWidget(QLabel("接口类型"), 0, 2)
-        provider_layout.addWidget(self.api_mode_input, 0, 3)
-        provider_layout.addWidget(QLabel("API Key"), 1, 0)
-        provider_layout.addWidget(self.api_key_input, 1, 1)
-        provider_layout.addWidget(QLabel("模型"), 1, 2)
-        provider_layout.addWidget(self.model_input, 1, 3)
-        provider_buttons = QVBoxLayout()
-        provider_buttons.setSpacing(6)
-        provider_buttons.addWidget(self.test_provider_button)
-        provider_buttons.addWidget(self.save_provider_button)
-        provider_layout.addLayout(provider_buttons, 0, 4, 2, 1)
-        provider_layout.addWidget(self.correction_check, 2, 0, 1, 2)
-        provider_layout.addWidget(QLabel("校订窗口"), 2, 2)
-        provider_layout.addWidget(self.correction_window_input, 2, 3)
-        provider_layout.addWidget(QLabel("校订模型"), 3, 0)
-        provider_layout.addWidget(self.correction_model_input, 3, 1, 1, 3)
+        provider_layout.addWidget(QLabel("当前连接"), 0, 0)
+        provider_layout.addWidget(self.connection_selector, 0, 1)
+        provider_layout.addWidget(self.add_connection_button, 0, 2)
+        provider_layout.addWidget(self.remove_connection_button, 0, 3)
+        provider_layout.addWidget(QLabel("连接名称"), 1, 0)
+        provider_layout.addWidget(self.connection_name_input, 1, 1)
+        provider_layout.addWidget(QLabel("Base URL"), 1, 2)
+        provider_layout.addWidget(self.base_url_input, 1, 3)
+        provider_layout.addWidget(QLabel("API Key"), 2, 0)
+        provider_layout.addWidget(self.api_key_input, 2, 1)
+        provider_layout.addWidget(QLabel("接口类型"), 2, 2)
+        provider_layout.addWidget(self.api_mode_input, 2, 3)
+        provider_layout.addWidget(self.correction_check, 3, 0)
+        provider_layout.addWidget(self.correction_window_input, 3, 1)
+        provider_layout.addWidget(self.test_provider_button, 3, 2)
+        provider_layout.addWidget(self.save_provider_button, 3, 3)
+
+        headers = ("角色", "主连接", "模型", "思考档位")
+        for column, text in enumerate(headers):
+            label = QLabel(text)
+            label.setObjectName("hint")
+            provider_layout.addWidget(label, 4, column)
+
+        self.role_connection_inputs: dict[RoleName, QComboBox] = {}
+        self.role_model_inputs: dict[RoleName, QLineEdit] = {}
+        self.role_reasoning_inputs: dict[RoleName, QComboBox] = {}
+        self.role_fallback_connection_inputs: dict[RoleName, QComboBox] = {}
+        self.role_fallback_model_inputs: dict[RoleName, QLineEdit] = {}
+        self.role_cross_auth_checks: dict[RoleName, QCheckBox] = {}
+        self.role_second_fallback_connection_inputs: dict[RoleName, QComboBox] = {}
+        self.role_second_fallback_model_inputs: dict[RoleName, QLineEdit] = {}
+        self.role_second_cross_auth_checks: dict[RoleName, QCheckBox] = {}
+        role_labels = {
+            RoleName.UTILITY: "实用",
+            RoleName.TRANSCRIPT_CORRECTION: "字幕校订",
+            RoleName.INSTANT_ANSWER: "即时问答",
+            RoleName.DEEP_ANALYSIS: "深度分析",
+        }
+        for index, role_name in enumerate(RoleName):
+            row = 5 + index * 3
+            role = self._provider_roles[role_name]
+            connection_input = QComboBox()
+            for connection in self._provider_connections:
+                connection_input.addItem(connection.name, connection.id)
+            connection_input.setCurrentIndex(max(0, connection_input.findData(role.connection_id)))
+            model_input = QLineEdit(role.model)
+            reasoning_input = QComboBox()
+            reasoning_input.addItem("快速", ReasoningLevel.FAST.value)
+            reasoning_input.addItem("均衡", ReasoningLevel.BALANCED.value)
+            reasoning_input.addItem("深入", ReasoningLevel.DEEP.value)
+            reasoning_input.setCurrentIndex(max(0, reasoning_input.findData(role.reasoning.value)))
+            fallback_controls: list[tuple[QComboBox, QLineEdit, QCheckBox]] = []
+            for fallback in (*role.fallbacks, None, None)[:2]:
+                fallback_connection = QComboBox()
+                fallback_connection.addItem("无", "")
+                for connection in self._provider_connections:
+                    fallback_connection.addItem(connection.name, connection.id)
+                if fallback is not None:
+                    fallback_connection.setCurrentIndex(
+                        max(0, fallback_connection.findData(fallback.connection_id))
+                    )
+                fallback_model = QLineEdit(fallback.model if fallback else "")
+                cross_auth = QCheckBox("已授权")
+                cross_auth.setChecked(bool(fallback and fallback.cross_connection_authorized))
+                fallback_controls.append((fallback_connection, fallback_model, cross_auth))
+            first_fallback, second_fallback = fallback_controls
+            self.role_connection_inputs[role_name] = connection_input
+            self.role_model_inputs[role_name] = model_input
+            self.role_reasoning_inputs[role_name] = reasoning_input
+            self.role_fallback_connection_inputs[role_name] = first_fallback[0]
+            self.role_fallback_model_inputs[role_name] = first_fallback[1]
+            self.role_cross_auth_checks[role_name] = first_fallback[2]
+            self.role_second_fallback_connection_inputs[role_name] = second_fallback[0]
+            self.role_second_fallback_model_inputs[role_name] = second_fallback[1]
+            self.role_second_cross_auth_checks[role_name] = second_fallback[2]
+            provider_layout.addWidget(QLabel(role_labels[role_name]), row, 0)
+            provider_layout.addWidget(connection_input, row, 1)
+            provider_layout.addWidget(model_input, row, 2)
+            provider_layout.addWidget(reasoning_input, row, 3)
+            for offset, controls in enumerate(fallback_controls, start=1):
+                fallback_label = QLabel(f"后备 {offset}")
+                fallback_label.setObjectName("hint")
+                provider_layout.addWidget(fallback_label, row + offset, 0)
+                provider_layout.addWidget(controls[0], row + offset, 1)
+                provider_layout.addWidget(controls[1], row + offset, 2)
+                provider_layout.addWidget(controls[2], row + offset, 3)
+
         hint = QLabel(
-            "返回网页源码通常表示 Base URL 或接口类型不匹配；API Key 保存到 Windows "
-            "凭据管理器。启用字幕校订会按所选窗口发送相邻字幕和带来源时间标签的代表性"
-            "关键帧；关闭时只使用本地 Whisper 原文。"
+            "同连接后备自动执行；跨连接后备只有勾选“已授权”才会执行。API Key 只写入 "
+            "Windows 凭据管理器。字幕校订失败时继续保留本地 Whisper 原文。"
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        provider_layout.addWidget(hint, 4, 0, 1, 4)
-        return provider_group
+        provider_layout.addWidget(hint, 17, 0, 1, 4)
+        self.invocation_audit = QLabel("尚无模型调用记录")
+        self.invocation_audit.setObjectName("hint")
+        self.invocation_audit.setWordWrap(True)
+        provider_layout.addWidget(self.invocation_audit, 18, 0, 1, 4)
+        self._refresh_invocation_audit()
+        scroll.setWidget(provider_group)
+        return scroll
 
     def _build_timeline_panel(self) -> QWidget:
         panel = QFrame()
@@ -762,6 +854,7 @@ class MainWindow(QMainWindow):
         self._render_timeline(timeline)
         self._show_selected_answer(timeline)
         self._refresh_reanswer_target()
+        self._refresh_invocation_audit()
 
     def _populate_answer_selector(self, answers: list[SessionAnswerRecord]) -> None:
         self.answer_selector.blockSignals(True)
@@ -1289,6 +1382,9 @@ class MainWindow(QMainWindow):
         self.summary_button.clicked.connect(self._summarize)
         self.test_provider_button.clicked.connect(self._test_provider)
         self.save_provider_button.clicked.connect(self._save_provider)
+        self.connection_selector.currentIndexChanged.connect(self._select_provider_connection)
+        self.add_connection_button.clicked.connect(self._add_provider_connection)
+        self.remove_connection_button.clicked.connect(self._remove_provider_connection)
         self.correction_check.toggled.connect(self._configure_correction)
         self.correction_window_input.currentIndexChanged.connect(self._configure_correction)
         self.transcript_diff_button.clicked.connect(self._show_transcript_diff)
@@ -1396,7 +1492,6 @@ class MainWindow(QMainWindow):
         self.microphone_check.setEnabled(False)
         self.correction_check.setEnabled(False)
         self.correction_window_input.setEnabled(False)
-        self.correction_model_input.setEnabled(False)
         self._refresh_sessions(session_id)
 
     @Slot()
@@ -1405,11 +1500,7 @@ class MainWindow(QMainWindow):
         window_seconds = int(self.correction_window_input.currentData())
         configure_manager = getattr(self.manager, "configure_transcript_correction", None)
         if callable(configure_manager):
-            configure_manager(
-                enabled=enabled,
-                window_seconds=window_seconds,
-                model=self.correction_model_input.text(),
-            )
+            configure_manager(enabled=enabled, window_seconds=window_seconds)
         if self._selected_session_id is not None:
             self.service.configure_transcript_correction(
                 self._selected_session_id,
@@ -1596,6 +1687,173 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=work, name="stop-session", daemon=True).start()
 
+    def _store_active_connection_form(self) -> None:
+        current = self._provider_connections[self._active_connection_index]
+        self._provider_connections[self._active_connection_index] = replace(
+            current,
+            name=self.connection_name_input.text().strip(),
+            base_url=self.base_url_input.text().strip(),
+            api_key=self.api_key_input.text().strip(),
+            api_mode=str(self.api_mode_input.currentData()),
+        )
+
+    @Slot(int)
+    def _select_provider_connection(self, index: int) -> None:
+        if index < 0 or index == self._active_connection_index:
+            return
+        previous = self._active_connection_index
+        try:
+            self._store_active_connection_form()
+        except Exception as exc:  # noqa: BLE001 - form validation boundary
+            self.connection_selector.blockSignals(True)
+            self.connection_selector.setCurrentIndex(previous)
+            self.connection_selector.blockSignals(False)
+            self._show_action_error(str(exc))
+            return
+        self._active_connection_index = index
+        self._load_active_connection_form()
+
+    def _load_active_connection_form(self) -> None:
+        connection = self._provider_connections[self._active_connection_index]
+        self.connection_name_input.setText(connection.name)
+        self.base_url_input.setText(connection.base_url)
+        self.api_key_input.setText(connection.api_key)
+        self.api_mode_input.setCurrentIndex(
+            max(0, self.api_mode_input.findData(connection.api_mode))
+        )
+
+    @Slot()
+    def _add_provider_connection(self) -> None:
+        try:
+            self._store_active_connection_form()
+        except Exception as exc:  # noqa: BLE001 - form validation boundary
+            self._show_action_error(str(exc))
+            return
+        self._provider_connections.append(ModelConnection(uuid.uuid4().hex, "新连接"))
+        self._refresh_provider_connection_choices(len(self._provider_connections) - 1)
+
+    @Slot()
+    def _remove_provider_connection(self) -> None:
+        if len(self._provider_connections) == 1:
+            self._show_action_error("至少保留一个模型连接")
+            return
+        connection_id = self._provider_connections[self._active_connection_index].id
+        used = any(
+            combo.currentData() == connection_id
+            for combo in (
+                *self.role_connection_inputs.values(),
+                *self.role_fallback_connection_inputs.values(),
+                *self.role_second_fallback_connection_inputs.values(),
+            )
+        )
+        if used:
+            self._show_action_error("请先把使用该连接的角色和后备策略切换到其他连接")
+            return
+        self._provider_connections.pop(self._active_connection_index)
+        self._refresh_provider_connection_choices(
+            min(self._active_connection_index, len(self._provider_connections) - 1)
+        )
+
+    def _refresh_provider_connection_choices(self, selected_index: int) -> None:
+        role_connections = {
+            name: combo.currentData() for name, combo in self.role_connection_inputs.items()
+        }
+        fallback_groups = (
+            self.role_fallback_connection_inputs,
+            self.role_second_fallback_connection_inputs,
+        )
+        fallback_connections = tuple(
+            {name: combo.currentData() for name, combo in group.items()}
+            for group in fallback_groups
+        )
+        self.connection_selector.blockSignals(True)
+        self.connection_selector.clear()
+        for connection in self._provider_connections:
+            self.connection_selector.addItem(connection.name, connection.id)
+        self.connection_selector.setCurrentIndex(selected_index)
+        self.connection_selector.blockSignals(False)
+        for name, combo in self.role_connection_inputs.items():
+            combo.clear()
+            for connection in self._provider_connections:
+                combo.addItem(connection.name, connection.id)
+            combo.setCurrentIndex(max(0, combo.findData(role_connections[name])))
+        for group, selections in zip(fallback_groups, fallback_connections, strict=True):
+            for name, combo in group.items():
+                combo.clear()
+                combo.addItem("无", "")
+                for connection in self._provider_connections:
+                    combo.addItem(connection.name, connection.id)
+                combo.setCurrentIndex(max(0, combo.findData(selections[name])))
+        self._active_connection_index = selected_index
+        self._load_active_connection_form()
+
+    def _provider_settings_from_form(self) -> SavedProviderSettings:
+        self._store_active_connection_form()
+        roles: list[ModelRole] = []
+        for name in RoleName:
+            connection_id = str(self.role_connection_inputs[name].currentData())
+            model = self.role_model_inputs[name].text().strip()
+            if not model:
+                raise ValueError(f"{name.value} 角色必须配置模型")
+            fallbacks: list[ModelFallback] = []
+            fallback_controls = (
+                (
+                    self.role_fallback_connection_inputs[name],
+                    self.role_fallback_model_inputs[name],
+                    self.role_cross_auth_checks[name],
+                ),
+                (
+                    self.role_second_fallback_connection_inputs[name],
+                    self.role_second_fallback_model_inputs[name],
+                    self.role_second_cross_auth_checks[name],
+                ),
+            )
+            for position, (connection_input, model_input, authorization) in enumerate(
+                fallback_controls, start=1
+            ):
+                fallback_connection_id = str(connection_input.currentData() or "")
+                fallback_model = model_input.text().strip()
+                if bool(fallback_connection_id) != bool(fallback_model):
+                    raise ValueError(f"{name.value} 角色的后备 {position} 连接和模型必须同时填写")
+                if fallback_connection_id:
+                    fallbacks.append(
+                        ModelFallback(
+                            fallback_connection_id,
+                            fallback_model,
+                            authorization.isChecked() and fallback_connection_id != connection_id,
+                        )
+                    )
+            roles.append(
+                ModelRole(
+                    name,
+                    connection_id,
+                    model,
+                    ReasoningLevel(str(self.role_reasoning_inputs[name].currentData())),
+                    tuple(fallbacks),
+                )
+            )
+        settings = SavedProviderSettings(tuple(self._provider_connections), tuple(roles))
+        self._provider_roles = {role.name: role for role in settings.roles}
+        return settings
+
+    def _refresh_invocation_audit(self) -> None:
+        database = getattr(self.manager, "database", None)
+        if database is None or not hasattr(self, "invocation_audit"):
+            return
+        records = database.model_invocations(self._selected_session_id)
+        if not records:
+            self.invocation_audit.setText("尚无模型调用记录")
+            return
+        summaries = []
+        for record in records[-4:]:
+            fallback = f"，后备原因：{record.fallback_reason}" if record.fallback_reason else ""
+            evidence = "、".join(record.evidence_ids) if record.evidence_ids else "无"
+            summaries.append(
+                f"{record.role} · {record.connection_name}/{record.model} · "
+                f"{record.reasoning_level} · {record.status}{fallback} · 证据：{evidence}"
+            )
+        self.invocation_audit.setText("最近调用：" + "；".join(summaries))
+
     @Slot()
     def _test_provider(self) -> None:
         if not self._configure_provider_from_form():
@@ -1623,7 +1881,6 @@ class MainWindow(QMainWindow):
                 configure_correction(
                     enabled=self.correction_check.isChecked(),
                     window_seconds=int(self.correction_window_input.currentData()),
-                    model=self.correction_model_input.text(),
                 )
             self.manager.save_provider()
         except Exception as exc:  # noqa: BLE001 - OS credential store boundary
@@ -1694,12 +1951,7 @@ class MainWindow(QMainWindow):
 
     def _configure_provider_from_form(self) -> bool:
         try:
-            self.manager.configure_provider(
-                model=self.model_input.text(),
-                base_url=self.base_url_input.text(),
-                api_key=self.api_key_input.text(),
-                api_mode=str(self.api_mode_input.currentData()),
-            )
+            self.manager.configure_provider(self._provider_settings_from_form())
         except Exception as exc:  # noqa: BLE001 - form validation boundary
             self._show_action_error(str(exc))
             return False
@@ -1730,6 +1982,7 @@ class MainWindow(QMainWindow):
         self.test_provider_button.setEnabled(True)
         self.voice_button.setEnabled(True)
         self.voice_button.setText("按住说话")
+        self._refresh_invocation_audit()
 
     @Slot(int, str)
     def _show_answer(self, question_id: int, answer: str) -> None:
@@ -1755,6 +2008,7 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_reanswer_target()
         self._set_status("回答完成", "success")
+        self._refresh_invocation_audit()
 
     @Slot()
     def _speak_answer(self) -> None:
@@ -1769,6 +2023,7 @@ class MainWindow(QMainWindow):
         self.output.set_markdown(summary)
         self.summary_button.setEnabled(True)
         self._set_status("总结已生成", "success")
+        self._refresh_invocation_audit()
 
     @Slot(str)
     def _provider_tested(self, result: str) -> None:
@@ -1781,6 +2036,7 @@ class MainWindow(QMainWindow):
         self._set_status("模型连接可用 · 配置已保存", "success")
         preview = self._compact_message(result)
         self.output.set_markdown(f"## 模型连接测试成功\n\n模型回复：{preview}")
+        self._refresh_invocation_audit()
 
     @Slot(str)
     def _recording_stopped(self, session_id: str) -> None:
@@ -1799,7 +2055,6 @@ class MainWindow(QMainWindow):
         self.microphone_check.setEnabled(True)
         self.correction_check.setEnabled(True)
         self.correction_window_input.setEnabled(True)
-        self.correction_model_input.setEnabled(True)
         self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -1809,12 +2064,7 @@ class MainWindow(QMainWindow):
         save_provider = getattr(self.manager, "save_provider", None)
         if callable(configure_provider) and callable(save_provider):
             try:
-                configure_provider(
-                    model=self.model_input.text(),
-                    base_url=self.base_url_input.text(),
-                    api_key=self.api_key_input.text(),
-                    api_mode=str(self.api_mode_input.currentData()),
-                )
+                configure_provider(self._provider_settings_from_form())
                 save_provider()
             except Exception:
                 logger.exception("Could not save provider settings while closing")
