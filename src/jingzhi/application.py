@@ -8,6 +8,7 @@ from typing import Protocol
 
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import (
+    AnswerEvidenceRecord,
     AnswerVersionRecord,
     Database,
     SessionAnswerRecord,
@@ -392,6 +393,66 @@ class JingzhiApplicationService:
 
     def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
         return self.database.transcript_versions(segment_id)
+
+    def answer_evidence_entries(
+        self, session_id: str, answer_version_id: int
+    ) -> list[AnswerEvidenceRecord]:
+        if not any(
+            answer.id == answer_version_id for answer in self.database.session_answers(session_id)
+        ):
+            raise KeyError(f"Unknown answer version for session: {answer_version_id}")
+        return self.database.answer_evidence(answer_version_id)
+
+    def resolve_answer_evidence(
+        self, session_id: str, answer_version_id: int, stable_id: str
+    ) -> TimelineFrameRecord | TimelineTranscriptRecord:
+        evidence = next(
+            (
+                item
+                for item in self.answer_evidence_entries(session_id, answer_version_id)
+                if item.stable_id == stable_id
+            ),
+            None,
+        )
+        if evidence is None:
+            raise LookupError("证据入口不属于当前回答")
+
+        if evidence.kind == "frame":
+            frame_id = evidence.frame_id
+            if frame_id is None or stable_id != f"frame:{frame_id}":
+                raise ValueError("证据链接协议不受支持")
+            frame = next(
+                (
+                    item
+                    for item in self.database.timeline_frames(
+                        session_id, evidence.start_ms, evidence.end_ms
+                    )
+                    if item.id == frame_id
+                ),
+                None,
+            )
+            if frame is None:
+                raise LookupError("证据目标不属于当前会话")
+            session_media_dir = (self.database.path.parent / "sessions" / session_id).resolve()
+            if not frame.path.resolve().is_relative_to(session_media_dir):
+                raise PermissionError("证据链接不能访问当前会话目录以外的文件")
+            return frame
+
+        if evidence.kind == "transcript":
+            version_id = evidence.transcript_version_id
+            if version_id is None or stable_id != f"transcript-version:{version_id}":
+                raise ValueError("证据链接协议不受支持")
+            transcripts = self.database.timeline_transcript_versions(
+                session_id,
+                (version_id,),
+                evidence.start_ms,
+                evidence.end_ms,
+            )
+            if not transcripts:
+                raise LookupError("证据目标不属于当前会话")
+            return transcripts[0]
+
+        raise ValueError("证据链接协议不受支持")
 
     def latest_question_id(self, session_id: str) -> int | None:
         return self.database.latest_question_id(session_id)
