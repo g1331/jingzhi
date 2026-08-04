@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS session_notifications (
 CREATE TABLE IF NOT EXISTS pending_media_deletions (
     session_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
-    path TEXT NOT NULL
+    path TEXT NOT NULL,
+    failure_notified_at_utc TEXT
 );
 
 CREATE TABLE IF NOT EXISTS frames (
@@ -250,7 +251,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
 
 
 class SessionNotificationKind(StrEnum):
@@ -552,6 +553,14 @@ class Database:
         ):
             if name not in session_columns:
                 connection.execute(f"ALTER TABLE sessions ADD COLUMN {name} TEXT")
+        pending_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(pending_media_deletions)").fetchall()
+        }
+        if "failure_notified_at_utc" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE pending_media_deletions ADD COLUMN failure_notified_at_utc TEXT"
+            )
         connection.execute(
             """UPDATE sessions
                SET retention_started_at_utc = COALESCE(ended_at_utc, started_at_utc)
@@ -750,13 +759,31 @@ class Database:
         return cursor.rowcount == 1
 
     def move_session_to_trash(
-        self, session_id: str, trashed_at_utc: str, expires_at_utc: str
+        self,
+        session_id: str,
+        trashed_at_utc: str,
+        expires_at_utc: str,
+        *,
+        allow_pinned: bool = True,
+        expected_session: SessionRecord | None = None,
     ) -> bool:
+        conditions = ["id = ?", "trashed_at_utc IS NULL", "status != 'recording'"]
+        parameters: list[object] = [session_id]
+        if not allow_pinned:
+            conditions.append("pinned_at_utc IS NULL")
+        if expected_session is not None:
+            conditions.append("status = ?")
+            parameters.append(expected_session.status)
+            if expected_session.retention_started_at_utc is None:
+                conditions.append("retention_started_at_utc IS NULL")
+            else:
+                conditions.append("retention_started_at_utc = ?")
+                parameters.append(expected_session.retention_started_at_utc)
         with self.connect() as connection:
             cursor = connection.execute(
-                """UPDATE sessions SET trashed_at_utc = ?, trash_expires_at_utc = ?
-                   WHERE id = ? AND trashed_at_utc IS NULL AND status != 'recording'""",
-                (trashed_at_utc, expires_at_utc, session_id),
+                f"""UPDATE sessions SET trashed_at_utc = ?, trash_expires_at_utc = ?
+                   WHERE {" AND ".join(conditions)}""",
+                (trashed_at_utc, expires_at_utc, *parameters),
             )
         return cursor.rowcount == 1
 
@@ -766,8 +793,9 @@ class Database:
                 """UPDATE sessions
                    SET trashed_at_utc = NULL, trash_expires_at_utc = NULL,
                        retention_started_at_utc = ?
-                   WHERE id = ? AND trashed_at_utc IS NOT NULL""",
-                (restored_at_utc, session_id),
+                   WHERE id = ? AND trashed_at_utc IS NOT NULL
+                     AND trash_expires_at_utc > ?""",
+                (restored_at_utc, session_id, restored_at_utc),
             )
             if cursor.rowcount:
                 connection.execute(
@@ -780,12 +808,70 @@ class Database:
         session_id: str,
         kind: SessionNotificationKind,
         notified_at_utc: str,
+        *,
+        expected_session: SessionRecord | None = None,
+        expected_trashed: bool | None = None,
     ) -> bool:
         with self.connect() as connection:
+            if expected_session is None and expected_trashed is None:
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO session_notifications(session_id, kind, notified_at_utc)
+                       VALUES (?, ?, ?)""",
+                    (session_id, kind.value, notified_at_utc),
+                )
+            else:
+                conditions = ["id = ?"]
+                parameters: list[object] = [session_id]
+                if expected_session is not None:
+                    conditions.extend(
+                        [
+                            "status = ?",
+                            "status != 'recording'",
+                            "pinned_at_utc IS NULL",
+                        ]
+                    )
+                    parameters.append(expected_session.status)
+                    if expected_session.retention_started_at_utc is None:
+                        conditions.append("retention_started_at_utc IS NULL")
+                    else:
+                        conditions.append("retention_started_at_utc = ?")
+                        parameters.append(expected_session.retention_started_at_utc)
+                if expected_trashed is True:
+                    conditions.append("trashed_at_utc IS NOT NULL")
+                elif expected_trashed is False or expected_session is not None:
+                    conditions.append("trashed_at_utc IS NULL")
+                cursor = connection.execute(
+                    f"""INSERT OR IGNORE INTO session_notifications(session_id, kind, notified_at_utc)
+                       SELECT ?, ?, ?
+                       WHERE EXISTS (SELECT 1 FROM sessions WHERE {" AND ".join(conditions)})""",
+                    (session_id, kind.value, notified_at_utc, *parameters),
+                )
+        return cursor.rowcount == 1
+
+    def record_final_delete_failure(self, session_id: str, notified_at_utc: str) -> bool:
+        with self.connect() as connection:
+            pending = connection.execute(
+                "SELECT 1 FROM pending_media_deletions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if pending is not None:
+                cursor = connection.execute(
+                    """UPDATE pending_media_deletions
+                       SET failure_notified_at_utc = ?
+                       WHERE session_id = ? AND failure_notified_at_utc IS NULL""",
+                    (notified_at_utc, session_id),
+                )
+                return cursor.rowcount == 1
+            session = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND trashed_at_utc IS NOT NULL",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                return False
             cursor = connection.execute(
-                """INSERT OR IGNORE INTO session_notifications(session_id, kind, notified_at_utc)
-                   VALUES (?, ?, ?)""",
-                (session_id, kind.value, notified_at_utc),
+                """INSERT OR IGNORE INTO session_notifications(
+                       session_id, kind, notified_at_utc
+                   ) VALUES (?, ?, ?)""",
+                (session_id, SessionNotificationKind.FINAL_DELETE_FAILED.value, notified_at_utc),
             )
         return cursor.rowcount == 1
 
@@ -794,9 +880,13 @@ class Database:
             rows = connection.execute(
                 "SELECT session_id, title, path FROM pending_media_deletions ORDER BY session_id"
             ).fetchall()
-        return tuple(
-            PendingMediaDeletion(row["session_id"], row["title"], Path(row["path"])) for row in rows
-        )
+        pending: list[PendingMediaDeletion] = []
+        for row in rows:
+            path = Path(row["path"])
+            if not path.is_absolute():
+                path = self.path.parent / path
+            pending.append(PendingMediaDeletion(row["session_id"], row["title"], path))
+        return tuple(pending)
 
     def finalize_pending_media_deletion(self, session_id: str) -> bool:
         pending = next(
@@ -827,20 +917,35 @@ class Database:
             staged_dir = None
         try:
             with self.connect() as connection:
-                connection.execute("DELETE FROM transcript_fts WHERE session_id = ?", (session_id,))
-                cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                cursor = connection.execute(
+                    "DELETE FROM sessions WHERE id = ? AND trashed_at_utc IS NOT NULL",
+                    (session_id,),
+                )
                 if cursor.rowcount != 1:
-                    raise RuntimeError("会话删除未完成")
-                if staged_dir is not None:
+                    deleted = False
+                else:
                     connection.execute(
-                        """INSERT OR REPLACE INTO pending_media_deletions(session_id, title, path)
-                           VALUES (?, ?, ?)""",
-                        (session_id, session.title, str(staged_dir)),
+                        "DELETE FROM transcript_fts WHERE session_id = ?", (session_id,)
                     )
+                    if staged_dir is not None:
+                        connection.execute(
+                            """INSERT OR REPLACE INTO pending_media_deletions(session_id, title, path)
+                               VALUES (?, ?, ?)""",
+                            (
+                                session_id,
+                                session.title,
+                                str(staged_dir.relative_to(self.path.parent)),
+                            ),
+                        )
+                    deleted = True
         except Exception:
             if staged_dir is not None and staged_dir.exists() and not media_dir.exists():
                 os.replace(staged_dir, media_dir)
             raise
+        if not deleted:
+            if staged_dir is not None and staged_dir.exists() and not media_dir.exists():
+                os.replace(staged_dir, media_dir)
+            return False
         if staged_dir is not None:
             self.finalize_pending_media_deletion(session_id)
         return True

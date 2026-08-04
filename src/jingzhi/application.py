@@ -277,6 +277,18 @@ class JingzhiApplicationService:
     def is_recording(self) -> bool:
         return self.recorder.is_recording
 
+    def session_storage_busy_reason(self, session_id: str) -> str | None:
+        if getattr(self.recorder, "session_id", None) != session_id:
+            return None
+        busy_reason = getattr(self.recorder, "storage_busy_reason", None)
+        if callable(busy_reason):
+            reason = busy_reason()
+            if reason:
+                return str(reason)
+        if self.recorder.is_recording:
+            return "正在记录会话"
+        return None
+
     def start_session(
         self,
         title: str,
@@ -338,8 +350,9 @@ class JingzhiApplicationService:
 
     @storage_writer("移入回收区")
     def delete_session(self, session_id: str) -> None:
-        if self.recorder.is_recording and session_id == getattr(self.recorder, "session_id", None):
-            raise RuntimeError("正在记录的会话不能删除")
+        busy_reason = self.session_storage_busy_reason(session_id)
+        if busy_reason:
+            raise RuntimeError(f"会话仍在写入：{busy_reason}")
         now = self._now_utc()
         if not self.database.move_session_to_trash(
             session_id, now.isoformat(), (now + timedelta(days=7)).isoformat()
@@ -353,6 +366,9 @@ class JingzhiApplicationService:
 
     @storage_writer("完成中断会话")
     def complete_interrupted_session(self, session_id: str) -> None:
+        busy_reason = self.session_storage_busy_reason(session_id)
+        if busy_reason:
+            raise RuntimeError(f"会话仍在写入：{busy_reason}")
         if not self.database.complete_interrupted_session(session_id, self._now_utc().isoformat()):
             raise KeyError(f"Unknown interrupted session: {session_id}")
 
@@ -360,17 +376,22 @@ class JingzhiApplicationService:
     def run_session_maintenance(self) -> tuple[SessionNotification, ...]:
         now = self._now_utc()
         notices: list[SessionNotification] = []
-        for pending in self.database.pending_media_deletions():
-            try:
-                finalized = self.database.finalize_pending_media_deletion(pending.session_id)
-            except Exception:  # noqa: BLE001 - cleanup failure remains retryable
+
+        def append_final_delete_failure(session_id: str, title: str) -> None:
+            if self.database.record_final_delete_failure(session_id, now.isoformat()):
                 notices.append(
                     SessionNotification(
-                        pending.session_id,
-                        pending.title,
-                        SessionNotificationKind.FINAL_DELETE_FAILED,
+                        session_id, title, SessionNotificationKind.FINAL_DELETE_FAILED
                     )
                 )
+
+        for pending in self.database.pending_media_deletions():
+            if self.session_storage_busy_reason(pending.session_id):
+                continue
+            try:
+                finalized = self.database.finalize_pending_media_deletion(pending.session_id)
+            except OSError:
+                append_final_delete_failure(pending.session_id, pending.title)
                 continue
             if finalized:
                 notices.append(
@@ -382,7 +403,11 @@ class JingzhiApplicationService:
                 )
 
         for session in self.database.list_sessions():
-            if session.pinned or session.status == "recording":
+            if (
+                self.session_storage_busy_reason(session.id)
+                or session.pinned
+                or session.status == "recording"
+            ):
                 continue
             anchor_text = (
                 session.retention_started_at_utc or session.ended_at_utc or session.started_at_utc
@@ -392,11 +417,17 @@ class JingzhiApplicationService:
             if remaining <= timedelta(0):
                 expires_at = now + timedelta(days=7)
                 if self.database.move_session_to_trash(
-                    session.id, now.isoformat(), expires_at.isoformat()
+                    session.id,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                    allow_pinned=False,
+                    expected_session=session,
+                ) and self.database.record_session_notification(
+                    session.id,
+                    SessionNotificationKind.MOVED_TO_TRASH,
+                    now.isoformat(),
+                    expected_trashed=True,
                 ):
-                    self.database.record_session_notification(
-                        session.id, SessionNotificationKind.MOVED_TO_TRASH, now.isoformat()
-                    )
                     notices.append(
                         SessionNotification(
                             session.id, session.title, SessionNotificationKind.MOVED_TO_TRASH
@@ -409,11 +440,16 @@ class JingzhiApplicationService:
             elif remaining <= timedelta(days=7):
                 kind = SessionNotificationKind.RETENTION_7D
             if kind and self.database.record_session_notification(
-                session.id, kind, now.isoformat()
+                session.id,
+                kind,
+                now.isoformat(),
+                expected_session=session,
             ):
                 notices.append(SessionNotification(session.id, session.title, kind))
 
         for session in self.database.list_sessions(status="trash"):
+            if self.session_storage_busy_reason(session.id):
+                continue
             if session.trash_expires_at_utc is None:
                 continue
             expires_at = self._as_utc(datetime.fromisoformat(session.trash_expires_at_utc))
@@ -421,14 +457,8 @@ class JingzhiApplicationService:
                 continue
             try:
                 deleted = self.database.permanently_delete_session(session.id)
-            except Exception:  # noqa: BLE001 - cleanup failure remains retryable
-                notices.append(
-                    SessionNotification(
-                        session.id,
-                        session.title,
-                        SessionNotificationKind.FINAL_DELETE_FAILED,
-                    )
-                )
+            except OSError:
+                append_final_delete_failure(session.id, session.title)
                 continue
             if deleted:
                 notices.append(

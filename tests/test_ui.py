@@ -1084,3 +1084,19 @@ def test_session_library_search_filter_pin_delete_and_restore(tmp_path, monkeypa
         second_id,
     }
     window.close()
+
+
+def test_interrupted_session_timeline_retains_status(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "interrupted-ui.sqlite3")
+    database.create_session("中断会话", "2026-08-04T10:00:00+00:00")
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window.show()
+    application.processEvents()
+
+    window.session_library.setCurrentItem(window.session_library.item(0))
+    application.processEvents()
+
+    assert "已中断" in window.workspace_meta.text()
+    window.close()

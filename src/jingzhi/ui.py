@@ -317,6 +317,8 @@ class UiBridge(QObject):
     summary = Signal(str)
     stopped = Signal(str)
     provider_tested = Signal(str)
+    maintenance_finished = Signal(object)
+    maintenance_failed = Signal(str)
 
 
 class RecordingConfirmationDialog(QDialog):
@@ -679,6 +681,7 @@ class MainWindow(QMainWindow):
         self._animations_enabled = motion_enabled()
         self._storage_dialog: StorageSettingsDialog | None = None
         self._session_sort_newest = True
+        self._maintenance_thread: threading.Thread | None = None
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
@@ -686,9 +689,8 @@ class MainWindow(QMainWindow):
         self._maintenance_timer.setInterval(60_000)
         self._maintenance_timer.timeout.connect(self._run_session_maintenance)
         self._maintenance_timer.start()
-        lifecycle_notices = self.service.run_session_maintenance()
         self._refresh_sessions()
-        self._show_lifecycle_notices(lifecycle_notices)
+        QTimer.singleShot(0, self._run_session_maintenance)
         self._whisper_dialog: WhisperSettingsDialog | None = None
         if (
             callable(getattr(self.manager, "configure_whisper", None))
@@ -1440,14 +1442,19 @@ class MainWindow(QMainWindow):
             self.session_complete_button.hide()
             return
         current = record.id == self._active_session_id()
-        self.session_pin_button.setEnabled(not current and record.trashed_at_utc is None)
+        busy = self.service.session_storage_busy_reason(record.id) is not None
+        self.session_pin_button.setEnabled(
+            not current and not busy and record.trashed_at_utc is None
+        )
         self.session_pin_button.setText("取消固定" if record.pinned else "固定")
-        self.session_delete_button.setEnabled(not current and record.trashed_at_utc is None)
+        self.session_delete_button.setEnabled(
+            not current and not busy and record.trashed_at_utc is None
+        )
         self.session_delete_button.setVisible(record.trashed_at_utc is None)
         self.session_restore_button.setVisible(record.trashed_at_utc is not None)
-        self.session_complete_button.setVisible(
-            record.status == "interrupted" and record.trashed_at_utc is None
-        )
+        interrupted = record.status == "interrupted" and record.trashed_at_utc is None
+        self.session_complete_button.setVisible(interrupted)
+        self.session_complete_button.setEnabled(interrupted and not busy)
 
     def _toggle_session_sort(self) -> None:
         self._session_sort_newest = not self._session_sort_newest
@@ -1514,11 +1521,35 @@ class MainWindow(QMainWindow):
         return getattr(self.manager, "session_id", None)
 
     def _run_session_maintenance(self) -> None:
-        notices = self.service.run_session_maintenance()
+        if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+            return
+
+        def work() -> None:
+            try:
+                notices = self.service.run_session_maintenance()
+            except Exception as exc:
+                logger.exception("Session maintenance failed")
+                self.bridge.maintenance_failed.emit(str(exc))
+            else:
+                self.bridge.maintenance_finished.emit(notices)
+
+        self._maintenance_thread = threading.Thread(
+            target=work, name="session-maintenance", daemon=True
+        )
+        self._maintenance_thread.start()
+
+    @Slot(object)
+    def _maintenance_finished(self, notices) -> None:  # type: ignore[no-untyped-def]
+        self._update_session_actions(self.session_library.currentItem())
         if not notices:
             return
         self._refresh_sessions(self._selected_session_id)
         self._show_lifecycle_notices(notices)
+
+    @Slot(str)
+    def _maintenance_failed(self, message: str) -> None:
+        self._update_session_actions(self.session_library.currentItem())
+        self._show_action_error(message)
 
     def _show_lifecycle_notices(self, notices) -> None:  # type: ignore[no-untyped-def]
         if not notices:
@@ -1556,7 +1587,11 @@ class MainWindow(QMainWindow):
         session = timeline.session
         self.workspace_breadcrumb.setText(f"会话 / {session.started_at_utc[:10]}")
         self.workspace_title.setText(session.title)
-        state = "记录中" if session.status == "recording" else "已完成"
+        state = {
+            "recording": "记录中",
+            "interrupted": "已中断 · 可恢复处理",
+            "complete": "已完成",
+        }.get(session.status, session.status)
         self.workspace_meta.setText(f"{state} · {len(timeline.frames)} 张关键帧位于当前缩放窗口")
         self.timeline_range.setText(
             f"{self._format_time(timeline.window_start_ms)} — "
@@ -1891,6 +1926,7 @@ class MainWindow(QMainWindow):
         write_thread_names = {
             "question-voice",
             "stop-session",
+            "session-maintenance",
             "test-provider",
             "answer-question",
             "reanswer-question",
@@ -1974,6 +2010,8 @@ class MainWindow(QMainWindow):
         self.bridge.summary.connect(self._show_summary)
         self.bridge.stopped.connect(self._recording_stopped)
         self.bridge.provider_tested.connect(self._provider_tested)
+        self.bridge.maintenance_finished.connect(self._maintenance_finished)
+        self.bridge.maintenance_failed.connect(self._maintenance_failed)
 
     @staticmethod
     def _compact_message(message: str) -> str:
