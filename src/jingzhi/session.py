@@ -277,6 +277,7 @@ class SessionManager:
         assert self.stop_event is not None
         assert self.chunk_queue is not None
         session_id = self.session_id
+        ended_at = datetime.now(UTC).isoformat()
         self.stop_event.set()
         for worker in self.workers:
             worker.join(timeout=self.settings.audio_chunk_s + 3)
@@ -288,7 +289,6 @@ class SessionManager:
             assert self.correction_queue is not None
             self.correction_queue.put(None)
             self.correction_worker.join(timeout=120)
-        ended_at = datetime.now(UTC).isoformat()
         assert session_id is not None
         all_workers_stopped = all(not worker.is_alive() for worker in self.workers)
         transcriber_stopped = self.transcriber is None or not self.transcriber.is_alive()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -401,6 +402,40 @@ def test_stop_waits_for_late_transcript_correction_retries(tmp_path: Path, monke
         "original",
         "correction",
     ]
+
+
+def test_stop_records_capture_end_before_waiting_for_workers(tmp_path: Path, monkeypatch) -> None:
+    capture_ended_at = datetime.fromisoformat("2026-08-04T00:00:10+00:00")
+    shutdown_completed_at = datetime.fromisoformat("2026-08-04T00:01:10+00:00")
+    current_time = SimpleNamespace(value=capture_ended_at)
+
+    class ControlledDateTime:
+        @classmethod
+        def now(cls, _timezone):
+            return current_time.value
+
+    class SlowWorker:
+        def join(self, *, timeout: float) -> None:
+            assert timeout > 0
+            current_time.value = shutdown_completed_at
+
+        def is_alive(self) -> bool:
+            return False
+
+    manager = SessionManager(Settings(data_dir=tmp_path))
+    session_id = manager.database.create_session("停止时间语义", "2026-08-04T00:00:00+00:00")
+    manager.session_id = session_id
+    manager.clock = SimpleNamespace(now_ms=lambda: 10_000)
+    manager.stop_event = threading.Event()
+    manager.chunk_queue = queue.Queue()
+    manager.workers = [SlowWorker()]
+    monkeypatch.setattr("jingzhi.session.datetime", ControlledDateTime)
+
+    assert manager.stop() == session_id
+
+    session = manager.database.get_session(session_id)
+    assert session is not None
+    assert session.ended_at_utc == capture_ended_at.isoformat()
 
 
 def test_window_is_rescheduled_when_a_segment_arrives_during_correction() -> None:
