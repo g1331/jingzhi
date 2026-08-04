@@ -141,6 +141,8 @@ def test_existing_session_migration_copies_all_data_rewrites_paths_and_survives_
     assert restarted.data_dir == target.resolve()
     assert (target / "samples" / "sample.wav").read_bytes() == b"sample"
     assert (target / "logs" / "app.log").read_text(encoding="utf-8") == "log"
+    assert not (target / "jingzhi.sqlite3-wal").exists()
+    assert not (target / "jingzhi.sqlite3-shm").exists()
     with sqlite3.connect(target / "jingzhi.sqlite3") as connection:
         frame_path = Path(connection.execute("SELECT path FROM frames").fetchone()[0])
         audio_path = Path(connection.execute("SELECT path FROM audio_chunks").fetchone()[0])

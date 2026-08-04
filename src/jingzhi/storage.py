@@ -333,10 +333,16 @@ class StorageManager:
             return
         raise ValueError("目标目录不能位于当前目录内部")
 
-    def _copy_and_verify(self, source: Path, staging: Path) -> None:
+    def _copy_and_verify(
+        self, source: Path, staging: Path, *, excluded: frozenset[Path] = frozenset()
+    ) -> None:
         staging.mkdir(parents=True)
         source_items = tuple(source.rglob("*")) if source.exists() else ()
-        source_files = {item.relative_to(source): item for item in source_items if item.is_file()}
+        source_files = {
+            item.relative_to(source): item
+            for item in source_items
+            if item.is_file() and item.relative_to(source) not in excluded
+        }
         for relative, item in source_files.items():
             destination = staging / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -368,7 +374,9 @@ class StorageManager:
             return
         connection = sqlite3.connect(database, timeout=10)
         try:
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy, _, _ = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if busy:
+                raise RuntimeError("SQLite WAL 正在使用，无法迁移应用数据")
         finally:
             connection.close()
 
@@ -408,7 +416,11 @@ class StorageManager:
             staging = target.parent / f".{target.name}.jingzhi-migration-{uuid.uuid4().hex}"
             token = uuid.uuid4().hex
             try:
-                self._copy_and_verify(source, staging)
+                self._copy_and_verify(
+                    source,
+                    staging,
+                    excluded=frozenset({Path("jingzhi.sqlite3-wal"), Path("jingzhi.sqlite3-shm")}),
+                )
                 self._rewrite_database_paths(staging / "jingzhi.sqlite3", source, target)
                 (staging / ".jingzhi-migration-complete").write_text(token, encoding="utf-8")
                 if target.exists():
