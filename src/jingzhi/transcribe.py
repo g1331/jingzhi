@@ -20,8 +20,9 @@ def _transcribe_audio(model, path: Path, settings: WhisperSettings):  # type: ig
 class WhisperQuestionTranscriber:
     """Transcribes a completed question clip without persisting it as session evidence."""
 
-    def __init__(self, settings: WhisperSettings) -> None:
+    def __init__(self, settings: WhisperSettings, model_dir: Path | None = None) -> None:
         self.settings = settings
+        self.model_dir = model_dir
         self._model = None
 
     def transcribe(self, path: Path) -> str:
@@ -32,6 +33,7 @@ class WhisperQuestionTranscriber:
                 self.settings.model,
                 device=self.settings.device,
                 compute_type=self.settings.compute_type,
+                download_root=str(self.model_dir) if self.model_dir is not None else None,
             )
         segments, _info = _transcribe_audio(self._model, path, self.settings)
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
@@ -47,6 +49,7 @@ class TranscriptionWorker(threading.Thread):
         database: Database,
         chunk_queue: queue.Queue[AudioChunk | None],
         settings: WhisperSettings,
+        model_dir: Path | None = None,
         on_segment: Callable[[int, int, str, str], None] | None = None,
         on_persisted_segment: Callable[[str, int, int], None] | None = None,
         on_recognition_started: Callable[[int, int, str], None] | None = None,
@@ -56,6 +59,7 @@ class TranscriptionWorker(threading.Thread):
         self.database = database
         self.chunk_queue = chunk_queue
         self.settings = settings
+        self.model_dir = model_dir
         self.on_segment = on_segment
         self.on_persisted_segment = on_persisted_segment
         self.on_recognition_started = on_recognition_started
@@ -69,6 +73,7 @@ class TranscriptionWorker(threading.Thread):
                 self.settings.model,
                 device=self.settings.device,
                 compute_type=self.settings.compute_type,
+                download_root=str(self.model_dir) if self.model_dir is not None else None,
             )
         except Exception as exc:
             logger.exception("Could not initialize transcription model")

@@ -210,6 +210,37 @@ def test_model_metadata_failure_is_retryable() -> None:
     assert failed.can_retry
 
 
+def test_downloader_and_benchmark_pass_the_configured_model_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_calls: list[dict] = []
+    download_calls: list[dict] = []
+
+    class FakeFasterWhisperModel:
+        def __init__(self, _model: str, **kwargs) -> None:
+            model_calls.append(kwargs)
+
+    monkeypatch.setattr("faster_whisper.WhisperModel", FakeFasterWhisperModel)
+    benchmark = WhisperBenchmark(model_dir=tmp_path)
+    benchmark._create_model(PROFILE_PRESETS[WhisperProfile.BALANCED].settings)
+
+    def fake_download(**kwargs):
+        download_calls.append(kwargs)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    downloader = WhisperModelDownloader(
+        model_dir=tmp_path,
+        repository_files=lambda _model: (("config.json", 1),),
+    )
+    state = downloader.prepare(
+        "small", on_progress=lambda _state: None, cancel_event=threading.Event()
+    )
+
+    assert state.status == "complete"
+    assert model_calls[0]["download_root"] == str(tmp_path)
+    assert download_calls[0]["cache_dir"] == str(tmp_path)
+
+
 def test_windows_detected_capabilities_resolve_cpu_and_available_gpu(monkeypatch) -> None:
     class FakeCTranslate2:
         @staticmethod

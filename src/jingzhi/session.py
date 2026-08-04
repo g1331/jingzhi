@@ -22,6 +22,7 @@ from jingzhi.model_roles import ModelRole, RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
 from jingzhi.recording_settings import RecordingPreferences, resolve_recording_selection
+from jingzhi.storage import canonical_whisper_repository_id, storage_writer
 from jingzhi.transcribe import TranscriptionWorker, WhisperQuestionTranscriber
 from jingzhi.transcript_correction import (
     CORRECTION_WINDOW_SECONDS,
@@ -110,6 +111,7 @@ class SessionManager:
     def transcript_correction_model(self) -> RoutedTranscriptCorrectionModel:
         return RoutedTranscriptCorrectionModel(self._model_router())
 
+    @storage_writer("保存字幕校订配置")
     def configure_transcript_correction(self, *, enabled: bool, window_seconds: int) -> None:
         if window_seconds not in CORRECTION_WINDOW_SECONDS:
             raise ValueError("Correction window must be 15, 30, or 60 seconds")
@@ -128,6 +130,7 @@ class SessionManager:
             if enabled:
                 self._start_correction_worker()
 
+    @storage_writer("保存模型连接配置")
     def save_provider(self) -> None:
         self.provider_settings_store.save(self.provider_settings)
 
@@ -140,24 +143,29 @@ class SessionManager:
         self.question_transcriber = None
         return resolved.fallback_advice
 
+    @storage_writer("保存 Whisper 配置")
     def save_whisper(self) -> None:
         self.whisper_settings_store.save(self.whisper_settings)
 
+    @storage_writer("运行 Whisper 样本测试")
     def benchmark_whisper(self, sample_path) -> BenchmarkResult:  # type: ignore[no-untyped-def]
         resolved = resolve_whisper_settings(self.whisper_settings, self.whisper_capabilities)
-        result = WhisperBenchmark().run(resolved.settings, sample_path)
+        result = WhisperBenchmark(model_dir=self.settings.model_dir).run(
+            resolved.settings, sample_path
+        )
         self.whisper_settings = replace(self.whisper_settings, first_run_completed=True)
         self.actual_whisper_settings = resolved.settings
         self.save_whisper()
         return result
 
+    @storage_writer("下载 Whisper 模型")
     def prepare_whisper_model(
         self,
         *,
         on_progress: Callable[[DownloadState], None],
         cancel_event: threading.Event,
     ) -> DownloadState:
-        return WhisperModelDownloader().prepare(
+        return WhisperModelDownloader(model_dir=self.settings.model_dir).prepare(
             self.whisper_settings.model,
             on_progress=on_progress,
             cancel_event=cancel_event,
@@ -167,6 +175,31 @@ class SessionManager:
     def is_recording(self) -> bool:
         return self.session_id is not None and self.stop_event is not None
 
+    def storage_busy_reason(self) -> str | None:
+        if self.is_recording:
+            return "正在录制会话"
+        if self.question_voice_recorder is not None:
+            return "正在录制语音提问"
+        if any(worker.is_alive() for worker in self.workers):
+            return "会话采集线程仍在写入数据"
+        if self.transcriber is not None and self.transcriber.is_alive():
+            return "字幕转写仍在写入数据"
+        if self.correction_worker is not None and self.correction_worker.is_alive():
+            return "字幕校订仍在写入数据"
+        return None
+
+    def whisper_model_in_use(self, repository_id: str) -> bool:
+        active_repository = canonical_whisper_repository_id(self.actual_whisper_settings.model)
+        if repository_id != active_repository:
+            return False
+        model_threads = {"whisper-model-download", "whisper-benchmark"}
+        return (
+            self.storage_busy_reason() is not None
+            or self.question_transcriber is not None
+            or any(thread.name in model_threads for thread in threading.enumerate())
+        )
+
+    @storage_writer("开始会话")
     def start(
         self,
         title: str,
@@ -175,6 +208,9 @@ class SessionManager:
     ) -> str:
         if self.is_recording:
             raise RuntimeError("A session is already recording")
+        busy_reason = self.storage_busy_reason()
+        if busy_reason:
+            raise RuntimeError(f"Cannot start a session while {busy_reason}")
         snapshot = self.device_catalog.snapshot()
         if selection is None:
             selection = RecordingSelection(
@@ -280,6 +316,7 @@ class SessionManager:
             database=self.database,
             chunk_queue=chunk_queue,
             settings=self.actual_whisper_settings,
+            model_dir=self.settings.model_dir,
             on_segment=self.on_segment,
             on_persisted_segment=self._enqueue_correction,
             on_recognition_started=(
@@ -347,12 +384,14 @@ class SessionManager:
         for item in self.correction_batcher.add_segment(session_id, start_ms):
             self.correction_queue.put(item)
 
+    @storage_writer("测试模型连接")
     def test_provider(self) -> str:
         result = self._model_router().invoke(
             RoleName.UTILITY, lambda model: model.test_connection(), session_id=self.session_id
         )
         return result.value
 
+    @storage_writer("结束会话")
     def stop(self) -> str | None:
         self.cancel_question()
         if not self.is_recording:
@@ -383,18 +422,21 @@ class SessionManager:
         )
         self.database.finish_session(session_id, ended_at, status)
         self.stop_event = None
-        self.workers = []
-        self.chunk_queue = None
-        self.transcriber = None
-        self.correction_queue = None
-        self.correction_worker = None
-        self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
-        self.correction_flush_event.clear()
+        self.workers = [worker for worker in self.workers if worker.is_alive()]
+        if transcriber_stopped:
+            self.chunk_queue = None
+            self.transcriber = None
+        if correction_stopped:
+            self.correction_queue = None
+            self.correction_worker = None
+            self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
+            self.correction_flush_event.clear()
         return session_id
 
     def _question_service(self) -> QuestionAnsweringService:
         return QuestionAnsweringService(self.database, self._model_router())
 
+    @storage_writer("创建问题锚点")
     def capture_question_anchor(self, lookback_ms: int = 2 * 60_000) -> int:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
@@ -404,11 +446,13 @@ class SessionManager:
             )
         return self.pending_question_id
 
+    @storage_writer("修改问题范围")
     def set_question_range(self, lookback_ms: int) -> None:
         if self.pending_question_id is None:
             raise RuntimeError("There is no pending question anchor")
         self._question_service().set_anchor_range(self.pending_question_id, lookback_ms)
 
+    @storage_writer("取消问题")
     def cancel_question(self) -> bool:
         voice_recorder = self.question_voice_recorder
         self.question_voice_recorder = None
@@ -420,6 +464,7 @@ class SessionManager:
         self.pending_question_id = None
         return self._question_service().cancel_anchor(question_id)
 
+    @storage_writer("录制语音提问")
     def start_question_voice(self) -> None:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
@@ -439,6 +484,7 @@ class SessionManager:
         recorder.start(path)
         self.question_voice_recorder = recorder
 
+    @storage_writer("转写语音提问")
     def finish_question_voice(self) -> str:
         recorder = self.question_voice_recorder
         if recorder is None:
@@ -448,12 +494,15 @@ class SessionManager:
         if self.question_transcriber is None:
             resolved = resolve_whisper_settings(self.whisper_settings, self.whisper_capabilities)
             self.actual_whisper_settings = resolved.settings
-            self.question_transcriber = WhisperQuestionTranscriber(self.actual_whisper_settings)
+            self.question_transcriber = WhisperQuestionTranscriber(
+                self.actual_whisper_settings, self.settings.model_dir
+            )
         try:
             return self.question_transcriber.transcribe(path)
         finally:
             path.unlink(missing_ok=True)
 
+    @storage_writer("提交问题")
     def answer(self, question: str) -> str:
         if self.session_id is None or self.clock is None:
             raise RuntimeError("Start a study session before asking a question")
@@ -464,6 +513,7 @@ class SessionManager:
         assert result.answer is not None
         return result.answer
 
+    @storage_writer("重新回答问题")
     def reanswer_question(self, question_id: int) -> str:
         result = self._question_service().reanswer(question_id)
         self.last_question_id = question_id
@@ -482,6 +532,7 @@ class SessionManager:
             raise RuntimeError("The selected question does not belong to the current session")
         return self.reanswer_question(self.last_question_id)
 
+    @storage_writer("生成会话材料")
     def summarize(self) -> dict:
         if self.session_id is None:
             raise RuntimeError("There is no current session")

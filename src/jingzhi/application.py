@@ -23,6 +23,7 @@ from jingzhi.database import (
 )
 from jingzhi.model_roles import RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter
+from jingzhi.storage import storage_writer
 from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
     TranscriptCorrectionProcessor,
@@ -36,6 +37,7 @@ class QuestionAnsweringService:
         self.database = database
         self.router = router
 
+    @storage_writer("创建问题锚点")
     def create_anchor(
         self, session_id: str, asked_at_ms: int, *, lookback_ms: int = 2 * 60_000
     ) -> int:
@@ -50,6 +52,7 @@ class QuestionAnsweringService:
             state="draft",
         )
 
+    @storage_writer("修改问题范围")
     def set_anchor_range(self, question_id: int, lookback_ms: int) -> None:
         if lookback_ms <= 0:
             raise ValueError("Question range must be greater than zero")
@@ -60,9 +63,11 @@ class QuestionAnsweringService:
             question_id, max(0, question.asked_at_ms - lookback_ms), question.asked_at_ms
         )
 
+    @storage_writer("取消问题")
     def cancel_anchor(self, question_id: int) -> bool:
         return self.database.delete_pending_question(question_id)
 
+    @storage_writer("提交问题")
     def submit(self, question_id: int, question: str) -> AnswerVersionRecord:
         question = question.strip()
         if not question:
@@ -92,6 +97,7 @@ class QuestionAnsweringService:
         question_id = self.create_anchor(session_id, asked_at_ms, lookback_ms=lookback_ms)
         return self.submit(question_id, question)
 
+    @storage_writer("重新回答问题")
     def reanswer(self, question_id: int) -> AnswerVersionRecord:
         question = self.database.question(question_id)
         if question is None:
@@ -397,6 +403,7 @@ class JingzhiApplicationService:
             now = now.replace(tzinfo=UTC)
         return max(session.duration_ms, int((now - started).total_seconds() * 1000))
 
+    @storage_writer("保存字幕校订配置")
     def configure_transcript_correction(
         self, session_id: str, *, enabled: bool, window_seconds: int
     ) -> None:
@@ -476,14 +483,17 @@ class JingzhiApplicationService:
     def session_answers(self, session_id: str) -> list[SessionAnswerRecord]:
         return self.database.session_answers(session_id)
 
+    @storage_writer("编辑字幕")
     def edit_transcript(self, segment_id: int, text: str) -> int:
         version_id = self.database.add_transcript_version(segment_id, "user_edit", text)
         assert version_id is not None
         return version_id
 
+    @storage_writer("撤销字幕校订")
     def undo_transcript_correction(self, segment_id: int) -> None:
         self.database.undo_transcript_correction(segment_id)
 
+    @storage_writer("运行字幕校订")
     def run_transcript_correction(
         self, session_id: str, *, window_start_ms: int
     ) -> TranscriptCorrectionRunRecord:
