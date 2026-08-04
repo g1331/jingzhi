@@ -67,7 +67,6 @@ CREATE TABLE IF NOT EXISTS timeline_events (
 );
 CREATE INDEX IF NOT EXISTS timeline_event_session_time
 ON timeline_events(session_id, start_ms, end_ms, id);
-
 CREATE TABLE IF NOT EXISTS pending_media_deletions (
     session_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
