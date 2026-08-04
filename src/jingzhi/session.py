@@ -225,7 +225,11 @@ class SessionManager:
                 item = self.correction_queue.get()
                 try:
                     if item is None:
-                        return
+                        if self.correction_queue.empty():
+                            return
+                        self.correction_queue.put(None)
+                        continue
+                    self.correction_batcher.start(item)
                     session_id, window_start_ms = item
                     window_ms = self.correction_window_seconds * 1000
                     ready_at_ms = (
@@ -247,6 +251,9 @@ class SessionManager:
                     if self.on_segment:
                         self.on_segment(window_start_ms, window_start_ms, "", "")
                 finally:
+                    if item is not None:
+                        for retry in self.correction_batcher.complete(item):
+                            self.correction_queue.put(retry)
                     self.correction_queue.task_done()
 
         self.correction_worker = threading.Thread(

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import queue
 import sqlite3
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
 from jingzhi.application import JingzhiApplicationService
+from jingzhi.config import Settings
 from jingzhi.database import Database
+from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CorrectionRequest, CorrectionWindowBatcher
 
 
@@ -160,6 +165,50 @@ def test_correction_uses_window_neighbors_and_source_labeled_representative_fram
     ]
 
 
+def test_rerunning_window_only_corrects_late_segments(tmp_path: Path) -> None:
+    database = Database(tmp_path / "late.sqlite3")
+    session_id = database.create_session("迟到字幕", "2026-08-04T00:00:00+00:00")
+    first_id = _add_segment(
+        database,
+        session_id,
+        tmp_path,
+        start_ms=5_000,
+        end_ms=7_000,
+        text="先落库",
+    )
+    model = FakeCorrectionModel()
+    service = JingzhiApplicationService(
+        database,
+        recorder=NoHardwareRecorder(),
+        correction_model=model,
+    )
+    service.configure_transcript_correction(session_id, enabled=True, window_seconds=30)
+    service.run_transcript_correction(session_id, window_start_ms=0)
+
+    late_id = _add_segment(
+        database,
+        session_id,
+        tmp_path,
+        start_ms=10_000,
+        end_ms=12_000,
+        text="后落库",
+    )
+    service.run_transcript_correction(session_id, window_start_ms=0)
+
+    assert [[segment.id for segment in request.target_segments] for request in model.requests] == [
+        [first_id],
+        [late_id],
+    ]
+    assert [version.kind for version in service.transcript_versions(first_id)] == [
+        "original",
+        "correction",
+    ]
+    assert [version.kind for version in service.transcript_versions(late_id)] == [
+        "original",
+        "correction",
+    ]
+
+
 def test_user_edit_wins_and_undo_restores_original_without_deleting_history(
     tmp_path: Path,
 ) -> None:
@@ -274,13 +323,96 @@ def test_incomplete_correction_result_is_recorded_as_failure(tmp_path: Path) -> 
     ]
 
 
-def test_window_batcher_emits_each_window_once() -> None:
+def test_completed_window_is_rescheduled_when_a_late_segment_arrives() -> None:
     batcher = CorrectionWindowBatcher(15)
+    window = ("session", 0)
 
-    assert batcher.add_segment("session", 1_000) == (("session", 0),)
+    assert batcher.add_segment("session", 1_000) == (window,)
+    batcher.start(window)
+    assert batcher.complete(window) == ()
+
+    assert batcher.add_segment("session", 12_000) == (window,)
+
+
+def test_stop_waits_for_late_transcript_correction_retries(tmp_path: Path, monkeypatch) -> None:
+    class BlockingCorrectionModel(FakeCorrectionModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_request_started = threading.Event()
+            self.release_first_request = threading.Event()
+
+        def correct(self, request: CorrectionRequest) -> dict[int, str]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                self.first_request_started.set()
+                assert self.release_first_request.wait(timeout=2)
+            return {segment.id: segment.text for segment in request.target_segments}
+
+    manager = SessionManager(
+        Settings(
+            data_dir=tmp_path,
+            transcript_correction_enabled=True,
+            transcript_correction_window_seconds=30,
+        )
+    )
+    session_id = manager.database.create_session("停止时补校订", "2026-08-04T00:00:00+00:00")
+    manager.database.configure_transcript_correction(session_id, enabled=True, window_ms=30_000)
+    manager.session_id = session_id
+    manager.clock = SimpleNamespace(now_ms=lambda: 100_000)
+    manager.stop_event = threading.Event()
+    manager.chunk_queue = queue.Queue()
+    model = BlockingCorrectionModel()
+    monkeypatch.setattr(manager, "transcript_correction_model", lambda: model)
+    manager._start_correction_worker()
+
+    first_id = _add_segment(
+        manager.database,
+        session_id,
+        tmp_path,
+        start_ms=5_000,
+        end_ms=7_000,
+        text="先落库",
+    )
+    manager._enqueue_correction(session_id, first_id, 5_000)
+    assert model.first_request_started.wait(timeout=2)
+
+    late_id = _add_segment(
+        manager.database,
+        session_id,
+        tmp_path,
+        start_ms=10_000,
+        end_ms=12_000,
+        text="运行中迟到",
+    )
+    manager._enqueue_correction(session_id, late_id, 10_000)
+    stopped_session_ids: list[str | None] = []
+    stop_thread = threading.Thread(target=lambda: stopped_session_ids.append(manager.stop()))
+    stop_thread.start()
+    model.release_first_request.set()
+    stop_thread.join(timeout=3)
+
+    assert not stop_thread.is_alive()
+    assert stopped_session_ids == [session_id]
+    assert [[segment.id for segment in request.target_segments] for request in model.requests] == [
+        [first_id],
+        [late_id],
+    ]
+    assert [version.kind for version in manager.database.transcript_versions(late_id)] == [
+        "original",
+        "correction",
+    ]
+
+
+def test_window_is_rescheduled_when_a_segment_arrives_during_correction() -> None:
+    batcher = CorrectionWindowBatcher(15)
+    window = ("session", 0)
+
+    assert batcher.add_segment("session", 1_000) == (window,)
+    batcher.start(window)
     assert batcher.add_segment("session", 12_000) == ()
-    assert batcher.add_segment("session", 16_000) == (("session", 15_000),)
-    assert batcher.add_segment("session", 18_000) == ()
+    assert batcher.complete(window) == (window,)
+    batcher.start(window)
+    assert batcher.complete(window) == ()
 
 
 def test_representative_frames_include_latest_per_source_and_at_most_two_changes(

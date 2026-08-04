@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -46,20 +47,40 @@ class TranscriptCorrectionModel(Protocol):
 
 
 class CorrectionWindowBatcher:
-    """Maps segments to correction windows and emits each window exactly once."""
+    """Serializes correction windows and reschedules them when new segments arrive."""
 
     def __init__(self, window_seconds: int) -> None:
         if window_seconds not in CORRECTION_WINDOW_SECONDS:
             raise ValueError("Correction window must be 15, 30, or 60 seconds")
         self.window_ms = window_seconds * 1000
-        self._emitted: set[tuple[str, int]] = set()
+        self._pending: set[tuple[str, int]] = set()
+        self._dirty: set[tuple[str, int]] = set()
+        self._lock = Lock()
 
     def add_segment(self, session_id: str, start_ms: int) -> tuple[tuple[str, int], ...]:
-        current = (session_id, start_ms // self.window_ms * self.window_ms)
-        if current in self._emitted:
-            return ()
-        self._emitted.add(current)
-        return (current,)
+        window = (session_id, start_ms // self.window_ms * self.window_ms)
+        with self._lock:
+            if window in self._pending:
+                self._dirty.add(window)
+                return ()
+            self._pending.add(window)
+        return (window,)
+
+    def start(self, window: tuple[str, int]) -> None:
+        with self._lock:
+            if window not in self._pending:
+                raise RuntimeError("Correction window is not pending")
+            self._dirty.discard(window)
+
+    def complete(self, window: tuple[str, int]) -> tuple[tuple[str, int], ...]:
+        with self._lock:
+            if window not in self._pending:
+                raise RuntimeError("Correction window is not pending")
+            if window in self._dirty:
+                self._dirty.remove(window)
+                return (window,)
+            self._pending.remove(window)
+        return ()
 
 
 class TranscriptCorrectionProcessor:
@@ -80,7 +101,7 @@ class TranscriptCorrectionProcessor:
             item
             for item in self.database.correction_segments(session_id, start_ms, end_ms)
             if not any(
-                version.kind == "user_edit" and version.active
+                version.kind in {"correction", "user_edit"}
                 for version in self.database.transcript_versions(item.id)
             )
         ]
