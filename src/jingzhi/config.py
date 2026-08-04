@@ -42,5 +42,7 @@ class Settings:
             llm_base_url=os.getenv("OPENAI_BASE_URL", saved.base_url),
             llm_api_key=os.getenv("OPENAI_API_KEY", saved.api_key),
             llm_api_mode=os.getenv("OPENAI_API_MODE", saved.api_mode),
-            transcript_correction_model=os.getenv("TRANSCRIPT_CORRECTION_MODEL", saved.model),
+            transcript_correction_model=os.getenv(
+                "TRANSCRIPT_CORRECTION_MODEL", saved.correction_model
+            ),
         )

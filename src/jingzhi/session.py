@@ -115,6 +115,7 @@ class SessionManager:
                 base_url=self.llm_base_url,
                 api_key=self.llm_api_key,
                 model=self.llm_model,
+                correction_model=self.correction_model,
                 api_mode=self.llm_api_mode,
             )
         )

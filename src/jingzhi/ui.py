@@ -1618,6 +1618,13 @@ class MainWindow(QMainWindow):
         if not self._configure_provider_from_form():
             return
         try:
+            configure_correction = getattr(self.manager, "configure_transcript_correction", None)
+            if callable(configure_correction):
+                configure_correction(
+                    enabled=self.correction_check.isChecked(),
+                    window_seconds=int(self.correction_window_input.currentData()),
+                    model=self.correction_model_input.text(),
+                )
             self.manager.save_provider()
         except Exception as exc:  # noqa: BLE001 - OS credential store boundary
             self._show_action_error(str(exc))
