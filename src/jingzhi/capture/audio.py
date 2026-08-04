@@ -6,10 +6,11 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import numpy as np
 
+from jingzhi.capture.devices import AudioDevice, DeviceCatalog
 from jingzhi.clock import SessionClock
 from jingzhi.database import Database
 
@@ -34,16 +35,21 @@ class SoundDeviceMicrophoneRecorder:
     input uses python-sounddevice while system loopback remains on SoundCard.
     """
 
-    def __init__(self, requested_sample_rate: int, blocksize: int) -> None:
+    def __init__(
+        self, requested_sample_rate: int, blocksize: int, device_index: int | None = None
+    ) -> None:
         self.requested_sample_rate = requested_sample_rate
         self.blocksize = blocksize
+        self.device_index = device_index
         self.sample_rate = requested_sample_rate
         self._stream = None
 
     def __enter__(self) -> Self:
         import sounddevice as sd
 
-        device_index = sd.default.device[0]
+        device_index = self.device_index
+        if device_index is None:
+            device_index = sd.default.device[0]
         if device_index is None or int(device_index) < 0:
             raise RuntimeError("Windows 没有配置默认麦克风")
         device = sd.query_devices(device_index, "input")
@@ -95,6 +101,58 @@ class SoundDeviceMicrophoneRecorder:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+
+
+class SelectedMicrophoneRecorder:
+    """Uses the exact MMDevice endpoint, with PortAudio fallback only when unambiguous."""
+
+    def __init__(
+        self,
+        endpoint_id: Any,
+        portaudio_index: int | None,
+        requested_sample_rate: int,
+        blocksize: int,
+    ) -> None:
+        self.endpoint_id = endpoint_id
+        self.portaudio_index = portaudio_index
+        self.requested_sample_rate = requested_sample_rate
+        self.blocksize = blocksize
+        self.sample_rate = requested_sample_rate
+        self._context = None
+        self._recorder = None
+
+    def __enter__(self) -> Self:
+        import soundcard as sc
+
+        microphone = sc.get_microphone(self.endpoint_id)
+        self._context = microphone.recorder(
+            samplerate=self.requested_sample_rate, blocksize=self.blocksize
+        )
+        try:
+            self._recorder = self._context.__enter__()
+        except Exception:
+            if self.portaudio_index is None:
+                raise
+            logger.info("SoundCard could not open selected endpoint; using its PortAudio match")
+            self._context = SoundDeviceMicrophoneRecorder(
+                self.requested_sample_rate,
+                self.blocksize,
+                device_index=self.portaudio_index,
+            )
+            self._recorder = self._context.__enter__()
+            self.sample_rate = self._recorder.sample_rate
+        return self
+
+    def record(self, numframes: int) -> np.ndarray:
+        if self._recorder is None:
+            raise RuntimeError("麦克风输入流尚未启动")
+        return self._recorder.record(numframes=numframes)
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[no-untyped-def]
+        if self._context is not None:
+            self._context.__exit__(exc_type, exc_value, traceback)
+        self._context = None
+        self._recorder = None
 
 
 def _prepare_mono_audio(
@@ -225,6 +283,8 @@ class AudioCaptureWorker(threading.Thread):
         session_id: str,
         clock: SessionClock,
         source: str,
+        device: AudioDevice | None,
+        device_catalog: DeviceCatalog,
         output_dir: Path,
         stop_event: threading.Event,
         chunk_queue: queue.Queue[AudioChunk | None],
@@ -238,6 +298,8 @@ class AudioCaptureWorker(threading.Thread):
         self.session_id = session_id
         self.clock = clock
         self.source = source
+        self.device = device
+        self.device_catalog = device_catalog
         self.output_dir = output_dir
         self.stop_event = stop_event
         self.chunk_queue = chunk_queue
@@ -249,9 +311,17 @@ class AudioCaptureWorker(threading.Thread):
     def _open_recorder(self):
         import soundcard as sc
 
+        if self.device is None:
+            raise RuntimeError(f"{self.source} audio source is unavailable")
+        endpoint_id, portaudio_index = self.device_catalog.audio_locator(self.device.id)
         if self.source == "microphone":
-            return SoundDeviceMicrophoneRecorder(self.sample_rate, blocksize=8192)
-        speaker = sc.default_speaker()
+            return SelectedMicrophoneRecorder(
+                endpoint_id,
+                portaudio_index,
+                self.sample_rate,
+                blocksize=8192,
+            )
+        speaker = sc.get_speaker(endpoint_id)
         loopback = sc.get_microphone(speaker.id, include_loopback=True)
         return loopback.recorder(samplerate=self.sample_rate, blocksize=8192)
 
