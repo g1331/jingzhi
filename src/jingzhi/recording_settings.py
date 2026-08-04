@@ -9,6 +9,7 @@ from jingzhi.capture.devices import (
     DeviceSnapshot,
     ResolvedRecordingSelection,
 )
+from jingzhi.storage import storage_writer
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,7 @@ class RecordingSettingsStore:
             estimated_duration_minutes=max(1, min(24 * 60, duration_minutes)),
         )
 
+    @storage_writer("保存录制来源配置")
     def save(self, preferences: RecordingPreferences) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")

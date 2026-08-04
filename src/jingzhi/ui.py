@@ -83,6 +83,7 @@ from jingzhi.recording_settings import (
 )
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
+from jingzhi.storage_ui import StorageSettingsDialog
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
 from jingzhi.whisper_ui import WhisperSettingsDialog
 
@@ -673,6 +674,7 @@ class MainWindow(QMainWindow):
         self._last_answer = ""
         self._speech: QTextToSpeech | None = None
         self._animations_enabled = motion_enabled()
+        self._storage_dialog: StorageSettingsDialog | None = None
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
@@ -789,6 +791,9 @@ class MainWindow(QMainWindow):
         self.provider_toggle_button.setProperty("role", "quiet")
         self.whisper_settings_button = QPushButton("本地 Whisper")
         self.whisper_settings_button.setProperty("role", "quiet")
+        self.storage_settings_button = QPushButton("存储")
+        self.storage_settings_button.setProperty("role", "quiet")
+        header.addWidget(self.storage_settings_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.whisper_settings_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.provider_toggle_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.summary_button, alignment=Qt.AlignmentFlag.AlignBottom)
@@ -1703,6 +1708,41 @@ class MainWindow(QMainWindow):
         self._whisper_dialog.raise_()
         self._whisper_dialog.activateWindow()
 
+    def _storage_busy_reason(self) -> str | None:
+        manager_reason = getattr(self.manager, "storage_busy_reason", None)
+        if callable(manager_reason):
+            reason = manager_reason()
+            if reason:
+                return reason
+        write_thread_names = {
+            "question-voice",
+            "stop-session",
+            "test-provider",
+            "answer-question",
+            "reanswer-question",
+            "summarize-session",
+            "whisper-model-download",
+            "whisper-benchmark",
+        }
+        if any(thread.name in write_thread_names for thread in threading.enumerate()):
+            return "后台任务仍在写入应用数据或模型缓存"
+        return None
+
+    @Slot()
+    def _show_storage_settings(self) -> None:
+        if self._storage_dialog is None:
+            model_in_use = getattr(self.manager, "whisper_model_in_use", None)
+            self._storage_dialog = StorageSettingsDialog(
+                self.settings,
+                busy_reason=self._storage_busy_reason,
+                model_in_use=model_in_use if callable(model_in_use) else None,
+                parent=self,
+            )
+        self._storage_dialog.refresh()
+        self._storage_dialog.show()
+        self._storage_dialog.raise_()
+        self._storage_dialog.activateWindow()
+
     def _connect_signals(self) -> None:
         self.session_library.currentItemChanged.connect(
             lambda current, _previous: self._select_session_item(current)
@@ -1742,6 +1782,7 @@ class MainWindow(QMainWindow):
             lambda: self.provider_group.setVisible(not self.provider_group.isVisible())
         )
         self.whisper_settings_button.clicked.connect(self._show_whisper_settings)
+        self.storage_settings_button.clicked.connect(self._show_storage_settings)
         self.output.render_failed.connect(self._show_worker_warning)
         self.bridge.segment.connect(self._append_segment)
         self.bridge.worker_warning.connect(self._show_worker_warning)
@@ -2416,6 +2457,12 @@ class MainWindow(QMainWindow):
         self._refresh_sessions(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._storage_dialog is not None and self._storage_dialog.operation_active:
+            self._storage_dialog.show()
+            self._storage_dialog.raise_()
+            self._show_action_error("存储迁移正在进行，请等待完成后再退出境织。")
+            event.ignore()
+            return
         if self._question_active:
             self.service.cancel_question()
         configure_provider = getattr(self.manager, "configure_provider", None)
@@ -2442,4 +2489,6 @@ def run_app(settings: Settings) -> int:
     application.setStyle("Fusion")
     window = MainWindow(settings)
     window.show()
+    if settings.startup_settings_store is not None:
+        settings.startup_settings_store.complete_successful_startup(settings.data_dir)
     return application.exec()

@@ -10,6 +10,7 @@ from jingzhi.provider_settings import (
     SavedProviderSettings,
     default_saved_settings,
 )
+from jingzhi.storage import StartupSettingsStore, StoragePaths
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
 from jingzhi.whisper_settings import WhisperSettings, WhisperSettingsStore
 
@@ -17,6 +18,12 @@ from jingzhi.whisper_settings import WhisperSettings, WhisperSettingsStore
 @dataclass(frozen=True, slots=True)
 class Settings:
     data_dir: Path
+    model_dir: Path | None = None
+    data_dir_managed_by_env: bool = False
+    model_dir_managed_by_env: bool = False
+    startup_settings_store: StartupSettingsStore | None = field(
+        default=None, compare=False, repr=False
+    )
     screen_interval_s: float = 1.0
     screen_hash_distance: int = 10
     audio_capture_rate: int = 48_000
@@ -29,9 +36,29 @@ class Settings:
     transcript_correction_enabled: bool = False
     transcript_correction_window_seconds: int = CORRECTION_WINDOW_SECONDS[1]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data_dir", self.data_dir.resolve())
+        object.__setattr__(
+            self,
+            "model_dir",
+            (self.model_dir or self.data_dir / "models").resolve(),
+        )
+
+    @property
+    def storage_paths(self) -> StoragePaths:
+        assert self.model_dir is not None
+        return StoragePaths(
+            self.data_dir,
+            self.model_dir,
+            self.data_dir_managed_by_env,
+            self.model_dir_managed_by_env,
+        )
+
     @classmethod
     def from_env(cls) -> Settings:
-        data_dir = Path(os.getenv("STUDY_DATA_DIR", "data")).resolve()
+        startup_store = StartupSettingsStore()
+        storage_paths = startup_store.resolve()
+        data_dir = storage_paths.data_dir
         saved = ProviderSettingsStore(data_dir).load()
         whisper = WhisperSettingsStore(data_dir).load()
         whisper_overrides = {
@@ -70,6 +97,10 @@ class Settings:
         )
         return cls(
             data_dir=data_dir,
+            model_dir=storage_paths.model_dir,
+            data_dir_managed_by_env=storage_paths.data_managed_by_env,
+            model_dir_managed_by_env=storage_paths.model_managed_by_env,
+            startup_settings_store=startup_store,
             whisper=whisper,
             provider_settings=provider_settings,
         )

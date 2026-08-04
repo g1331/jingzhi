@@ -13,6 +13,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from jingzhi.storage import canonical_whisper_repository_id
+
 
 class WhisperProfile(StrEnum):
     LIGHTWEIGHT = "lightweight"
@@ -207,24 +209,26 @@ class WhisperBenchmark:
     def __init__(
         self,
         *,
+        model_dir: Path | None = None,
         model_factory: Callable[[WhisperSettings], WhisperModel] | None = None,
         duration_reader: Callable[[Path], float] | None = None,
         clock: Callable[[], float] = time.perf_counter,
         resource_reader: Callable[[], dict[str, float]] | None = None,
     ) -> None:
+        self.model_dir = model_dir
         self.model_factory = model_factory or self._create_model
         self.duration_reader = duration_reader or self._read_duration
         self.clock = clock
         self.resource_reader = resource_reader
 
-    @staticmethod
-    def _create_model(settings: WhisperSettings) -> WhisperModel:
+    def _create_model(self, settings: WhisperSettings) -> WhisperModel:
         from faster_whisper import WhisperModel as FasterWhisperModel
 
         return FasterWhisperModel(
             settings.model,
             device=settings.device,
             compute_type=settings.compute_type,
+            download_root=str(self.model_dir) if self.model_dir is not None else None,
         )
 
     @staticmethod
@@ -349,15 +353,17 @@ class WhisperModelDownloader:
     def __init__(
         self,
         *,
+        model_dir: Path | None = None,
         repository_files: Callable[[str], tuple[tuple[str, int], ...]] | None = None,
         download_file: Callable[[str, str], None] | None = None,
     ) -> None:
+        self.model_dir = model_dir
         self.repository_files = repository_files or self._repository_files
         self.download_file = download_file
 
     @staticmethod
     def repository_id(model: str) -> str:
-        return f"Systran/faster-whisper-{model}"
+        return canonical_whisper_repository_id(model)
 
     @classmethod
     def _repository_files(cls, model: str) -> tuple[tuple[str, int], ...]:
@@ -370,9 +376,8 @@ class WhisperModelDownloader:
             if sibling.rfilename
         )
 
-    @classmethod
     def _download_file(
-        cls,
+        self,
         model: str,
         filename: str,
         *,
@@ -395,8 +400,9 @@ class WhisperModelDownloader:
                 return result
 
         hf_hub_download(
-            repo_id=cls.repository_id(model),
+            repo_id=self.repository_id(model),
             filename=filename,
+            cache_dir=str(self.model_dir) if self.model_dir is not None else None,
             tqdm_class=CancellableProgress,
         )
 
