@@ -38,6 +38,35 @@ CREATE TABLE IF NOT EXISTS session_notifications (
     PRIMARY KEY(session_id, kind)
 );
 
+CREATE TABLE IF NOT EXISTS source_events (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'failure', 'device_unavailable', 'stream_stopped', 'overflow'
+    )),
+    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+    end_ms INTEGER NOT NULL CHECK (end_ms >= start_ms),
+    message TEXT NOT NULL,
+    data_loss_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (data_loss_confirmed IN (0, 1)),
+    created_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS source_event_session_time
+ON source_events(session_id, start_ms, end_ms, id);
+
+CREATE TABLE IF NOT EXISTS timeline_events (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('pause', 'data_gap')),
+    source TEXT,
+    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+    end_ms INTEGER NOT NULL CHECK (end_ms >= start_ms),
+    message TEXT NOT NULL,
+    source_event_id INTEGER REFERENCES source_events(id) ON DELETE SET NULL,
+    UNIQUE(kind, source_event_id)
+);
+CREATE INDEX IF NOT EXISTS timeline_event_session_time
+ON timeline_events(session_id, start_ms, end_ms, id);
 CREATE TABLE IF NOT EXISTS pending_media_deletions (
     session_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -251,7 +280,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 
 
 class SessionNotificationKind(StrEnum):
@@ -260,6 +289,18 @@ class SessionNotificationKind(StrEnum):
     MOVED_TO_TRASH = "moved_to_trash"
     PERMANENTLY_DELETED = "permanently_deleted"
     FINAL_DELETE_FAILED = "final_delete_failed"
+
+
+class SourceEventKind(StrEnum):
+    FAILURE = "failure"
+    DEVICE_UNAVAILABLE = "device_unavailable"
+    STREAM_STOPPED = "stream_stopped"
+    OVERFLOW = "overflow"
+
+
+class TimelineEventKind(StrEnum):
+    PAUSE = "pause"
+    DATA_GAP = "data_gap"
 
 
 SESSION_SUMMARY_QUERY = """
@@ -321,6 +362,30 @@ class TimelineQuestionRecord:
     id: int
     asked_at_ms: int
     question: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineEventRecord:
+    id: int
+    session_id: str
+    kind: str
+    source: str | None
+    start_ms: int
+    end_ms: int
+    message: str
+    source_event_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEventRecord:
+    id: int
+    session_id: str
+    source: str
+    kind: str
+    start_ms: int
+    end_ms: int
+    message: str
+    data_loss_confirmed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1074,6 +1139,196 @@ class Database:
                 (session_id, start_ms, end_ms),
             )
         return [TimelineQuestionRecord(**dict(row)) for row in rows]
+
+    def record_source_event(
+        self,
+        session_id: str,
+        source: str,
+        kind: str | SourceEventKind,
+        start_ms: int,
+        end_ms: int,
+        message: str,
+    ) -> int:
+        kind_value = kind.value if isinstance(kind, SourceEventKind) else kind
+        if kind_value not in {item.value for item in SourceEventKind}:
+            raise ValueError(f"Unsupported source event kind: {kind_value}")
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Source event range is invalid")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO source_events(
+                       session_id, source, kind, start_ms, end_ms, message, created_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    kind_value,
+                    start_ms,
+                    end_ms,
+                    message,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def source_event(self, event_id: int) -> SourceEventRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT id, session_id, source, kind, start_ms, end_ms, message,
+                          data_loss_confirmed
+                   FROM source_events WHERE id = ?""",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceEventRecord(
+            id=row["id"],
+            session_id=row["session_id"],
+            source=row["source"],
+            kind=row["kind"],
+            start_ms=row["start_ms"],
+            end_ms=row["end_ms"],
+            message=row["message"],
+            data_loss_confirmed=bool(row["data_loss_confirmed"]),
+        )
+
+    def source_events(
+        self, session_id: str, start_ms: int = 0, end_ms: int | None = None
+    ) -> list[SourceEventRecord]:
+        with self.connect() as connection:
+            if end_ms is None:
+                rows = connection.execute(
+                    """SELECT id, session_id, source, kind, start_ms, end_ms, message,
+                              data_loss_confirmed
+                       FROM source_events
+                       WHERE session_id = ? AND end_ms >= ?
+                       ORDER BY start_ms, id""",
+                    (session_id, start_ms),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT id, session_id, source, kind, start_ms, end_ms, message,
+                              data_loss_confirmed
+                       FROM source_events
+                       WHERE session_id = ? AND end_ms >= ? AND start_ms <= ?
+                       ORDER BY start_ms, id""",
+                    (session_id, start_ms, end_ms),
+                ).fetchall()
+        return [
+            SourceEventRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                source=row["source"],
+                kind=row["kind"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                message=row["message"],
+                data_loss_confirmed=bool(row["data_loss_confirmed"]),
+            )
+            for row in rows
+        ]
+
+    def add_timeline_event(
+        self,
+        session_id: str,
+        kind: str | TimelineEventKind,
+        source: str | None,
+        start_ms: int,
+        end_ms: int,
+        message: str,
+        *,
+        source_event_id: int | None = None,
+    ) -> int:
+        kind_value = kind.value if isinstance(kind, TimelineEventKind) else kind
+        if kind_value not in {item.value for item in TimelineEventKind}:
+            raise ValueError(f"Unsupported timeline event kind: {kind_value}")
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Timeline event range is invalid")
+        with self.connect() as connection:
+            if source_event_id is not None:
+                existing = connection.execute(
+                    """SELECT id FROM timeline_events
+                       WHERE kind = ? AND source_event_id = ?""",
+                    (kind_value, source_event_id),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
+            cursor = connection.execute(
+                """INSERT INTO timeline_events(
+                       session_id, kind, source, start_ms, end_ms, message, source_event_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    kind_value,
+                    source,
+                    start_ms,
+                    end_ms,
+                    message,
+                    source_event_id,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_timeline_event(self, event_id: int, end_ms: int) -> bool:
+        if end_ms < 0:
+            raise ValueError("Timeline event end is invalid")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE timeline_events
+                   SET end_ms = ?
+                   WHERE id = ? AND kind = 'pause' AND end_ms = start_ms AND start_ms <= ?""",
+                (end_ms, event_id, end_ms),
+            )
+        return cursor.rowcount == 1
+
+    def timeline_events(
+        self, session_id: str, start_ms: int, end_ms: int
+    ) -> list[TimelineEventRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, session_id, kind, source, start_ms, end_ms, message,
+                          source_event_id
+                   FROM timeline_events
+                   WHERE session_id = ? AND end_ms >= ? AND start_ms <= ?
+                   ORDER BY start_ms, id""",
+                (session_id, start_ms, end_ms),
+            ).fetchall()
+        return [TimelineEventRecord(**dict(row)) for row in rows]
+
+    def confirm_data_gap(self, source_event_id: int) -> int:
+        with self.connect() as connection:
+            source = connection.execute(
+                """SELECT id, session_id, source, start_ms, end_ms, message
+                   FROM source_events WHERE id = ?""",
+                (source_event_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(f"Unknown source event: {source_event_id}")
+            existing = connection.execute(
+                """SELECT id FROM timeline_events
+                   WHERE kind = 'data_gap' AND source_event_id = ?""",
+                (source_event_id,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            cursor = connection.execute(
+                """INSERT INTO timeline_events(
+                       session_id, kind, source, start_ms, end_ms, message, source_event_id
+                   ) VALUES (?, 'data_gap', ?, ?, ?, ?, ?)""",
+                (
+                    source["session_id"],
+                    source["source"],
+                    source["start_ms"],
+                    source["end_ms"],
+                    source["message"],
+                    source_event_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE source_events SET data_loss_confirmed = 1 WHERE id = ?",
+                (source_event_id,),
+            )
+            return int(cursor.lastrowid)
 
     def add_audio_chunk(
         self, session_id: str, source: str, start_ms: int, end_ms: int, path: Path

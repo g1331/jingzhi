@@ -122,6 +122,62 @@ def test_html_warning_is_compacted_and_does_not_change_window_width(tmp_path) ->
     window.close()
 
 
+def test_pause_control_starts_disabled_when_idle(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    application.processEvents()
+
+    assert window.pause_button.isEnabled() is False
+    window.close()
+
+
+def test_start_waits_for_interrupted_workers_to_exit(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window.manager.session_id = "interrupted-session"
+    application.processEvents()
+    window.service.session_storage_busy_reason = lambda _session_id: "采集线程仍在写入"
+
+    window._refresh_recording_status()
+    assert window.start_button.isEnabled() is False
+
+    window.service.session_storage_busy_reason = lambda _session_id: None
+    window._stop_in_flight = True
+    window._refresh_recording_status()
+    assert window.start_button.isEnabled() is False
+
+    window._stop_in_flight = False
+    window._refresh_recording_status()
+    assert window.start_button.isEnabled() is True
+    window.close()
+
+
+def test_unconfirmed_source_event_is_replayed_on_session_open(tmp_path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "source-event-ui.sqlite3")
+    session_id = database.create_session("待确认缺口", "2026-08-04T00:00:00+00:00")
+    event_id = database.record_source_event(
+        session_id,
+        "microphone",
+        "device_unavailable",
+        1_000,
+        3_000,
+        "设备已拔出",
+    )
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    monkeypatch.setattr(
+        "jingzhi.ui.QMessageBox.question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    application.processEvents()
+
+    events = database.timeline_events(session_id, 0, 10_000)
+    assert [(event.kind, event.source_event_id) for event in events] == [("data_gap", event_id)]
+    window.close()
+
+
 def test_saving_provider_keeps_role_models(tmp_path, monkeypatch) -> None:
     stored_secret: dict[str, str] = {}
     monkeypatch.setattr(

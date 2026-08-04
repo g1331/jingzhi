@@ -38,8 +38,10 @@ class ScreenCaptureWorker(threading.Thread):
         stop_event: threading.Event,
         interval_s: float,
         hash_distance: int,
+        pause_event: threading.Event | None = None,
         on_frame: Callable[[int, Path], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_failure: Callable[[str, str, int, int, str], None] | None = None,
         capture_factory: Callable[[], AbstractContextManager] | None = None,
     ) -> None:
         super().__init__(name=f"screen-{display.id}", daemon=True)
@@ -49,13 +51,17 @@ class ScreenCaptureWorker(threading.Thread):
         self.display = display
         self.output_dir = output_dir
         self.stop_event = stop_event
+        self.pause_event = pause_event or threading.Event()
         self.interval_s = interval_s
         self.hash_distance = hash_distance
         self.on_frame = on_frame
         self.on_error = on_error
+        self.on_failure = on_failure
         self.capture_factory = capture_factory
 
     def run(self) -> None:
+        last_success_ms = self.clock.now_ms()
+        capture_opened = False
         try:
             if self.capture_factory is None:
                 from mss import MSS
@@ -67,8 +73,17 @@ class ScreenCaptureWorker(threading.Thread):
             self.output_dir.mkdir(parents=True, exist_ok=True)
             previous_hash: int | None = None
             with capture_factory() as capture:
+                capture_opened = True
                 while not self.stop_event.is_set():
+                    while self.pause_event.is_set() and not self.stop_event.is_set():
+                        last_success_ms = self.clock.now_ms()
+                        self.stop_event.wait(0.1)
+                    if self.stop_event.is_set():
+                        break
                     shot = capture.grab(self.display.monitor)
+                    if self.pause_event.is_set():
+                        continue
+                    last_success_ms = self.clock.now_ms()
                     image = Image.frombytes("RGB", shot.size, shot.rgb)
                     image_hash = average_hash(image)
                     distance = (
@@ -94,5 +109,17 @@ class ScreenCaptureWorker(threading.Thread):
                     self.stop_event.wait(self.interval_s)
         except Exception as exc:  # a capture worker must report failure without killing the UI
             logger.exception("Screen capture failed for %s", self.display.id)
-            if self.on_error:
-                self.on_error(f"显示来源“{self.display.name}”采集失败：{exc}")
+            if self.stop_event.is_set():
+                return
+            detail = str(exc).strip() or type(exc).__name__
+            message = f"显示来源“{self.display.name}”采集失败：{detail}"
+            if self.on_failure:
+                self.on_failure(
+                    self.display.id,
+                    "failure" if capture_opened else "device_unavailable",
+                    last_success_ms,
+                    self.clock.now_ms(),
+                    message,
+                )
+            elif self.on_error:
+                self.on_error(message)

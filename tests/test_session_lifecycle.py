@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import queue
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from jingzhi.application import JingzhiApplicationService
-from jingzhi.database import Database, ModelInvocationEvidenceRecord
+from jingzhi.application import JingzhiApplicationService, RecordingStatus
+from jingzhi.config import Settings
+from jingzhi.database import Database, ModelInvocationEvidenceRecord, TimelineEventKind
+from jingzhi.session import SessionManager
 from jingzhi.whisper_settings import WhisperSettings
 
 
@@ -22,6 +27,71 @@ class ActiveRecorder(IdleRecorder):
 class BusyRecorder(IdleRecorder):
     def storage_busy_reason(self) -> str:
         return "会话采集线程仍在写入数据"
+
+
+class LifecycleRecorder:
+    def __init__(self, database: Database, now: datetime) -> None:
+        self.database = database
+        self.now = now
+        self.session_id: str | None = None
+        self.is_paused = False
+        self.pause_event_id: int | None = None
+        self.pause_ms = 0
+        self.selection = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self.session_id is not None
+
+    def start(self, title: str, *, selection=None) -> str:  # type: ignore[no-untyped-def]
+        self.selection = selection
+        self.session_id = self.database.create_session(title, self.now.isoformat())
+        return self.session_id
+
+    def pause(self) -> bool:
+        if not self.is_recording or self.is_paused:
+            return False
+        assert self.session_id is not None
+        self.pause_ms += 1_000
+        self.pause_event_id = self.database.add_timeline_event(
+            self.session_id,
+            TimelineEventKind.PAUSE,
+            None,
+            self.pause_ms,
+            self.pause_ms,
+            "用户主动暂停，所有来源停止采集",
+        )
+        self.is_paused = True
+        return True
+
+    def resume(self) -> bool:
+        if not self.is_recording or not self.is_paused:
+            return False
+        assert self.pause_event_id is not None
+        self.pause_ms += 2_000
+        assert self.database.finish_timeline_event(self.pause_event_id, self.pause_ms)
+        self.is_paused = False
+        return True
+
+    def recording_status(self) -> RecordingStatus:
+        return RecordingStatus(
+            "paused" if self.is_paused else "recording" if self.is_recording else "idle",
+            self.pause_ms,
+            1,
+            False,
+            False,
+        )
+
+    def stop(self) -> str | None:
+        if not self.is_recording:
+            return None
+        if self.is_paused:
+            assert self.resume()
+        session_id = self.session_id
+        assert session_id is not None
+        self.database.finish_session(session_id, self.now.isoformat(), "complete")
+        self.session_id = None
+        return session_id
 
 
 def _service(database: Database, now: list[datetime]) -> JingzhiApplicationService:
@@ -514,3 +584,102 @@ def test_stopped_session_is_not_treated_as_current_and_can_be_deleted(tmp_path: 
     assert service.list_sessions()[0].id == session_id
     service.delete_session(session_id)
     assert service.list_sessions(status="trash")[0].id == session_id
+
+
+def test_application_service_pause_resume_and_repeated_stop_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    database = Database(tmp_path / "pause.sqlite3")
+    recorder = LifecycleRecorder(database, now)
+    service = JingzhiApplicationService(database, recorder=recorder, now=lambda: now)
+
+    session_id = service.start_session("可暂停会话")
+    assert service.recording_status().state == "recording"
+    assert service.pause_session() is True
+    assert service.pause_session() is False
+    assert service.recording_status().state == "paused"
+    assert service.resume_session() is True
+    assert service.resume_session() is False
+    assert service.recording_status().state == "recording"
+
+    events = database.timeline_events(session_id, 0, 10_000)
+    assert [(event.kind, event.start_ms, event.end_ms) for event in events] == [
+        ("pause", 1_000, 3_000)
+    ]
+    assert service.stop_session() == session_id
+    assert service.stop_session() is None
+
+
+def test_confirmed_source_failure_becomes_a_gap_only_after_confirmation(tmp_path: Path) -> None:
+    errors: list[str] = []
+    manager = SessionManager(Settings(data_dir=tmp_path), on_error=errors.append)
+    session_id = manager.database.create_session("来源故障", "2026-08-04T12:00:00+00:00")
+    manager.session_id = session_id
+    service = JingzhiApplicationService(manager.database, recorder=manager)
+
+    manager._source_failure("microphone", "device_unavailable", 2_000, 4_000, "设备已拔出")
+
+    source_events = service.source_events(session_id)
+    assert len(source_events) == 1
+    assert source_events[0].data_loss_confirmed is False
+    assert service.open_session(session_id, window_start_ms=0).events == ()
+    assert errors and "设备已拔出" in errors[0]
+
+    gap_id = service.confirm_data_gap(session_id, source_events[0].id)
+    assert service.confirm_data_gap(session_id, source_events[0].id) == gap_id
+    events = service.open_session(session_id, window_start_ms=0).events
+    assert [(event.kind, event.source_event_id) for event in events] == [
+        ("data_gap", source_events[0].id)
+    ]
+    assert service.source_events(session_id)[0].data_loss_confirmed is True
+
+
+def test_source_failure_can_retry_after_persistence_error(tmp_path: Path) -> None:
+    errors: list[str] = []
+    manager = SessionManager(Settings(data_dir=tmp_path), on_error=errors.append)
+    session_id = manager.database.create_session("来源故障重试", "2026-08-04T12:00:00+00:00")
+    manager.session_id = session_id
+    original_record_source_event = manager.database.record_source_event
+    attempts = 0
+
+    def flaky_record_source_event(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("database is temporarily unavailable")
+        return original_record_source_event(*args, **kwargs)
+
+    manager.database.record_source_event = flaky_record_source_event  # type: ignore[method-assign]
+
+    manager._source_failure("microphone", "failure", 2_000, 4_000, "写入失败")
+    manager._source_failure("microphone", "failure", 2_000, 4_000, "写入失败")
+
+    events = manager.database.source_events(session_id)
+    assert len(events) == 1
+    assert attempts == 2
+    assert errors and "无法写入本地存储" in errors[0]
+
+
+def test_stop_with_live_capture_worker_marks_session_interrupted(tmp_path: Path) -> None:
+    class LiveWorker:
+        def join(self, *, timeout: float) -> None:
+            assert timeout > 0
+
+        def is_alive(self) -> bool:
+            return True
+
+    manager = SessionManager(Settings(data_dir=tmp_path))
+    session_id = manager.database.create_session("异常结束", "2026-08-04T12:00:00+00:00")
+    manager.session_id = session_id
+    manager.clock = SimpleNamespace(now_ms=lambda: 1_000)
+    manager.stop_event = threading.Event()
+    manager.chunk_queue = queue.Queue()
+    manager.workers = [LiveWorker()]
+
+    service = JingzhiApplicationService(manager.database, recorder=manager)
+    assert service.stop_session() == session_id
+    session = manager.database.get_session(session_id)
+    assert session is not None
+    assert session.status == "interrupted"
+    assert manager.storage_busy_reason() == "会话采集线程仍在写入数据"

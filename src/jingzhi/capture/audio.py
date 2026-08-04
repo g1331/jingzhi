@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ from jingzhi.clock import SessionClock
 from jingzhi.database import Database
 
 logger = logging.getLogger(__name__)
+_SOUNDCARD_WARNING_LOCK = threading.Lock()
+EMPTY_STREAM_TIMEOUT_MS = 5_000
+OVERFLOW_TIMEOUT_MS = 5_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,7 @@ class SoundDeviceMicrophoneRecorder:
         self.device_index = device_index
         self.sample_rate = requested_sample_rate
         self._stream = None
+        self.last_overflowed = False
 
     def __enter__(self) -> Self:
         import sounddevice as sd
@@ -92,6 +97,7 @@ class SoundDeviceMicrophoneRecorder:
         if self._stream is None:
             raise RuntimeError("麦克风输入流尚未启动")
         data, overflowed = self._stream.read(numframes)
+        self.last_overflowed = bool(overflowed)
         if overflowed:
             logger.warning("Microphone input overflowed; some samples may be missing")
         return data.copy()
@@ -120,6 +126,7 @@ class SelectedMicrophoneRecorder:
         self.sample_rate = requested_sample_rate
         self._context = None
         self._recorder = None
+        self.last_overflowed = False
 
     def __enter__(self) -> Self:
         import soundcard as sc
@@ -146,7 +153,12 @@ class SelectedMicrophoneRecorder:
     def record(self, numframes: int) -> np.ndarray:
         if self._recorder is None:
             raise RuntimeError("麦克风输入流尚未启动")
-        return self._recorder.record(numframes=numframes)
+        data = self._recorder.record(numframes=numframes)
+        self.last_overflowed = bool(
+            getattr(self._recorder, "last_overflowed", False)
+            or getattr(self._context, "last_overflowed", False)
+        )
+        return data
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[no-untyped-def]
         if self._context is not None:
@@ -291,7 +303,9 @@ class AudioCaptureWorker(threading.Thread):
         sample_rate: int,
         storage_sample_rate: int,
         chunk_s: float,
+        pause_event: threading.Event | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_failure: Callable[[str, str, int, int, str], None] | None = None,
     ) -> None:
         super().__init__(name=f"audio-{source}", daemon=True)
         self.database = database
@@ -302,11 +316,14 @@ class AudioCaptureWorker(threading.Thread):
         self.device_catalog = device_catalog
         self.output_dir = output_dir
         self.stop_event = stop_event
+        self.pause_event = pause_event if pause_event is not None else threading.Event()
         self.chunk_queue = chunk_queue
         self.sample_rate = sample_rate
         self.storage_sample_rate = storage_sample_rate
         self.chunk_s = chunk_s
         self.on_error = on_error
+        self.on_failure = on_failure
+        self._last_success_ms = 0
 
     def _open_recorder(self):
         import soundcard as sc
@@ -325,52 +342,127 @@ class AudioCaptureWorker(threading.Thread):
         loopback = sc.get_microphone(speaker.id, include_loopback=True)
         return loopback.recorder(samplerate=self.sample_rate, blocksize=8192)
 
-    def run(self) -> None:
-        try:
-            with self._open_recorder() as recorder:
-                active_sample_rate = int(getattr(recorder, "sample_rate", self.sample_rate))
-                frames_per_chunk = int(active_sample_rate * self.chunk_s)
-                block_frames = min(4096, frames_per_chunk)
-                while not self.stop_event.is_set():
-                    start_ms = self.clock.now_ms()
-                    blocks: list[np.ndarray] = []
-                    received = 0
-                    while received < frames_per_chunk and not self.stop_event.is_set():
-                        block = recorder.record(
-                            numframes=min(block_frames, frames_per_chunk - received)
+    def _report_failure(self, kind: str, start_ms: int, end_ms: int, message: str) -> None:
+        if self.on_failure:
+            self.on_failure(self.source, kind, start_ms, end_ms, message)
+        elif self.on_error:
+            source_name = "麦克风" if self.source == "microphone" else "系统声音"
+            self.on_error(f"{source_name}采集不可用：{message}")
+
+    @staticmethod
+    def _record_block(recorder: Any, numframes: int) -> tuple[np.ndarray, bool]:
+        # warnings filters and showwarning are process-global; serialize the short
+        # backend call so concurrent audio workers cannot steal each other's warning.
+        with _SOUNDCARD_WARNING_LOCK, warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            block = recorder.record(numframes=numframes)
+        overflowed = bool(getattr(recorder, "last_overflowed", False)) or any(
+            warning.category.__name__ == "SoundcardRuntimeWarning" for warning in caught_warnings
+        )
+        return block, overflowed
+
+    def _capture_open_recorder(self, recorder: Any) -> bool:
+        active_sample_rate = int(getattr(recorder, "sample_rate", self.sample_rate))
+        frames_per_chunk = int(active_sample_rate * self.chunk_s)
+        block_frames = min(4096, frames_per_chunk)
+        empty_started_ms: int | None = None
+        overflow_started_ms: int | None = None
+        while not self.stop_event.is_set() and not self.pause_event.is_set():
+            start_ms = self.clock.now_ms()
+            blocks: list[np.ndarray] = []
+            received = 0
+            while (
+                received < frames_per_chunk
+                and not self.stop_event.is_set()
+                and not self.pause_event.is_set()
+            ):
+                block, overflowed = self._record_block(
+                    recorder, min(block_frames, frames_per_chunk - received)
+                )
+                now_ms = self.clock.now_ms()
+                self._last_success_ms = now_ms
+                if overflowed:
+                    if overflow_started_ms is None:
+                        overflow_started_ms = now_ms
+                    elif now_ms - overflow_started_ms >= OVERFLOW_TIMEOUT_MS:
+                        self._report_failure(
+                            "overflow",
+                            overflow_started_ms,
+                            now_ms,
+                            "音频来源持续溢出，可能存在数据缺失",
                         )
-                        if block.size:
-                            blocks.append(block)
-                            received += len(block)
-                    if not blocks:
-                        continue
-                    samples = np.concatenate(blocks)
-                    end_ms = self.clock.now_ms()
-                    path = self.output_dir / self.source / f"{start_ms:012d}-{end_ms:012d}.flac"
-                    _write_flac(path, samples, active_sample_rate, self.storage_sample_rate)
-                    chunk_id = self.database.add_audio_chunk(
-                        self.session_id, self.source, start_ms, end_ms, path
+                        return False
+                else:
+                    overflow_started_ms = None
+                if block.size:
+                    blocks.append(block)
+                    received += len(block)
+                else:
+                    break
+            paused = self.pause_event.is_set()
+            if paused and not blocks:
+                return True
+            if not blocks:
+                now_ms = self.clock.now_ms()
+                if empty_started_ms is None:
+                    empty_started_ms = now_ms
+                elif now_ms - empty_started_ms >= EMPTY_STREAM_TIMEOUT_MS:
+                    self._report_failure(
+                        "stream_stopped",
+                        empty_started_ms,
+                        now_ms,
+                        "音频来源持续无数据",
                     )
-                    chunk = AudioChunk(
-                        id=chunk_id,
-                        session_id=self.session_id,
-                        source=self.source,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        path=path,
-                    )
-                    try:
-                        self.chunk_queue.put_nowait(chunk)
-                    except queue.Full:
-                        # The chunk is already durable and remains "pending" for recovery.
-                        # Capture must not deadlock merely because transcription is slower.
-                        message = f"Transcription queue is full; {path.name} remains pending"
-                        logger.warning(message)
-                        if self.on_error:
-                            self.on_error(message)
+                    return False
+                continue
+            empty_started_ms = None
+            if paused:
+                overflow_started_ms = None
+            samples = np.concatenate(blocks)
+            end_ms = self.clock.now_ms()
+            path = self.output_dir / self.source / f"{start_ms:012d}-{end_ms:012d}.flac"
+            _write_flac(path, samples, active_sample_rate, self.storage_sample_rate)
+            chunk_id = self.database.add_audio_chunk(
+                self.session_id, self.source, start_ms, end_ms, path
+            )
+            chunk = AudioChunk(
+                id=chunk_id,
+                session_id=self.session_id,
+                source=self.source,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                path=path,
+            )
+            try:
+                self.chunk_queue.put_nowait(chunk)
+            except queue.Full:
+                # The chunk is already durable and remains "pending" for recovery.
+                # Capture must not deadlock merely because transcription is slower.
+                message = f"Transcription queue is full; {path.name} remains pending"
+                logger.warning(message)
+                if self.on_error:
+                    self.on_error(message)
+        return True
+
+    def run(self) -> None:
+        self._last_success_ms = self.clock.now_ms()
+        recorder_opened = False
+        try:
+            while not self.stop_event.is_set():
+                while self.pause_event.is_set() and not self.stop_event.is_set():
+                    self._last_success_ms = self.clock.now_ms()
+                    self.stop_event.wait(0.1)
+                if self.stop_event.is_set():
+                    break
+                recorder_opened = False
+                with self._open_recorder() as recorder:
+                    recorder_opened = True
+                    if not self._capture_open_recorder(recorder):
+                        return
         except Exception as exc:
             logger.exception("%s audio capture failed", self.source)
-            if self.on_error:
-                detail = str(exc).strip() or type(exc).__name__
-                source_name = "麦克风" if self.source == "microphone" else "系统声音"
-                self.on_error(f"{source_name}采集不可用：{detail}")
+            if self.stop_event.is_set():
+                return
+            detail = str(exc).strip() or type(exc).__name__
+            kind = "failure" if recorder_opened else "device_unavailable"
+            self._report_failure(kind, self._last_success_ms, self.clock.now_ms(), detail)

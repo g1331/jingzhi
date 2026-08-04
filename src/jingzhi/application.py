@@ -15,6 +15,8 @@ from jingzhi.database import (
     SessionAnswerRecord,
     SessionNotificationKind,
     SessionRecord,
+    SourceEventRecord,
+    TimelineEventRecord,
     TimelineFrameRecord,
     TimelineQuestionRecord,
     TimelineTranscriptRecord,
@@ -190,6 +192,25 @@ class RecordingAdapter(Protocol):
 
     def stop(self) -> str | None: ...
 
+    def pause(self) -> bool: ...
+
+    def resume(self) -> bool: ...
+
+    @property
+    def is_paused(self) -> bool: ...
+
+    def recording_status(self) -> RecordingStatus: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingStatus:
+    state: str
+    duration_ms: int
+    display_count: int
+    system_audio: bool
+    microphone: bool
+    failed_sources: frozenset[str] = frozenset()
+
 
 @dataclass(frozen=True, slots=True)
 class AnswerEvidenceSummary:
@@ -238,8 +259,10 @@ class SessionTimeline:
     transcripts: tuple[TimelineTranscriptRecord, ...]
     questions: tuple[TimelineQuestionRecord, ...]
     duration_ms: int
+
     window_start_ms: int
     window_end_ms: int
+    events: tuple[TimelineEventRecord, ...] = ()
     answer_frame_ids: frozenset[int] = frozenset()
     answer_transcript_ids: frozenset[int] = frozenset()
     selected_answer_id: int | None = None
@@ -299,6 +322,42 @@ class JingzhiApplicationService:
 
     def stop_session(self) -> str | None:
         return self.recorder.stop()
+
+    @property
+    def supports_pause(self) -> bool:
+        return callable(getattr(self.recorder, "pause", None)) and callable(
+            getattr(self.recorder, "resume", None)
+        )
+
+    @property
+    def is_paused(self) -> bool:
+        return bool(getattr(self.recorder, "is_paused", False))
+
+    def pause_session(self) -> bool:
+        method = getattr(self.recorder, "pause", None)
+        if not callable(method):
+            raise TypeError("当前录制适配器不支持暂停")
+        return bool(method())
+
+    def resume_session(self) -> bool:
+        method = getattr(self.recorder, "resume", None)
+        if not callable(method):
+            raise TypeError("当前录制适配器不支持恢复")
+        return bool(method())
+
+    def recording_status(self) -> RecordingStatus:
+        method = getattr(self.recorder, "recording_status", None)
+        if callable(method):
+            return method()
+        if not self.recorder.is_recording:
+            return RecordingStatus("idle", 0, 0, False, False)
+        return RecordingStatus(
+            "paused" if self.is_paused else "recording",
+            0,
+            0,
+            False,
+            False,
+        )
 
     def begin_question(self, lookback_ms: int = 2 * 60_000) -> int:
         return self.recorder.capture_question_anchor(lookback_ms)
@@ -371,6 +430,18 @@ class JingzhiApplicationService:
             raise RuntimeError(f"会话仍在写入：{busy_reason}")
         if not self.database.complete_interrupted_session(session_id, self._now_utc().isoformat()):
             raise KeyError(f"Unknown interrupted session: {session_id}")
+
+    def source_events(
+        self, session_id: str, start_ms: int = 0, end_ms: int | None = None
+    ) -> list[SourceEventRecord]:
+        return self.database.source_events(session_id, start_ms, end_ms)
+
+    @storage_writer("确认数据缺口")
+    def confirm_data_gap(self, session_id: str, source_event_id: int) -> int:
+        source_event = self.database.source_event(source_event_id)
+        if source_event is None or source_event.session_id != session_id:
+            raise KeyError(f"Unknown source event for session: {source_event_id}")
+        return self.database.confirm_data_gap(source_event_id)
 
     @storage_writer("执行会话清理")
     def run_session_maintenance(self) -> tuple[SessionNotification, ...]:
@@ -552,6 +623,7 @@ class JingzhiApplicationService:
             session=session,
             frames=tuple(self.database.timeline_frames(session_id, start_ms, end_ms)),
             transcripts=tuple(transcripts),
+            events=tuple(self.database.timeline_events(session_id, start_ms, end_ms)),
             questions=tuple(self.database.timeline_questions(session_id, start_ms, end_ms)),
             duration_ms=duration_ms,
             window_start_ms=start_ms,
