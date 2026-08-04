@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from jingzhi.transcript_correction import CORRECTION_WINDOW_MS
+from jingzhi.whisper_settings import WhisperSettings
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -110,6 +111,22 @@ CREATE TABLE IF NOT EXISTS transcript_correction_runs (
 CREATE INDEX IF NOT EXISTS transcript_correction_run_window
 ON transcript_correction_runs(session_id, window_start_ms, window_end_ms, id);
 
+CREATE TABLE IF NOT EXISTS whisper_runs (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    requested_device TEXT NOT NULL,
+    requested_compute_type TEXT NOT NULL,
+    actual_model TEXT NOT NULL,
+    actual_device TEXT NOT NULL,
+    actual_compute_type TEXT NOT NULL,
+    language TEXT NOT NULL,
+    vad_enabled INTEGER NOT NULL CHECK (vad_enabled IN (0, 1)),
+    vad_min_silence_ms INTEGER NOT NULL,
+    fallback_advice TEXT NOT NULL,
+    started_at_utc TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
     segment_id UNINDEXED, session_id UNINDEXED, text, tokenize='unicode61'
 );
@@ -210,7 +227,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -413,6 +430,23 @@ class ModelInvocationEvidenceRecord:
     end_ms: int
     transcript_version_id: int | None = None
     frame_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WhisperRunRecord:
+    session_id: str
+    profile: str
+    requested_model: str
+    requested_device: str
+    requested_compute_type: str
+    actual_model: str
+    actual_device: str
+    actual_compute_type: str
+    language: str
+    vad_enabled: bool
+    vad_min_silence_ms: int
+    fallback_advice: str
+    started_at_utc: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1246,6 +1280,50 @@ class Database:
                 (session_id, kind, created_at_utc, content_json, model),
             )
             return int(cursor.lastrowid)
+
+    def record_whisper_run(
+        self,
+        *,
+        session_id: str,
+        requested: WhisperSettings,
+        actual: WhisperSettings,
+        fallback_advice: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO whisper_runs(
+                       session_id, profile, requested_model, requested_device,
+                       requested_compute_type, actual_model, actual_device,
+                       actual_compute_type, language, vad_enabled, vad_min_silence_ms,
+                       fallback_advice, started_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    requested.profile.value,
+                    requested.model,
+                    requested.device,
+                    requested.compute_type,
+                    actual.model,
+                    actual.device,
+                    actual.compute_type,
+                    actual.language,
+                    int(actual.vad_enabled),
+                    actual.vad_min_silence_ms,
+                    fallback_advice,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def whisper_run(self, session_id: str) -> WhisperRunRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM whisper_runs WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["vad_enabled"] = bool(values["vad_enabled"])
+        return WhisperRunRecord(**values)
 
     def start_model_invocation(
         self,

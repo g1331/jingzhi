@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from jingzhi.application import QuestionAnsweringService
@@ -27,6 +28,17 @@ from jingzhi.transcript_correction import (
     CorrectionWindowBatcher,
     TranscriptCorrectionProcessor,
 )
+from jingzhi.whisper_settings import (
+    BenchmarkResult,
+    DownloadState,
+    WhisperBenchmark,
+    WhisperCapabilities,
+    WhisperModelDownloader,
+    WhisperSettings,
+    WhisperSettingsStore,
+    detect_whisper_capabilities,
+    resolve_whisper_settings,
+)
 
 
 class SessionManager:
@@ -37,6 +49,7 @@ class SessionManager:
         on_segment: Callable[[int, int, str, str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         device_catalog: DeviceCatalog | None = None,
+        whisper_capabilities: WhisperCapabilities | None = None,
     ) -> None:
         self.settings = settings
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +71,12 @@ class SessionManager:
         self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
         self.correction_flush_event = threading.Event()
         self.provider_settings_store = ProviderSettingsStore(settings.data_dir)
+        self.whisper_settings_store = WhisperSettingsStore(settings.data_dir)
+        self.whisper_settings = settings.whisper
+        self.whisper_capabilities = whisper_capabilities or detect_whisper_capabilities()
+        self.actual_whisper_settings = resolve_whisper_settings(
+            self.whisper_settings, self.whisper_capabilities
+        ).settings
         self.last_question_id: int | None = None
         self.pending_question_id: int | None = None
         self.question_voice_recorder: QuestionVoiceRecorder | None = None
@@ -111,6 +130,38 @@ class SessionManager:
 
     def save_provider(self) -> None:
         self.provider_settings_store.save(self.provider_settings)
+
+    def configure_whisper(self, settings: WhisperSettings) -> str:
+        if self.is_recording:
+            raise RuntimeError("Cannot change Whisper settings during a recording")
+        resolved = resolve_whisper_settings(settings, self.whisper_capabilities)
+        self.whisper_settings = settings
+        self.actual_whisper_settings = resolved.settings
+        self.question_transcriber = None
+        return resolved.fallback_advice
+
+    def save_whisper(self) -> None:
+        self.whisper_settings_store.save(self.whisper_settings)
+
+    def benchmark_whisper(self, sample_path) -> BenchmarkResult:  # type: ignore[no-untyped-def]
+        resolved = resolve_whisper_settings(self.whisper_settings, self.whisper_capabilities)
+        result = WhisperBenchmark().run(resolved.settings, sample_path)
+        self.whisper_settings = replace(self.whisper_settings, first_run_completed=True)
+        self.actual_whisper_settings = resolved.settings
+        self.save_whisper()
+        return result
+
+    def prepare_whisper_model(
+        self,
+        *,
+        on_progress: Callable[[DownloadState], None],
+        cancel_event: threading.Event,
+    ) -> DownloadState:
+        return WhisperModelDownloader().prepare(
+            self.whisper_settings.model,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
 
     @property
     def is_recording(self) -> bool:
@@ -171,6 +222,16 @@ class SessionManager:
         self.last_question_id = None
         self.pending_question_id = None
         self.chunk_queue = chunk_queue
+        resolved_whisper = resolve_whisper_settings(
+            self.whisper_settings, self.whisper_capabilities
+        )
+        self.actual_whisper_settings = resolved_whisper.settings
+        self.database.record_whisper_run(
+            session_id=session_id,
+            requested=self.whisper_settings,
+            actual=self.actual_whisper_settings,
+            fallback_advice=resolved_whisper.fallback_advice,
+        )
         self.database.configure_transcript_correction(
             session_id,
             enabled=self.correction_enabled,
@@ -218,9 +279,7 @@ class SessionManager:
         self.transcriber = TranscriptionWorker(
             database=self.database,
             chunk_queue=chunk_queue,
-            model_name=self.settings.whisper_model,
-            device=self.settings.whisper_device,
-            compute_type=self.settings.whisper_compute_type,
+            settings=self.actual_whisper_settings,
             on_segment=self.on_segment,
             on_persisted_segment=self._enqueue_correction,
             on_recognition_started=(
@@ -387,11 +446,9 @@ class SessionManager:
         self.question_voice_recorder = None
         path = recorder.stop()
         if self.question_transcriber is None:
-            self.question_transcriber = WhisperQuestionTranscriber(
-                self.settings.whisper_model,
-                self.settings.whisper_device,
-                self.settings.whisper_compute_type,
-            )
+            resolved = resolve_whisper_settings(self.whisper_settings, self.whisper_capabilities)
+            self.actual_whisper_settings = resolved.settings
+            self.question_transcriber = WhisperQuestionTranscriber(self.actual_whisper_settings)
         try:
             return self.question_transcriber.transcribe(path)
         finally:

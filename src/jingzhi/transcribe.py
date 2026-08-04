@@ -8,26 +8,20 @@ from pathlib import Path
 
 from jingzhi.capture.audio import AudioChunk
 from jingzhi.database import Database
+from jingzhi.whisper_settings import WhisperSettings, whisper_transcribe_options
 
 logger = logging.getLogger(__name__)
 
 
-def _transcribe_audio(model, path: Path):  # type: ignore[no-untyped-def]
-    return model.transcribe(
-        str(path),
-        beam_size=1,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 400},
-    )
+def _transcribe_audio(model, path: Path, settings: WhisperSettings):  # type: ignore[no-untyped-def]
+    return model.transcribe(str(path), **whisper_transcribe_options(settings))
 
 
 class WhisperQuestionTranscriber:
     """Transcribes a completed question clip without persisting it as session evidence."""
 
-    def __init__(self, model_name: str, device: str, compute_type: str) -> None:
-        self.model_name = model_name
-        self.device = device
-        self.compute_type = compute_type
+    def __init__(self, settings: WhisperSettings) -> None:
+        self.settings = settings
         self._model = None
 
     def transcribe(self, path: Path) -> str:
@@ -35,9 +29,11 @@ class WhisperQuestionTranscriber:
             from faster_whisper import WhisperModel
 
             self._model = WhisperModel(
-                self.model_name, device=self.device, compute_type=self.compute_type
+                self.settings.model,
+                device=self.settings.device,
+                compute_type=self.settings.compute_type,
             )
-        segments, _info = _transcribe_audio(self._model, path)
+        segments, _info = _transcribe_audio(self._model, path, self.settings)
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
         if not text:
             raise RuntimeError("No speech was recognized in the question recording")
@@ -50,9 +46,7 @@ class TranscriptionWorker(threading.Thread):
         *,
         database: Database,
         chunk_queue: queue.Queue[AudioChunk | None],
-        model_name: str,
-        device: str,
-        compute_type: str,
+        settings: WhisperSettings,
         on_segment: Callable[[int, int, str, str], None] | None = None,
         on_persisted_segment: Callable[[str, int, int], None] | None = None,
         on_recognition_started: Callable[[int, int, str], None] | None = None,
@@ -61,9 +55,7 @@ class TranscriptionWorker(threading.Thread):
         super().__init__(name="transcription", daemon=True)
         self.database = database
         self.chunk_queue = chunk_queue
-        self.model_name = model_name
-        self.device = device
-        self.compute_type = compute_type
+        self.settings = settings
         self.on_segment = on_segment
         self.on_persisted_segment = on_persisted_segment
         self.on_recognition_started = on_recognition_started
@@ -74,7 +66,9 @@ class TranscriptionWorker(threading.Thread):
             from faster_whisper import WhisperModel
 
             model = WhisperModel(
-                self.model_name, device=self.device, compute_type=self.compute_type
+                self.settings.model,
+                device=self.settings.device,
+                compute_type=self.settings.compute_type,
             )
         except Exception as exc:
             logger.exception("Could not initialize transcription model")
@@ -90,7 +84,7 @@ class TranscriptionWorker(threading.Thread):
             try:
                 if self.on_recognition_started:
                     self.on_recognition_started(chunk.start_ms, chunk.end_ms, chunk.source)
-                segments, info = _transcribe_audio(model, chunk.path)
+                segments, info = _transcribe_audio(model, chunk.path, self.settings)
                 persisted_segments: list[tuple[int, int, str, str]] = []
                 correction_candidates: list[tuple[str, int, int]] = []
                 for segment in segments:
