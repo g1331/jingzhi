@@ -11,6 +11,7 @@ from jingzhi.provider_settings import (
     default_saved_settings,
 )
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
+from jingzhi.whisper_settings import WhisperSettings, WhisperSettingsStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,9 +22,7 @@ class Settings:
     audio_capture_rate: int = 48_000
     audio_storage_rate: int = 16_000
     audio_chunk_s: float = 8.0
-    whisper_model: str = "small"
-    whisper_device: str = "cpu"
-    whisper_compute_type: str = "int8"
+    whisper: WhisperSettings = field(default_factory=WhisperSettings)
     provider_settings: SavedProviderSettings = field(default_factory=default_saved_settings)
     capture_microphone: bool = True
     capture_system_audio: bool = True
@@ -34,6 +33,16 @@ class Settings:
     def from_env(cls) -> Settings:
         data_dir = Path(os.getenv("STUDY_DATA_DIR", "data")).resolve()
         saved = ProviderSettingsStore(data_dir).load()
+        whisper = WhisperSettingsStore(data_dir).load()
+        whisper_overrides = {
+            "model": os.getenv("WHISPER_MODEL"),
+            "device": os.getenv("WHISPER_DEVICE"),
+            "compute_type": os.getenv("WHISPER_COMPUTE_TYPE"),
+        }
+        whisper = replace(
+            whisper,
+            **{name: value for name, value in whisper_overrides.items() if value},
+        )
         connections = list(saved.connections or default_saved_settings().connections)
         primary = connections[0]
         primary = replace(
@@ -61,8 +70,6 @@ class Settings:
         )
         return cls(
             data_dir=data_dir,
-            whisper_model=os.getenv("WHISPER_MODEL", "small"),
-            whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
-            whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
+            whisper=whisper,
             provider_settings=provider_settings,
         )

@@ -84,6 +84,7 @@ from jingzhi.recording_settings import (
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
+from jingzhi.whisper_ui import WhisperSettingsDialog
 
 logger = logging.getLogger(__name__)
 
@@ -676,6 +677,12 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
         self._refresh_sessions()
+        self._whisper_dialog: WhisperSettingsDialog | None = None
+        if (
+            callable(getattr(self.manager, "configure_whisper", None))
+            and not self.manager.whisper_settings.first_run_completed
+        ):
+            QTimer.singleShot(0, self._show_whisper_settings)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -780,6 +787,9 @@ class MainWindow(QMainWindow):
         self.summary_button.setProperty("role", "primary")
         self.provider_toggle_button = QPushButton("模型连接")
         self.provider_toggle_button.setProperty("role", "quiet")
+        self.whisper_settings_button = QPushButton("本地 Whisper")
+        self.whisper_settings_button.setProperty("role", "quiet")
+        header.addWidget(self.whisper_settings_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.provider_toggle_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.summary_button, alignment=Qt.AlignmentFlag.AlignBottom)
         panel_layout.addLayout(header)
@@ -1683,6 +1693,16 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(self.output, 1)
         return panel
 
+    @Slot()
+    def _show_whisper_settings(self) -> None:
+        if not callable(getattr(self.manager, "configure_whisper", None)):
+            return
+        if self._whisper_dialog is None:
+            self._whisper_dialog = WhisperSettingsDialog(self.manager, self)
+        self._whisper_dialog.show()
+        self._whisper_dialog.raise_()
+        self._whisper_dialog.activateWindow()
+
     def _connect_signals(self) -> None:
         self.session_library.currentItemChanged.connect(
             lambda current, _previous: self._select_session_item(current)
@@ -1721,6 +1741,7 @@ class MainWindow(QMainWindow):
         self.provider_toggle_button.clicked.connect(
             lambda: self.provider_group.setVisible(not self.provider_group.isVisible())
         )
+        self.whisper_settings_button.clicked.connect(self._show_whisper_settings)
         self.output.render_failed.connect(self._show_worker_warning)
         self.bridge.segment.connect(self._append_segment)
         self.bridge.worker_warning.connect(self._show_worker_warning)
@@ -2405,6 +2426,12 @@ class MainWindow(QMainWindow):
                 save_provider()
             except Exception:
                 logger.exception("Could not save provider settings while closing")
+        save_whisper = getattr(self.manager, "save_whisper", None)
+        if callable(save_whisper):
+            try:
+                save_whisper()
+            except Exception:
+                logger.exception("Could not save Whisper settings while closing")
         if self.service.is_recording:
             self.service.stop_session()
         event.accept()

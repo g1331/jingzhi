@@ -119,7 +119,7 @@ uv sync --extra dev
 uv run jingzhi
 ```
 
-首次启动会下载 Whisper `small` 模型。界面顶部可直接填写 `Base URL`、`API Key`、`Model`，并选择 `Responses API` 或 `Chat Completions`。点击“保存配置”后，Base URL、模型和接口类型写入 `data/provider.json`，API Key 单独写入 Windows 凭据管理器，不会以明文进入配置文件或 SQLite；下次启动会自动回填。测试连接成功以及正常关闭窗口时也会自动保存。没有 API 密钥时，本地采集和字幕仍可使用，提问与总结会给出明确错误。回答区域支持 Markdown，以及 `$...$`、`$$...$$`、`\(...\)` 和 `\[...\]` 形式的 LaTeX 公式；渲染资源均随应用保存在本地。
+首次启动会打开“本地 Whisper 设置”。用户可选择轻量（`base`/CPU `int8`）、均衡（`small`/自动设备）或准确（`medium`/自动设备）档位，并查看处理器、显卡、内存和磁盘影响；高级设置可覆盖模型、设备、计算精度、语言和 VAD。模型下载界面显示磁盘需求、进度、取消和失败重试状态；内置中文样本测试展示识别文字、处理耗时、实时系数、CPU 时间和峰值内存。设置保存到 `data/whisper.json`，每个会话实际使用的模型、设备、精度和回退原因写入 SQLite。界面顶部还可配置模型连接的 `Base URL`、`API Key`、模型和接口类型；公开配置写入 `data/provider.json`，API Key 单独写入 Windows 凭据管理器。没有 API 密钥时，本地采集和字幕仍可使用，提问与总结会给出明确错误。回答区域支持 Markdown，以及 `$...$`、`$$...$$`、`\(...\)` 和 `\[...\]` 形式的 LaTeX 公式；渲染资源均随应用保存在本地。
 
 建议先点击“测试连接”。如果 Provider 返回网页源码，应用会给出简短提示，而不会把整页 HTML 显示到界面。开始记录前可以分别启用或关闭“系统声音”和“麦克风”；没有可用麦克风时，关闭麦克风仍可继续记录系统声音和屏幕。详细异常保存在 `data/logs/app.log`。
 
@@ -135,7 +135,7 @@ $env:OPENAI_API_MODE = "chat_completions" # 或 responses
 uv run jingzhi
 ```
 
-有 NVIDIA GPU 时可在启动前设置：
+Whisper 设置通常通过界面保存；环境变量可在单次启动时覆盖设备和计算精度，例如 NVIDIA GPU：
 
 ```powershell
 $env:WHISPER_DEVICE = "cuda"
