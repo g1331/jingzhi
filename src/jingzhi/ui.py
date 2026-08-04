@@ -38,7 +38,12 @@ from PySide6.QtWidgets import (
 
 from jingzhi.application import JingzhiApplicationService, SessionTimeline, present_answer
 from jingzhi.config import Settings
-from jingzhi.database import SessionAnswerRecord, TimelineFrameRecord, TimelineTranscriptRecord
+from jingzhi.database import (
+    AnswerEvidenceRecord,
+    SessionAnswerRecord,
+    TimelineFrameRecord,
+    TimelineTranscriptRecord,
+)
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
@@ -776,6 +781,8 @@ class MainWindow(QMainWindow):
         answer = self._answers_by_id.get(timeline.selected_answer_id or -1)
         if answer is None:
             self.answer_evidence_status.hide()
+            self._clear_layout(self.answer_evidence_layout)
+            self.answer_evidence_entries.hide()
             self.output.set_markdown("")
             self._last_answer = ""
             self.speak_button.setEnabled(False)
@@ -807,6 +814,7 @@ class MainWindow(QMainWindow):
         self.answer_evidence_status.style().unpolish(self.answer_evidence_status)
         self.answer_evidence_status.style().polish(self.answer_evidence_status)
         self.answer_evidence_status.show()
+        self._render_answer_evidence_entries(answer.id)
 
         if answer.answer:
             content = present_answer(answer.answer, summary)
@@ -815,6 +823,97 @@ class MainWindow(QMainWindow):
         self._last_answer = content
         self.output.set_markdown(content)
         self.speak_button.setEnabled(bool(answer.answer and answer.answer.strip()))
+
+    def _render_answer_evidence_entries(self, answer_version_id: int) -> None:
+        self._clear_layout(self.answer_evidence_layout)
+        if self._selected_session_id is None:
+            self.answer_evidence_entries.hide()
+            return
+        evidence = self.service.answer_evidence_entries(
+            self._selected_session_id, answer_version_id
+        )
+        for item in evidence:
+            button = QPushButton(self._answer_evidence_label(item))
+            button.setObjectName(f"answer-evidence-{item.ordinal}")
+            button.setProperty("role", "quiet")
+            button.setProperty("stableId", item.stable_id)
+            button.setToolTip(f"定位证据：{item.stable_id}")
+            button.clicked.connect(
+                lambda _checked=False, answer_id=answer_version_id, stable_id=item.stable_id: (
+                    self._navigate_to_answer_evidence(answer_id, stable_id)
+                )
+            )
+            self.answer_evidence_layout.addWidget(button)
+        self.answer_evidence_entries.setVisible(bool(evidence))
+
+    def _answer_evidence_label(self, evidence: AnswerEvidenceRecord) -> str:
+        kind = "关键帧" if evidence.kind == "frame" else "字幕"
+        return f"{kind} · {self._format_time(evidence.start_ms)} · {evidence.source}"
+
+    def _navigate_to_answer_evidence(self, answer_version_id: int, stable_id: str) -> None:
+        if self._selected_session_id is None:
+            return
+        try:
+            target = self.service.resolve_answer_evidence(
+                self._selected_session_id, answer_version_id, stable_id
+            )
+        except (KeyError, LookupError, PermissionError, ValueError) as exc:
+            self._show_evidence_navigation_error(str(exc))
+            return
+
+        target_ms = target.ts_ms if isinstance(target, TimelineFrameRecord) else target.start_ms
+        self._zoom_key = "1-minute"
+        zoom_button = self.findChild(QPushButton, "zoom-1-minute")
+        if zoom_button is not None:
+            zoom_button.setChecked(True)
+        self._window_start_ms = max(0, target_ms - 30_000)
+        current = self.session_library.currentItem()
+        if current is None:
+            return
+        self._open_session_item(current)
+
+        if self._timeline is None:
+            return
+        if isinstance(target, TimelineFrameRecord):
+            visible = next((item for item in self._timeline.frames if item.id == target.id), None)
+            object_name = f"keyframe-{target.id}"
+        else:
+            visible = next(
+                (
+                    item
+                    for item in self._timeline.transcripts
+                    if item.version_id == target.version_id
+                ),
+                None,
+            )
+            object_name = f"transcript-{target.id}"
+        if visible is None:
+            self._show_evidence_navigation_error("证据目标不属于当前会话")
+            return
+        if isinstance(visible, TimelineFrameRecord):
+            self._select_frame(visible)
+            track = self.keyframe_track
+        else:
+            self._select_transcript(visible)
+            track = self.transcript_track
+        button = self.findChild(QPushButton, object_name)
+        scroll = track.findChild(QScrollArea)
+        if button is not None and scroll is not None:
+            scroll.ensureWidgetVisible(button)
+
+    def _show_evidence_navigation_error(self, message: str) -> None:
+        self._selected_frame = None
+        self._selected_transcript = None
+        self.evidence_image.setPixmap(QPixmap())
+        self.evidence_image.setStyleSheet(
+            "background: #172221; color: #dce8e3; padding: 18px; font-size: 15px;"
+        )
+        self.evidence_image.setText(message)
+        self.evidence_title.setText("无法打开证据")
+        self.evidence_metadata.setText("当前会话和时间线位置保持不变。")
+        self.evidence_version.hide()
+        self._show_transcript_actions(False)
+        self._animate_detail_change()
 
     @Slot()
     def _select_answer(self) -> None:
@@ -1012,13 +1111,18 @@ class MainWindow(QMainWindow):
             f"稳定 ID：{transcript.id}"
         )
         state_label = self.CORRECTION_STATE_LABELS.get(transcript.correction_state or "")
-        if state_label:
-            self.evidence_version.setText(
-                f"字幕校订已启用 · 当前状态：{state_label}\nWhisper 原文保留为独立版本。"
-            )
-            self.evidence_version.show()
+        if transcript.version_kind == "correction":
+            version_label = "校订文"
+        elif transcript.version_kind == "user_edit":
+            version_label = "用户编辑"
         else:
-            self.evidence_version.hide()
+            version_label = "当前版本"
+        state_line = f"字幕校订状态：{state_label}\n" if state_label else ""
+        self.evidence_version.setText(
+            f"{state_line}Whisper 原文：{transcript.original_text}\n"
+            f"{version_label}：{transcript.text}"
+        )
+        self.evidence_version.show()
         editable = transcript.version_id is not None and transcript.version_kind != "recognizing"
         self._show_transcript_actions(editable)
         self.transcript_undo_button.setVisible(editable and transcript.version_kind == "correction")
@@ -1125,6 +1229,12 @@ class MainWindow(QMainWindow):
         answer_selection_row.addWidget(answer_selection_label)
         answer_selection_row.addWidget(self.answer_selector, 1)
         answer_selection_row.addWidget(self.answer_evidence_status, 2)
+        self.answer_evidence_entries = QWidget()
+        self.answer_evidence_entries.setObjectName("answerEvidenceEntries")
+        self.answer_evidence_layout = QHBoxLayout(self.answer_evidence_entries)
+        self.answer_evidence_layout.setContentsMargins(0, 0, 0, 0)
+        self.answer_evidence_layout.setSpacing(6)
+        self.answer_evidence_entries.hide()
 
         answer_header = QHBoxLayout()
         heading = QLabel("回答与会话材料")
@@ -1148,6 +1258,7 @@ class MainWindow(QMainWindow):
         self.output = MarkdownDocument()
         panel_layout.addLayout(question_row)
         panel_layout.addLayout(answer_selection_row)
+        panel_layout.addWidget(self.answer_evidence_entries)
 
         panel_layout.addLayout(answer_header)
         panel_layout.addWidget(self.output, 1)

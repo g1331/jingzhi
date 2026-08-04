@@ -450,6 +450,248 @@ def test_answer_selection_updates_exact_evidence_across_zoom_and_unavailable_his
     window.close()
 
 
+def test_answer_evidence_entries_navigate_to_exact_frame_and_transcript(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "navigation.sqlite3")
+    session_id = database.create_session("证据定位", "2026-08-04T09:00:00+00:00")
+    frame_dir = tmp_path / "sessions" / session_id / "frames"
+    frame_dir.mkdir(parents=True)
+    frame_path = frame_dir / "frame.webp"
+    Image.new("RGB", (640, 360), "navy").save(frame_path)
+    frame_id = database.add_frame(
+        session_id,
+        320_000,
+        frame_path,
+        "navigation-frame",
+        (640, 360),
+        source_id="display:2",
+    )
+    chunk_id = database.add_audio_chunk(
+        session_id,
+        "system",
+        321_000,
+        329_000,
+        tmp_path / "sessions" / session_id / "audio" / "chunk.flac",
+    )
+    segment_id = database.add_transcript(
+        session_id,
+        chunk_id,
+        "system",
+        322_000,
+        327_000,
+        "换入便量",
+        "zh",
+        -0.2,
+    )
+    corrected_version_id = database.add_transcript_version(
+        segment_id, "correction", "换入变量", model="correction-small"
+    )
+    question_id = database.create_question(session_id, 330_000, "这里说了什么？", 300_000, 330_000)
+    answer = database.record_answer_version(
+        question_id,
+        model="answer-model",
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="回答引用了两项证据。",
+        error=None,
+        evidence_state="exact",
+        evidence=[
+            {
+                "stable_id": f"frame:{frame_id}",
+                "kind": "frame",
+                "source": "display:2",
+                "start_ms": 320_000,
+                "end_ms": 320_000,
+                "frame_id": frame_id,
+                "resource_path": str(frame_path),
+            },
+            {
+                "stable_id": f"transcript-version:{corrected_version_id}",
+                "kind": "transcript",
+                "source": "system",
+                "start_ms": 322_000,
+                "end_ms": 327_000,
+                "transcript_version_id": corrected_version_id,
+                "content_text": "换入变量",
+            },
+        ],
+    )
+    database.finish_session(session_id, "2026-08-04T09:06:00+00:00", "complete")
+
+    window = MainWindow(
+        Settings(data_dir=tmp_path),
+        service=JingzhiApplicationService(database, recorder=NoHardwareRecorder()),
+    )
+    window.show()
+    application.processEvents()
+
+    frame_entry = window.findChild(QPushButton, "answer-evidence-0")
+    transcript_entry = window.findChild(QPushButton, "answer-evidence-1")
+    assert frame_entry is not None and transcript_entry is not None
+    assert frame_entry.property("stableId") == f"frame:{frame_id}"
+    assert transcript_entry.property("stableId") == f"transcript-version:{corrected_version_id}"
+
+    frame_entry.click()
+    application.processEvents()
+    assert window._zoom_key == "1-minute"
+    assert window._timeline is not None
+    assert window._timeline.window_start_ms <= 320_000 <= window._timeline.window_end_ms
+    assert window.timeline_navigator.value() == window._timeline.window_start_ms // 1000
+    selected_frame = window.findChild(QPushButton, f"keyframe-{frame_id}")
+    assert selected_frame is not None and selected_frame.property("selected") is True
+    assert window.evidence_image.pixmap() is not None
+    assert "display:2" in window.evidence_metadata.text()
+
+    transcript_entry = window.findChild(QPushButton, "answer-evidence-1")
+    assert transcript_entry is not None
+    transcript_entry.click()
+    application.processEvents()
+    selected_transcript = window.findChild(QPushButton, f"transcript-{segment_id}")
+    assert selected_transcript is not None and selected_transcript.property("selected") is True
+    assert "原文：换入便量" in window.evidence_version.text()
+    assert "校订文：换入变量" in window.evidence_version.text()
+    assert window.transcript_diff_button.isVisible()
+    window.transcript_diff_button.click()
+    assert "[-便-]{+变+}" in window.evidence_version.text()
+    assert window.answer_selector.currentData() == answer.id
+    window.close()
+
+
+def test_answer_evidence_navigation_degrades_for_missing_and_unsafe_targets(
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "unsafe-navigation.sqlite3")
+    session_id = database.create_session("安全定位", "2026-08-04T09:00:00+00:00")
+    other_session_id = database.create_session("其他会话", "2026-08-04T08:00:00+00:00")
+    missing_path = tmp_path / "sessions" / session_id / "frames" / "missing.webp"
+    missing_frame_id = database.add_frame(
+        session_id,
+        120_000,
+        missing_path,
+        "missing-frame",
+        (640, 360),
+        source_id="display:1",
+    )
+    other_path = tmp_path / "sessions" / other_session_id / "frames" / "other.webp"
+    other_path.parent.mkdir(parents=True)
+    Image.new("RGB", (320, 180), "white").save(other_path)
+    other_frame_id = database.add_frame(
+        other_session_id,
+        240_000,
+        other_path,
+        "other-frame",
+        (320, 180),
+        source_id="display:9",
+    )
+    outside_path = tmp_path / "outside.webp"
+    Image.new("RGB", (320, 180), "red").save(outside_path)
+    outside_frame_id = database.add_frame(
+        session_id,
+        260_000,
+        outside_path,
+        "outside-frame",
+        (320, 180),
+        source_id="display:1",
+    )
+    question_id = database.create_question(session_id, 300_000, "证据安全吗？", 0, 300_000)
+    database.record_answer_version(
+        question_id,
+        model="answer-model",
+        connection_json=None,
+        request_status="succeeded",
+        request_id=None,
+        answer="包含缺失和恶意证据入口。",
+        error=None,
+        evidence_state="exact",
+        evidence=[
+            {
+                "stable_id": f"frame:{missing_frame_id}",
+                "kind": "frame",
+                "source": "display:1",
+                "start_ms": 120_000,
+                "end_ms": 120_000,
+                "frame_id": missing_frame_id,
+                "resource_path": str(missing_path),
+            },
+            {
+                "stable_id": f"frame:{other_frame_id}",
+                "kind": "frame",
+                "source": "display:9",
+                "start_ms": 240_000,
+                "end_ms": 240_000,
+                "frame_id": other_frame_id,
+                "resource_path": str(other_path),
+            },
+            {
+                "stable_id": f"frame:{outside_frame_id}",
+                "kind": "frame",
+                "source": "display:1",
+                "start_ms": 260_000,
+                "end_ms": 260_000,
+                "frame_id": outside_frame_id,
+                "resource_path": str(outside_path),
+            },
+            {
+                "stable_id": "file:///C:/Windows/win.ini",
+                "kind": "frame",
+                "source": "display:1",
+                "start_ms": 250_000,
+                "end_ms": 250_000,
+                "frame_id": missing_frame_id,
+                "resource_path": "C:/Windows/win.ini",
+            },
+        ],
+    )
+    database.finish_session(session_id, "2026-08-04T09:05:00+00:00", "complete")
+    database.finish_session(other_session_id, "2026-08-04T08:05:00+00:00", "complete")
+
+    window = MainWindow(
+        Settings(data_dir=tmp_path),
+        service=JingzhiApplicationService(database, recorder=NoHardwareRecorder()),
+    )
+    window.show()
+    application.processEvents()
+    assert window._selected_session_id == session_id
+
+    missing_entry = window.findChild(QPushButton, "answer-evidence-0")
+    assert missing_entry is not None
+    missing_entry.click()
+    application.processEvents()
+    assert window._selected_session_id == session_id
+    assert "关键帧文件不可读取" in window.evidence_image.text()
+
+    safe_window_start = window._window_start_ms
+    cross_session_entry = window.findChild(QPushButton, "answer-evidence-1")
+    assert cross_session_entry is not None
+    cross_session_entry.click()
+    application.processEvents()
+    assert window._selected_session_id == session_id
+    assert window._window_start_ms == safe_window_start
+    assert "不属于当前会话" in window.evidence_image.text()
+    assert "display:9" not in window.evidence_metadata.text()
+
+    outside_entry = window.findChild(QPushButton, "answer-evidence-2")
+    assert outside_entry is not None
+    outside_entry.click()
+    application.processEvents()
+    assert window._selected_session_id == session_id
+    assert window._window_start_ms == safe_window_start
+    assert "会话目录以外" in window.evidence_image.text()
+    assert "outside.webp" not in window.evidence_metadata.text()
+
+    malicious_entry = window.findChild(QPushButton, "answer-evidence-3")
+    assert malicious_entry is not None
+    malicious_entry.click()
+    application.processEvents()
+    assert window._selected_session_id == session_id
+    assert window._window_start_ms == safe_window_start
+    assert "不受支持" in window.evidence_image.text()
+    assert "win.ini" not in window.evidence_metadata.text()
+    window.close()
+
+
 def test_answer_without_evidence_is_explicitly_unconfirmed(tmp_path: Path) -> None:
     application = QApplication.instance() or QApplication([])
     database = Database(tmp_path / "no-evidence.sqlite3")
