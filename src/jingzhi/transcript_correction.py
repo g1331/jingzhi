@@ -20,6 +20,7 @@ class CorrectionSegment:
     end_ms: int
     source: str
     text: str
+    version_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,11 +115,15 @@ class TranscriptCorrectionProcessor:
             window_start_ms=start_ms,
             window_end_ms=end_ms,
             target_segments=tuple(
-                CorrectionSegment(item.id, item.start_ms, item.end_ms, item.source, item.text)
+                CorrectionSegment(
+                    item.id, item.start_ms, item.end_ms, item.source, item.text, item.version_id
+                )
                 for item in target_records
             ),
             context_segments=tuple(
-                CorrectionSegment(item.id, item.start_ms, item.end_ms, item.source, item.text)
+                CorrectionSegment(
+                    item.id, item.start_ms, item.end_ms, item.source, item.text, item.version_id
+                )
                 for item in context_records
             ),
             frames=tuple(

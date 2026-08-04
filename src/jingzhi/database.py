@@ -159,6 +159,42 @@ CREATE TABLE IF NOT EXISTS answer_evidence (
     UNIQUE(answer_version_id, stable_id)
 );
 
+CREATE TABLE IF NOT EXISTS model_invocations (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN (
+        'utility', 'transcript_correction', 'instant_answer', 'deep_analysis'
+    )),
+    connection_id TEXT NOT NULL,
+    connection_name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions')),
+    model TEXT NOT NULL,
+    reasoning_level TEXT NOT NULL CHECK (reasoning_level IN ('fast', 'balanced', 'deep')),
+    fallback_reason TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    upstream_request_id TEXT,
+    error TEXT,
+    started_at_utc TEXT NOT NULL,
+    completed_at_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS model_invocation_session
+ON model_invocations(session_id, id);
+
+CREATE TABLE IF NOT EXISTS model_invocation_evidence (
+    invocation_id INTEGER NOT NULL REFERENCES model_invocations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stable_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('transcript', 'frame')),
+    source TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    transcript_version_id INTEGER,
+    frame_id INTEGER,
+    PRIMARY KEY(invocation_id, ordinal),
+    UNIQUE(invocation_id, stable_id)
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -174,7 +210,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 SESSION_SUMMARY_QUERY = """
 SELECT
@@ -270,6 +306,7 @@ class CorrectionSegmentRecord:
     end_ms: int
     source: str
     text: str
+    version_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +402,37 @@ class AnswerFrameRecord:
     source: str
     ts_ms: int
     path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInvocationEvidenceRecord:
+    stable_id: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    transcript_version_id: int | None = None
+    frame_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInvocationRecord:
+    id: int
+    session_id: str | None
+    role: str
+    connection_id: str
+    connection_name: str
+    base_url: str
+    api_mode: str
+    model: str
+    reasoning_level: str
+    fallback_reason: str | None
+    status: str
+    request_id: str | None
+    error: str | None
+    started_at_utc: str
+    completed_at_utc: str | None
+    evidence_ids: tuple[str, ...]
 
 
 class Database:
@@ -709,14 +777,19 @@ class Database:
             ).fetchall()
         return [TranscriptRecord(**dict(row)) for row in reversed(rows)]
 
-    def all_transcripts(self, session_id: str) -> list[TranscriptRecord]:
+    def all_effective_transcripts(self, session_id: str) -> list[AnswerTranscriptRecord]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT start_ms, end_ms, source, text FROM transcript_segments
-                   WHERE session_id = ? ORDER BY start_ms""",
+                """SELECT segment.id AS segment_id, version.id AS version_id,
+                          segment.source, segment.start_ms, segment.end_ms, version.text
+                   FROM transcript_segments AS segment
+                   JOIN effective_transcript_versions AS version
+                     ON version.segment_id = segment.id
+                   WHERE segment.session_id = ?
+                   ORDER BY segment.start_ms, segment.id""",
                 (session_id,),
             ).fetchall()
-        return [TranscriptRecord(**dict(row)) for row in rows]
+        return [AnswerTranscriptRecord(**dict(row)) for row in rows]
 
     def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
         with self.connect() as connection:
@@ -810,8 +883,8 @@ class Database:
     ) -> list[CorrectionSegmentRecord]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT segment.id, segment.start_ms, segment.end_ms, segment.source,
-                          version.text
+                """SELECT segment.id, version.id AS version_id,
+                          segment.start_ms, segment.end_ms, segment.source, version.text
                    FROM transcript_segments AS segment
                    JOIN effective_transcript_versions AS version
                      ON version.segment_id = segment.id
@@ -1173,3 +1246,133 @@ class Database:
                 (session_id, kind, created_at_utc, content_json, model),
             )
             return int(cursor.lastrowid)
+
+    def start_model_invocation(
+        self,
+        *,
+        session_id: str | None,
+        role: str,
+        connection_id: str,
+        connection_name: str,
+        base_url: str,
+        api_mode: str,
+        model: str,
+        reasoning_level: str,
+        fallback_reason: str | None,
+        evidence: tuple[ModelInvocationEvidenceRecord, ...] = (),
+    ) -> int:
+        started_at = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO model_invocations(
+                       session_id, role, connection_id, connection_name, base_url, api_mode,
+                       model, reasoning_level, fallback_reason, status, started_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
+                (
+                    session_id,
+                    role,
+                    connection_id,
+                    connection_name,
+                    base_url,
+                    api_mode,
+                    model,
+                    reasoning_level,
+                    fallback_reason,
+                    started_at,
+                ),
+            )
+            invocation_id = int(cursor.lastrowid)
+            connection.executemany(
+                """INSERT INTO model_invocation_evidence(
+                       invocation_id, ordinal, stable_id, kind, source, start_ms, end_ms,
+                       transcript_version_id, frame_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        invocation_id,
+                        ordinal,
+                        item.stable_id,
+                        item.kind,
+                        item.source,
+                        item.start_ms,
+                        item.end_ms,
+                        item.transcript_version_id,
+                        item.frame_id,
+                    )
+                    for ordinal, item in enumerate(evidence)
+                ],
+            )
+            return invocation_id
+
+    def finish_model_invocation(
+        self,
+        invocation_id: int,
+        status: str,
+        *,
+        request_id: str | None = None,
+        error: str | None = None,
+    ) -> ModelInvocationRecord:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError(f"Invalid invocation status: {status}")
+        completed_at = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE model_invocations
+                   SET status = ?, upstream_request_id = ?, error = ?, completed_at_utc = ?
+                   WHERE id = ? AND status = 'running'""",
+                (status, request_id, error, completed_at, invocation_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Model invocation is unavailable or already finished")
+        record = self.model_invocation(invocation_id)
+        if record is None:
+            raise RuntimeError("Finished model invocation is unavailable")
+        return record
+
+    def model_invocation(self, invocation_id: int) -> ModelInvocationRecord | None:
+        records = self._model_invocations("WHERE invocation.id = ?", (invocation_id,))
+        return records[0] if records else None
+
+    def model_invocations(self, session_id: str | None = None) -> tuple[ModelInvocationRecord, ...]:
+        if session_id is None:
+            return self._model_invocations("", ())
+        return self._model_invocations("WHERE invocation.session_id = ?", (session_id,))
+
+    def _model_invocations(
+        self, where: str, parameters: tuple[object, ...]
+    ) -> tuple[ModelInvocationRecord, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT invocation.*,
+                           GROUP_CONCAT(evidence.stable_id, char(31)) AS evidence_ids
+                    FROM model_invocations AS invocation
+                    LEFT JOIN model_invocation_evidence AS evidence
+                      ON evidence.invocation_id = invocation.id
+                    {where}
+                    GROUP BY invocation.id
+                    ORDER BY invocation.id""",
+                parameters,
+            ).fetchall()
+        return tuple(
+            ModelInvocationRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                role=row["role"],
+                connection_id=row["connection_id"],
+                connection_name=row["connection_name"],
+                base_url=row["base_url"],
+                api_mode=row["api_mode"],
+                model=row["model"],
+                reasoning_level=row["reasoning_level"],
+                fallback_reason=row["fallback_reason"],
+                status=row["status"],
+                request_id=row["upstream_request_id"],
+                error=row["error"],
+                started_at_utc=row["started_at_utc"],
+                completed_at_utc=row["completed_at_utc"],
+                evidence_ids=tuple((row["evidence_ids"] or "").split(chr(31)))
+                if row["evidence_ids"]
+                else (),
+            )
+            for row in rows
+        )
