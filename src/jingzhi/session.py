@@ -8,6 +8,11 @@ from datetime import UTC, datetime
 
 from jingzhi.application import QuestionAnsweringService
 from jingzhi.capture.audio import AudioCaptureWorker, AudioChunk, QuestionVoiceRecorder
+from jingzhi.capture.devices import (
+    DeviceCatalog,
+    RecordingSelection,
+    WindowsDeviceCatalog,
+)
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
@@ -15,6 +20,7 @@ from jingzhi.database import Database
 from jingzhi.model_roles import ModelRole, RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
+from jingzhi.recording_settings import RecordingPreferences, resolve_recording_selection
 from jingzhi.transcribe import TranscriptionWorker, WhisperQuestionTranscriber
 from jingzhi.transcript_correction import (
     CORRECTION_WINDOW_SECONDS,
@@ -30,12 +36,14 @@ class SessionManager:
         *,
         on_segment: Callable[[int, int, str, str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        device_catalog: DeviceCatalog | None = None,
     ) -> None:
         self.settings = settings
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.database = Database(self.settings.data_dir / "jingzhi.sqlite3")
         self.on_segment = on_segment
         self.on_error = on_error
+        self.device_catalog = device_catalog or WindowsDeviceCatalog()
         self.session_id: str | None = None
         self.clock: SessionClock | None = None
         self.stop_event: threading.Event | None = None
@@ -112,11 +120,43 @@ class SessionManager:
         self,
         title: str,
         *,
-        capture_system_audio: bool | None = None,
-        capture_microphone: bool | None = None,
+        selection: RecordingSelection | None = None,
     ) -> str:
         if self.is_recording:
             raise RuntimeError("A session is already recording")
+        snapshot = self.device_catalog.snapshot()
+        if selection is None:
+            selection = RecordingSelection(
+                display_ids=(),
+                system_audio_id=(
+                    next(
+                        (item.id for item in snapshot.system_audio if item.is_default),
+                        snapshot.system_audio[0].id if snapshot.system_audio else None,
+                    )
+                    if self.settings.capture_system_audio
+                    else None
+                ),
+                microphone_id=(
+                    next(
+                        (item.id for item in snapshot.microphones if item.is_default),
+                        snapshot.microphones[0].id if snapshot.microphones else None,
+                    )
+                    if self.settings.capture_microphone
+                    else None
+                ),
+                estimated_duration_minutes=60,
+            )
+        resolved_selection = resolve_recording_selection(
+            RecordingPreferences(
+                display_ids=selection.display_ids,
+                system_audio_id=selection.system_audio_id,
+                microphone_id=selection.microphone_id,
+                system_audio_enabled=selection.system_audio_id is not None,
+                microphone_enabled=selection.microphone_id is not None,
+                estimated_duration_minutes=selection.estimated_duration_minutes,
+            ),
+            snapshot,
+        )
         clock = SessionClock.start()
         session_id = self.database.create_session(
             title.strip() or "Untitled session", clock.started_at_utc
@@ -144,32 +184,28 @@ class SessionManager:
                 database=self.database,
                 session_id=session_id,
                 clock=clock,
-                output_dir=session_dir / "frames",
+                display=display,
+                output_dir=session_dir / "frames" / f"display-{index:02d}",
                 stop_event=stop_event,
                 interval_s=self.settings.screen_interval_s,
                 hash_distance=self.settings.screen_hash_distance,
                 on_error=self.on_error,
             )
+            for index, display in enumerate(resolved_selection.displays, start=1)
         ]
-        system_audio_enabled = (
-            self.settings.capture_system_audio
-            if capture_system_audio is None
-            else capture_system_audio
-        )
-        microphone_enabled = (
-            self.settings.capture_microphone if capture_microphone is None else capture_microphone
-        )
-        for source, enabled in (
-            ("system", system_audio_enabled),
-            ("microphone", microphone_enabled),
+        for source, device in (
+            ("system", resolved_selection.system_audio),
+            ("microphone", resolved_selection.microphone),
         ):
-            if enabled:
+            if device is not None:
                 self.workers.append(
                     AudioCaptureWorker(
                         database=self.database,
                         session_id=session_id,
                         clock=clock,
                         source=source,
+                        device=device,
+                        device_catalog=self.device_catalog,
                         output_dir=session_dir / "audio",
                         stop_event=stop_event,
                         chunk_queue=chunk_queue,

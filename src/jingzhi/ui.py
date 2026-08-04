@@ -10,7 +10,17 @@ from dataclasses import replace
 from difflib import SequenceMatcher
 from typing import ClassVar
 
-from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QSize, Qt, Signal, Slot
+from PIL.ImageQt import ImageQt
+from PySide6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
@@ -18,6 +28,8 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -29,16 +41,25 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from jingzhi.application import JingzhiApplicationService, SessionTimeline, present_answer
+from jingzhi.capture.devices import (
+    AudioDevice,
+    DeviceCatalog,
+    DeviceSnapshot,
+    RecordingSelection,
+    WindowsDeviceCatalog,
+)
 from jingzhi.config import Settings
 from jingzhi.database import (
     AnswerEvidenceRecord,
@@ -54,6 +75,12 @@ from jingzhi.model_roles import (
     RoleName,
 )
 from jingzhi.provider_settings import SavedProviderSettings
+from jingzhi.recording_settings import (
+    RecordingPreferences,
+    RecordingSettingsStore,
+    estimate_storage_bytes,
+    resolve_recording_selection,
+)
 from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
@@ -285,6 +312,305 @@ class UiBridge(QObject):
     summary = Signal(str)
     stopped = Signal(str)
     provider_tested = Signal(str)
+
+
+class RecordingConfirmationDialog(QDialog):
+    snapshot_ready = Signal(object)
+    snapshot_failed = Signal(str)
+    level_ready = Signal(object)
+
+    def __init__(
+        self,
+        catalog: DeviceCatalog,
+        store: RecordingSettingsStore,
+        *,
+        screen_interval_s: float,
+        audio_storage_rate: int,
+        default_system_audio_enabled: bool = True,
+        default_microphone_enabled: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("确认录制来源")
+        self.resize(760, 620)
+        self.catalog = catalog
+        self.store = store
+        self.screen_interval_s = screen_interval_s
+        self.audio_storage_rate = audio_storage_rate
+        self.preferences = store.load()
+        if not store.path.is_file():
+            self.preferences = RecordingPreferences(
+                system_audio_enabled=default_system_audio_enabled,
+                microphone_enabled=default_microphone_enabled,
+            )
+        self.snapshot = DeviceSnapshot((), (), ())
+        self.display_checks: dict[str, QCheckBox] = {}
+        self._display_widgets: list[QWidget] = []
+        self._display_selection_changed = False
+        self._audio_initialized = False
+        self._refresh_in_progress = False
+        self._level_in_progress = False
+
+        root = QVBoxLayout(self)
+        heading = QLabel("开始会话前确认来源")
+        heading.setObjectName("sectionTitle")
+        root.addWidget(heading)
+        hint = QLabel(
+            "打开此窗口会临时采样缩略图和麦克风电平，仅用于来源确认；"
+            "取消后不保存。未选择显示器时按全部显示器处理。"
+        )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self.device_error = QLabel()
+        self.device_error.setWordWrap(True)
+        self.device_error.setVisible(False)
+        root.addWidget(self.device_error)
+
+        display_scroll = QScrollArea()
+        display_scroll.setWidgetResizable(True)
+        display_scroll.setMinimumHeight(270)
+        display_container = QWidget()
+        self.display_grid = QGridLayout(display_container)
+        display_scroll.setWidget(display_container)
+        root.addWidget(display_scroll, 1)
+
+        audio_group = QGroupBox("音频来源")
+        audio_layout = QGridLayout(audio_group)
+        self.system_audio_combo = QComboBox()
+        self.microphone_combo = QComboBox()
+        self.microphone_level = QProgressBar()
+        self.microphone_level.setRange(0, 100)
+        self.microphone_level.setFormat("麦克风电平 %p%")
+        audio_layout.addWidget(QLabel("系统声音"), 0, 0)
+        audio_layout.addWidget(self.system_audio_combo, 0, 1)
+        audio_layout.addWidget(QLabel("麦克风"), 1, 0)
+        audio_layout.addWidget(self.microphone_combo, 1, 1)
+        audio_layout.addWidget(self.microphone_level, 2, 0, 1, 2)
+        root.addWidget(audio_group)
+
+        estimate_row = QHBoxLayout()
+        estimate_row.addWidget(QLabel("预计时长"))
+        self.duration_input = QSpinBox()
+        self.duration_input.setRange(1, 24 * 60)
+        self.duration_input.setSingleStep(15)
+        self.duration_input.setSuffix(" 分钟")
+        self.duration_input.setValue(self.preferences.estimated_duration_minutes)
+        estimate_row.addWidget(self.duration_input)
+        self.storage_estimate = QLabel()
+        estimate_row.addWidget(self.storage_estimate, 1)
+        root.addLayout(estimate_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并开始")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.confirm_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.confirm_button.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.system_audio_combo.currentIndexChanged.connect(self._update_estimate)
+        self.microphone_combo.currentIndexChanged.connect(self._update_level_and_estimate)
+        self.duration_input.valueChanged.connect(self._update_estimate)
+        self.snapshot_ready.connect(self._apply_snapshot)
+        self.snapshot_failed.connect(self._show_snapshot_error)
+        self.level_ready.connect(self._apply_microphone_level)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(1_000)
+        self.refresh_timer.timeout.connect(self.refresh_devices)
+        self.level_timer = QTimer(self)
+        self.level_timer.setInterval(250)
+        self.level_timer.timeout.connect(self._update_microphone_level)
+        self.refresh_devices()
+        self.refresh_timer.start()
+        self.level_timer.start()
+
+    def refresh_devices(self) -> None:
+        if self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
+
+        def sample() -> None:
+            try:
+                self.snapshot_ready.emit(self.catalog.snapshot())
+            except Exception as exc:  # noqa: BLE001 - hardware enumeration boundary
+                self.snapshot_failed.emit(str(exc))
+
+        threading.Thread(target=sample, name="recording-device-preview", daemon=True).start()
+
+    @Slot(object)
+    def _apply_snapshot(self, snapshot: DeviceSnapshot) -> None:
+        self._refresh_in_progress = False
+        checked = {
+            identifier: checkbox.isChecked() for identifier, checkbox in self.display_checks.items()
+        }
+        system_id = self.system_audio_combo.currentData()
+        microphone_id = self.microphone_combo.currentData()
+        self.device_error.setVisible(False)
+        self.snapshot = snapshot
+        resolved = resolve_recording_selection(self.preferences, snapshot)
+        preferred_displays = {display.id for display in resolved.displays}
+
+        for widget in self._display_widgets:
+            self.display_grid.removeWidget(widget)
+            widget.deleteLater()
+        self._display_widgets.clear()
+        self.display_checks.clear()
+        for index, display in enumerate(snapshot.displays):
+            panel = QGroupBox(display.name)
+            panel_layout = QVBoxLayout(panel)
+            preview = QLabel()
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setMinimumSize(220, 124)
+            pixmap = QPixmap.fromImage(ImageQt(display.preview))
+            preview.setPixmap(
+                pixmap.scaled(
+                    QSize(260, 146),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            checkbox = QCheckBox("录制此显示器")
+            if display.id in checked:
+                checkbox.setChecked(checked[display.id])
+            elif self._display_selection_changed:
+                checkbox.setChecked(False)
+            else:
+                checkbox.setChecked(display.id in preferred_displays)
+            checkbox.toggled.connect(self._display_toggled)
+            panel_layout.addWidget(preview)
+            panel_layout.addWidget(checkbox)
+            self.display_grid.addWidget(panel, index // 2, index % 2)
+            self._display_widgets.append(panel)
+            self.display_checks[display.id] = checkbox
+        if not snapshot.displays:
+            empty = QLabel("当前未检测到显示器，请连接显示器后刷新。")
+            self.display_grid.addWidget(empty, 0, 0)
+            self._display_widgets.append(empty)
+
+        preferred_system_id = (
+            system_id
+            if self._audio_initialized
+            else (resolved.system_audio.id if resolved.system_audio is not None else None)
+        )
+        preferred_microphone_id = (
+            microphone_id
+            if self._audio_initialized
+            else (resolved.microphone.id if resolved.microphone is not None else None)
+        )
+        self._populate_audio_combo(
+            self.system_audio_combo, snapshot.system_audio, preferred_system_id
+        )
+        self._populate_audio_combo(
+            self.microphone_combo, snapshot.microphones, preferred_microphone_id
+        )
+        self._audio_initialized = True
+        self.confirm_button.setEnabled(bool(snapshot.displays))
+        self._update_level_and_estimate()
+
+    @Slot(str)
+    def _show_snapshot_error(self, message: str) -> None:
+        self._refresh_in_progress = False
+        self.device_error.setText(f"设备刷新失败：{message}")
+        self.device_error.setVisible(True)
+
+    @staticmethod
+    def _populate_audio_combo(
+        combo: QComboBox, devices: tuple[AudioDevice, ...], selected_id: object
+    ) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("不录制", None)
+        for device in devices:
+            suffix = "（默认）" if device.is_default else ""
+            combo.addItem(f"{device.name}{suffix}", device.id)
+        selected_index = combo.findData(selected_id)
+        if selected_index < 0 and selected_id is not None:
+            fallback = next((device.id for device in devices if device.is_default), None)
+            if fallback is None and devices:
+                fallback = devices[0].id
+            selected_index = combo.findData(fallback)
+        combo.setCurrentIndex(max(selected_index, 0))
+        combo.blockSignals(False)
+
+    def _display_toggled(self) -> None:
+        self._display_selection_changed = True
+        self._update_estimate()
+
+    def _audio_device(self, identifier: object, devices: tuple[AudioDevice, ...]):
+        return next((device for device in devices if device.id == identifier), None)
+
+    def _current_preferences(self) -> RecordingPreferences:
+        return RecordingPreferences(
+            display_ids=tuple(
+                identifier
+                for identifier, checkbox in self.display_checks.items()
+                if checkbox.isChecked()
+            ),
+            system_audio_id=self.system_audio_combo.currentData(),
+            microphone_id=self.microphone_combo.currentData(),
+            system_audio_enabled=self.system_audio_combo.currentData() is not None,
+            microphone_enabled=self.microphone_combo.currentData() is not None,
+            estimated_duration_minutes=self.duration_input.value(),
+        )
+
+    def recording_selection(self) -> RecordingSelection:
+        preferences = self._current_preferences()
+        self.store.save(preferences)
+        return RecordingSelection(
+            display_ids=preferences.display_ids,
+            system_audio_id=(
+                preferences.system_audio_id if preferences.system_audio_enabled else None
+            ),
+            microphone_id=(preferences.microphone_id if preferences.microphone_enabled else None),
+            estimated_duration_minutes=preferences.estimated_duration_minutes,
+        )
+
+    def _update_microphone_level(self) -> None:
+        if self._level_in_progress:
+            return
+        device = self._audio_device(self.microphone_combo.currentData(), self.snapshot.microphones)
+        if device is None:
+            self.microphone_level.setValue(0)
+            return
+        self._level_in_progress = True
+
+        def sample() -> None:
+            self.level_ready.emit((device.id, self.catalog.microphone_level(device)))
+
+        threading.Thread(target=sample, name="recording-microphone-level", daemon=True).start()
+
+    @Slot(object)
+    def _apply_microphone_level(self, result: tuple[str, float]) -> None:
+        self._level_in_progress = False
+        device_id, level = result
+        if self.microphone_combo.currentData() == device_id:
+            self.microphone_level.setValue(round(level * 100))
+
+    def _update_level_and_estimate(self) -> None:
+        self._update_microphone_level()
+        self._update_estimate()
+
+    def _update_estimate(self) -> None:
+        selection = resolve_recording_selection(self._current_preferences(), self.snapshot)
+        estimate = estimate_storage_bytes(
+            selection,
+            screen_interval_s=self.screen_interval_s,
+            audio_storage_rate=self.audio_storage_rate,
+        )
+        if estimate >= 1024**3:
+            formatted = f"{estimate / 1024**3:.1f} GiB"
+        else:
+            formatted = f"{estimate / 1024**2:.0f} MiB"
+        self.storage_estimate.setText(f"预计占用（估算）：{formatted}")
+
+    def done(self, result: int) -> None:
+        self.refresh_timer.stop()
+        self.level_timer.stop()
+        super().done(result)
 
 
 class MainWindow(QMainWindow):
@@ -1474,16 +1800,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start(self) -> None:
+        catalog = getattr(self.manager, "device_catalog", None) or WindowsDeviceCatalog()
+        dialog = RecordingConfirmationDialog(
+            catalog,
+            RecordingSettingsStore(self.settings.data_dir),
+            screen_interval_s=self.settings.screen_interval_s,
+            audio_storage_rate=self.settings.audio_storage_rate,
+            default_system_audio_enabled=self.system_audio_check.isChecked(),
+            default_microphone_enabled=self.microphone_check.isChecked(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
         try:
+            selection = dialog.recording_selection()
             self._configure_correction()
-            session_id = self.service.start_session(
-                self.title_input.text(),
-                capture_system_audio=self.system_audio_check.isChecked(),
-                capture_microphone=self.microphone_check.isChecked(),
-            )
+            session_id = self.service.start_session(self.title_input.text(), selection=selection)
         except Exception as exc:  # noqa: BLE001 - UI boundary must surface worker failures
             self._show_action_error(str(exc))
             return
+        self.system_audio_check.setChecked(selection.system_audio_id is not None)
+        self.microphone_check.setChecked(selection.microphone_id is not None)
         self._set_status(f"记录中 · {session_id[:8]}", "recording")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)

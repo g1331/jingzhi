@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from jingzhi.capture.devices import RecordingSelection
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import (
     AnswerEvidenceRecord,
@@ -178,13 +179,7 @@ class RecordingAdapter(Protocol):
     @property
     def is_recording(self) -> bool: ...
 
-    def start(
-        self,
-        title: str,
-        *,
-        capture_system_audio: bool | None = None,
-        capture_microphone: bool | None = None,
-    ) -> str: ...
+    def start(self, title: str, *, selection: RecordingSelection | None = None) -> str: ...
 
     def stop(self) -> str | None: ...
 
@@ -268,14 +263,9 @@ class JingzhiApplicationService:
         self,
         title: str,
         *,
-        capture_system_audio: bool | None = None,
-        capture_microphone: bool | None = None,
+        selection: RecordingSelection | None = None,
     ) -> str:
-        return self.recorder.start(
-            title,
-            capture_system_audio=capture_system_audio,
-            capture_microphone=capture_microphone,
-        )
+        return self.recorder.start(title, selection=selection)
 
     def stop_session(self) -> str | None:
         return self.recorder.stop()

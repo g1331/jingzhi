@@ -7,6 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from jingzhi.application import JingzhiApplicationService
+from jingzhi.capture.devices import RecordingSelection
 from jingzhi.database import Database
 
 
@@ -15,19 +16,14 @@ class FakeRecorder:
         self.database = database
         self.now = now
         self.session_id: str | None = None
+        self.selection: RecordingSelection | None = None
 
     @property
     def is_recording(self) -> bool:
         return self.session_id is not None
 
-    def start(
-        self,
-        title: str,
-        *,
-        capture_system_audio: bool | None = None,
-        capture_microphone: bool | None = None,
-    ) -> str:
-        del capture_system_audio, capture_microphone
+    def start(self, title: str, *, selection: RecordingSelection | None = None) -> str:
+        self.selection = selection
         self.session_id = self.database.create_session(title, self.now.isoformat())
         return self.session_id
 
@@ -96,7 +92,9 @@ def test_application_service_browses_sessions_and_scaled_keyframes_without_hardw
     recorder = FakeRecorder(database, now)
     service = JingzhiApplicationService(database, recorder=recorder, now=lambda: now)
 
-    session_id = service.start_session("多来源会话", capture_system_audio=False)
+    selection = RecordingSelection(("display:1",), None, None, 60)
+    session_id = service.start_session("多来源会话", selection=selection)
+    assert recorder.selection == selection
     first_path = tmp_path / "display-1.webp"
     second_path = tmp_path / "display-2.webp"
     Image.new("RGB", (320, 180), "white").save(first_path)
