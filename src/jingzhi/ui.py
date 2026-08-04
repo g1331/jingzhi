@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -64,6 +65,8 @@ from jingzhi.config import Settings
 from jingzhi.database import (
     AnswerEvidenceRecord,
     SessionAnswerRecord,
+    SessionNotificationKind,
+    SessionRecord,
     TimelineFrameRecord,
     TimelineTranscriptRecord,
 )
@@ -675,10 +678,17 @@ class MainWindow(QMainWindow):
         self._speech: QTextToSpeech | None = None
         self._animations_enabled = motion_enabled()
         self._storage_dialog: StorageSettingsDialog | None = None
+        self._session_sort_newest = True
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
+        self._maintenance_timer = QTimer(self)
+        self._maintenance_timer.setInterval(60_000)
+        self._maintenance_timer.timeout.connect(self._run_session_maintenance)
+        self._maintenance_timer.start()
+        lifecycle_notices = self.service.run_session_maintenance()
         self._refresh_sessions()
+        self._show_lifecycle_notices(lifecycle_notices)
         self._whisper_dialog: WhisperSettingsDialog | None = None
         if (
             callable(getattr(self.manager, "configure_whisper", None))
@@ -753,15 +763,44 @@ class MainWindow(QMainWindow):
         title.setObjectName("appTitle")
         subtitle = QLabel("本地会话库")
         subtitle.setObjectName("subtitle")
+        self.session_search = QLineEdit()
+        self.session_search.setObjectName("sessionSearch")
+        self.session_search.setPlaceholderText("搜索标题或字幕")
+        filter_row = QHBoxLayout()
+        self.session_filter = QComboBox()
+        self.session_filter.setObjectName("sessionFilter")
+        for label, value in (
+            ("全部", "all"),
+            ("未完成", "unfinished"),
+            ("已完成", "complete"),
+            ("回收区", "trash"),
+        ):
+            self.session_filter.addItem(label, value)
+        self.session_sort_button = QPushButton("新→旧")
+        self.session_sort_button.setObjectName("sessionSort")
+        filter_row.addWidget(self.session_filter, 1)
+        filter_row.addWidget(self.session_sort_button)
         self.session_library = QListWidget()
         self.session_library.setObjectName("sessionLibrary")
         self.session_library.setSpacing(3)
         self.session_library.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        action_row = QHBoxLayout()
+        self.session_pin_button = QPushButton("固定")
+        self.session_delete_button = QPushButton("删除")
+        self.session_restore_button = QPushButton("恢复")
+        self.session_complete_button = QPushButton("标记完成")
+        action_row.addWidget(self.session_pin_button)
+        action_row.addWidget(self.session_delete_button)
+        action_row.addWidget(self.session_restore_button)
         panel_layout.addWidget(title)
         panel_layout.addWidget(subtitle)
-        panel_layout.addSpacing(10)
+        panel_layout.addSpacing(6)
+        panel_layout.addWidget(self.session_search)
+        panel_layout.addLayout(filter_row)
         panel_layout.addWidget(self.session_library, 1)
-        library_state = QLabel("会话与关键帧均保存在本机")
+        panel_layout.addLayout(action_row)
+        panel_layout.addWidget(self.session_complete_button)
+        library_state = QLabel("未固定会话保留 30 天 · 回收区保留 7 天")
         library_state.setObjectName("hint")
         library_state.setWordWrap(True)
         panel_layout.addWidget(library_state)
@@ -1135,13 +1174,34 @@ class MainWindow(QMainWindow):
         self.session_library.blockSignals(True)
         self.session_library.clear()
         selected_item: QListWidgetItem | None = None
-        for session in self.service.list_sessions():
-            state = "记录中" if session.status == "recording" else "已完成"
+        status = str(self.session_filter.currentData())
+        current_session_id = self._active_session_id()
+        sessions = self.service.list_sessions(
+            query=self.session_search.text(),
+            status=status,
+            newest_first=self._session_sort_newest,
+        )
+        state_labels = {
+            "recording": "记录中",
+            "interrupted": "已中断 · 可标记完成",
+            "complete": "已完成",
+        }
+        for session in sessions:
+            prefixes = []
+            if session.id == current_session_id:
+                prefixes.append("当前")
+            if session.pinned:
+                prefixes.append("已固定")
+            if session.trashed_at_utc:
+                prefixes.append("回收区")
+            state = state_labels[session.status]
+            prefix = f"{' · '.join(prefixes)} · " if prefixes else ""
             item = QListWidgetItem(
-                f"{session.title}\n{state} · {self._format_time(session.duration_ms)}"
+                f"{session.title}\n{prefix}{state} · {self._format_time(session.duration_ms)}"
                 f" · {session.frame_count} 帧"
             )
             item.setData(Qt.ItemDataRole.UserRole, session.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, session)
             item.setToolTip(session.started_at_utc)
             self.session_library.addItem(item)
             if session.id == selected_id:
@@ -1153,7 +1213,9 @@ class MainWindow(QMainWindow):
             self.session_library.setCurrentItem(selected_item)
             self._open_session_item(selected_item)
         else:
+            self._selected_session_id = None
             self._show_empty_timeline()
+        self._update_session_actions(selected_item)
 
     def _open_session_item(self, item: QListWidgetItem | None) -> None:
         if item is None:
@@ -1359,7 +1421,119 @@ class MainWindow(QMainWindow):
 
     def _select_session_item(self, item: QListWidgetItem | None) -> None:
         self._window_start_ms = 0
+        self._update_session_actions(item)
         self._open_session_item(item)
+
+    def _selected_session_record(self) -> SessionRecord | None:
+        item = self.session_library.currentItem()
+        if item is None:
+            return None
+        record = item.data(Qt.ItemDataRole.UserRole + 1)
+        return record if isinstance(record, SessionRecord) else None
+
+    def _update_session_actions(self, item: QListWidgetItem | None) -> None:
+        record = item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else None
+        if not isinstance(record, SessionRecord):
+            self.session_pin_button.setEnabled(False)
+            self.session_delete_button.setEnabled(False)
+            self.session_restore_button.hide()
+            self.session_complete_button.hide()
+            return
+        current = record.id == self._active_session_id()
+        self.session_pin_button.setEnabled(not current and record.trashed_at_utc is None)
+        self.session_pin_button.setText("取消固定" if record.pinned else "固定")
+        self.session_delete_button.setEnabled(not current and record.trashed_at_utc is None)
+        self.session_delete_button.setVisible(record.trashed_at_utc is None)
+        self.session_restore_button.setVisible(record.trashed_at_utc is not None)
+        self.session_complete_button.setVisible(
+            record.status == "interrupted" and record.trashed_at_utc is None
+        )
+
+    def _toggle_session_sort(self) -> None:
+        self._session_sort_newest = not self._session_sort_newest
+        self.session_sort_button.setText("新→旧" if self._session_sort_newest else "旧→新")
+        self._refresh_sessions()
+
+    def _toggle_selected_session_pin(self) -> None:
+        record = self._selected_session_record()
+        if record is None:
+            return
+        try:
+            self.service.pin_session(record.id, not record.pinned)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        self._refresh_sessions(record.id)
+
+    def _delete_selected_session(self) -> None:
+        record = self._selected_session_record()
+        if record is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除完整会话",
+            f"“{record.title}”将移入本地回收区并保留 7 天。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.service.delete_session(record.id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        self._selected_session_id = None
+        self._refresh_sessions()
+
+    def _restore_selected_session(self) -> None:
+        record = self._selected_session_record()
+        if record is None:
+            return
+        try:
+            self.service.restore_session(record.id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        self.session_filter.setCurrentIndex(0)
+        self._refresh_sessions(record.id)
+
+    def _complete_selected_session(self) -> None:
+        record = self._selected_session_record()
+        if record is None:
+            return
+        try:
+            self.service.complete_interrupted_session(record.id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+            self._show_action_error(str(exc))
+            return
+        self._refresh_sessions(record.id)
+
+    def _active_session_id(self) -> str | None:
+        if not getattr(self.manager, "is_recording", False):
+            return None
+        return getattr(self.manager, "session_id", None)
+
+    def _run_session_maintenance(self) -> None:
+        notices = self.service.run_session_maintenance()
+        if not notices:
+            return
+        self._refresh_sessions(self._selected_session_id)
+        self._show_lifecycle_notices(notices)
+
+    def _show_lifecycle_notices(self, notices) -> None:  # type: ignore[no-untyped-def]
+        if not notices:
+            return
+        labels = {
+            SessionNotificationKind.RETENTION_7D: "将在 7 天内进入回收区",
+            SessionNotificationKind.RETENTION_1D: "将在 1 天内进入回收区",
+            SessionNotificationKind.MOVED_TO_TRASH: "已移入回收区，可在 7 天内恢复",
+            SessionNotificationKind.PERMANENTLY_DELETED: "已从本机最终删除",
+            SessionNotificationKind.FINAL_DELETE_FAILED: "媒体删除失败，完整会话仍保留在回收区并将在下次重试",
+        }
+        self.notice_text.setText(
+            "\n".join(f"{notice.title}：{labels[notice.kind]}" for notice in notices)
+        )
+        self.notice.show()
 
     def _set_zoom(self, zoom_key: str) -> None:
         self._zoom_key = zoom_key
@@ -1747,6 +1921,13 @@ class MainWindow(QMainWindow):
         self.session_library.currentItemChanged.connect(
             lambda current, _previous: self._select_session_item(current)
         )
+        self.session_search.textChanged.connect(self._refresh_sessions)
+        self.session_filter.currentIndexChanged.connect(self._refresh_sessions)
+        self.session_sort_button.clicked.connect(self._toggle_session_sort)
+        self.session_pin_button.clicked.connect(self._toggle_selected_session_pin)
+        self.session_delete_button.clicked.connect(self._delete_selected_session)
+        self.session_restore_button.clicked.connect(self._restore_selected_session)
+        self.session_complete_button.clicked.connect(self._complete_selected_session)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self._stop)
         self.pause_button.clicked.connect(self._toggle_pause)
