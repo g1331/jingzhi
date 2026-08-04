@@ -335,17 +335,12 @@ class StorageManager:
 
     def _copy_and_verify(self, source: Path, staging: Path) -> None:
         staging.mkdir(parents=True)
-        for item in source.rglob("*") if source.exists() else ():
-            relative = item.relative_to(source)
+        source_items = tuple(source.rglob("*")) if source.exists() else ()
+        source_files = {item.relative_to(source): item for item in source_items if item.is_file()}
+        for relative, item in source_files.items():
             destination = staging / relative
-            if item.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
-            elif item.is_file():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                self.copy_function(item, destination, follow_symlinks=False)
-        source_files = {
-            item.relative_to(source): item for item in source.rglob("*") if item.is_file()
-        }
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.copy_function(item, destination, follow_symlinks=False)
         copied_files = {
             item.relative_to(staging): item for item in staging.rglob("*") if item.is_file()
         }
