@@ -16,6 +16,7 @@ class SavedProviderSettings:
     base_url: str = ""
     api_key: str = ""
     model: str = "gpt-5.5"
+    correction_model: str = ""
     api_mode: str = "responses"
 
 
@@ -48,10 +49,13 @@ class ProviderSettingsStore:
         api_mode = str(public.get("api_mode", "responses"))
         if api_mode not in {"responses", "chat_completions"}:
             api_mode = "responses"
+        model = str(public.get("model", "gpt-5.5"))
+        correction_model = str(public.get("correction_model", "")).strip() or model
         return SavedProviderSettings(
             base_url=str(public.get("base_url", "")),
             api_key=api_key,
-            model=str(public.get("model", "gpt-5.5")),
+            model=model,
+            correction_model=correction_model,
             api_mode=api_mode,
         )
 
@@ -61,6 +65,7 @@ class ProviderSettingsStore:
             "version": 1,
             "base_url": settings.base_url.strip(),
             "model": settings.model.strip(),
+            "correction_model": settings.correction_model.strip() or settings.model.strip(),
             "api_mode": settings.api_mode,
         }
         temporary = self.path.with_suffix(".json.tmp")

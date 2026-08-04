@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
+import keyring
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from jingzhi.application import JingzhiApplicationService
 from jingzhi.config import Settings
 from jingzhi.database import Database
+from jingzhi.provider_settings import ProviderSettingsStore
 from jingzhi.ui import EvidenceButton, MainWindow
 
 
@@ -115,6 +116,40 @@ def test_html_warning_is_compacted_and_does_not_change_window_width(tmp_path) ->
     assert "网页源码" in window.notice_text.text()
     assert len(window.notice_text.text()) < 120
     assert window.width() == initial_width
+    window.manager.save_provider = lambda: None
+    window.close()
+
+
+def test_saving_provider_keeps_correction_model(tmp_path, monkeypatch) -> None:
+    stored_secret: dict[str, str] = {}
+    monkeypatch.setattr(
+        keyring,
+        "set_password",
+        lambda _service, _username, password: stored_secret.update(value=password),
+    )
+    monkeypatch.setattr(
+        keyring,
+        "get_password",
+        lambda _service, _username: stored_secret.get("value"),
+    )
+    monkeypatch.setattr(keyring, "delete_password", lambda _service, _username: None)
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        Settings(
+            data_dir=tmp_path,
+            llm_model="main-model",
+            transcript_correction_model="main-model",
+        )
+    )
+    window.model_input.setText("main-model")
+    window.correction_model_input.setText("luna")
+
+    window._save_provider()
+    application.processEvents()
+
+    saved = ProviderSettingsStore(tmp_path).load()
+    assert saved.model == "main-model"
+    assert saved.correction_model == "luna"
     window.manager.save_provider = lambda: None
     window.close()
 
