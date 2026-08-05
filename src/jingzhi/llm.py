@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jingzhi.context import QuestionContext
+from jingzhi.context import QuestionContext, SynthesisContext
 from jingzhi.transcript_correction import CorrectionRequest
 
 
@@ -29,6 +29,13 @@ class AnswerModelResult:
 @dataclass(frozen=True, slots=True)
 class MaterialModelResult:
     content: str
+    request_id: str | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisModelResult:
+    text: str
     request_id: str | None = None
     model: str | None = None
 
@@ -293,6 +300,50 @@ class OpenAIContextModel:
         if not raw:
             raise ProviderRequestError("会话材料模型没有返回 Markdown 内容", request_id=request_id)
         return MaterialModelResult(raw, request_id, resolved_model)
+
+    def synthesize(self, question: str, context: SynthesisContext) -> SynthesisModelResult:
+        prompt = (
+            "你是跨会话深度分析助手。用户只授权了下列证据，必须严格限定在这些证据内回答。"
+            "请使用 Markdown 输出；明确区分证据确认、跨会话比较、推断和无法确认的部分。"
+            "每个关键结论都要引用相关的稳定证据标识。\n\n"
+            f"问题：{question}\n\n{context.prompt_text}"
+        )
+        response_content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        chat_content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for item in context.evidence:
+            if item.image_url is None:
+                continue
+            label = f"[{item.stable_id}] 关键帧图像"
+            response_content.append({"type": "input_text", "text": label})
+            response_content.append({"type": "input_image", "image_url": item.image_url})
+            chat_content.append({"type": "text", "text": label})
+            chat_content.append({"type": "image_url", "image_url": {"url": item.image_url}})
+        try:
+            client = self._client()
+            if self.api_mode == "responses":
+                response = client.responses.create(
+                    model=self.model,
+                    input=[{"role": "user", "content": response_content}],
+                    **self._responses_options(),
+                )
+                raw = str(response.output_text or "").strip()
+                request_id = getattr(response, "id", None)
+                resolved_model = getattr(response, "model", self.model)
+            else:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": chat_content}],
+                )
+                raw = self._chat_text(response).strip()
+                request_id = getattr(response, "id", None)
+                resolved_model = getattr(response, "model", self.model)
+            if not raw:
+                raise ProviderRequestError("跨会话综合模型没有返回内容", request_id=request_id)
+            return SynthesisModelResult(raw, request_id, resolved_model)
+        except ProviderRequestError:
+            raise
+        except Exception as exc:
+            raise self._provider_error(exc) from exc
 
     def summarize(self, transcript: str) -> MaterialModelResult:
         """Compatibility alias for callers that still use the old summary name."""

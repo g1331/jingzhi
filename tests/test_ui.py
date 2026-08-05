@@ -3,6 +3,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import keyring
@@ -23,10 +24,15 @@ from PySide6.QtWidgets import (
 
 from jingzhi.application import JingzhiApplicationService
 from jingzhi.config import Settings
-from jingzhi.database import Database
+from jingzhi.cross_session import CrossSessionSynthesisError, CrossSessionSynthesisPreview
+from jingzhi.database import (
+    CrossSessionEvidenceRecord,
+    CrossSessionSearchResult,
+    Database,
+)
 from jingzhi.model_roles import RoleName
 from jingzhi.provider_settings import ProviderSettingsStore, default_saved_settings
-from jingzhi.ui import EvidenceButton, MainWindow
+from jingzhi.ui import CrossSessionSynthesisDialog, EvidenceButton, MainWindow
 
 
 class NoHardwareRecorder:
@@ -37,6 +43,124 @@ class NoHardwareRecorder:
 
     def stop(self):
         return None
+
+
+class CrossSessionDialogService:
+    def __init__(self) -> None:
+        self.preview_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.failed_items: tuple[object, ...] = ()
+        self.saved_evidence: dict[int, tuple[object, ...]] = {}
+        self.results = [
+            CrossSessionSearchResult(
+                "answer-version:1",
+                "session-1",
+                "会话一",
+                "answer",
+                1,
+                "问答",
+                1_000,
+                1_000,
+                None,
+                "问题\n答案关键词",
+                "答案关键词",
+            ),
+            CrossSessionSearchResult(
+                "answer-version:4",
+                "session-2",
+                "会话二",
+                "answer",
+                4,
+                "问答",
+                2_000,
+                2_000,
+                None,
+                "另一个答案关键词",
+                "另一个答案关键词",
+            ),
+        ]
+        self.candidates = [
+            CrossSessionEvidenceRecord(
+                "answer-version:1",
+                "session-1",
+                "会话一",
+                "answer",
+                "问答",
+                1_000,
+                1_000,
+                "答案关键词",
+                None,
+                answer_version_id=1,
+            ),
+            CrossSessionEvidenceRecord(
+                "transcript-version:2",
+                "session-1",
+                "会话一",
+                "transcript",
+                "麦克风",
+                500,
+                1_500,
+                "字幕关键词",
+                None,
+                transcript_version_id=2,
+            ),
+            CrossSessionEvidenceRecord(
+                "frame:3",
+                "session-1",
+                "会话一",
+                "frame",
+                "display:1",
+                1_000,
+                1_000,
+                None,
+                Path("frame.webp"),
+                frame_id=3,
+            ),
+            CrossSessionEvidenceRecord(
+                "answer-version:4",
+                "session-2",
+                "会话二",
+                "answer",
+                "问答",
+                2_000,
+                2_000,
+                "另一个答案关键词",
+                None,
+                answer_version_id=4,
+            ),
+        ]
+
+    def failed_cross_session_syntheses(self, *, limit: int = 10):
+        del limit
+        return self.failed_items
+
+    def cross_session_synthesis_evidence(self, synthesis_id: int):
+        return self.saved_evidence.get(synthesis_id, ())
+
+    def cross_session_search(self, query: str, *, limit: int = 50):
+        del limit
+        return [] if query == "无结果" else self.results
+
+    def cross_session_evidence_candidates(self, stable_ids: tuple[str, ...]):
+        requested = set(stable_ids)
+        if "answer-version:1" in requested:
+            return self.candidates[:3]
+        if "answer-version:4" in requested:
+            return [self.candidates[3]]
+        return []
+
+    def cross_session_synthesis_preview(self, question: str, stable_ids: tuple[str, ...]):
+        self.preview_calls.append((question, stable_ids))
+        return CrossSessionSynthesisPreview(
+            question=question,
+            stable_ids=stable_ids,
+            evidence_count=len(stable_ids),
+            character_count=10,
+            frame_count=0,
+            connection_name="连接",
+            model="模型",
+            reasoning_level="deep",
+            can_synthesize=bool(question and stable_ids),
+        )
 
 
 class VisualStateService(JingzhiApplicationService):
@@ -59,6 +183,159 @@ class VisualStateService(JingzhiApplicationService):
             answer_frame_ids=frozenset({self.cited_frame_id}),
             answer_transcript_ids=frozenset({self.cited_transcript_id}),
         )
+
+
+def test_cross_session_dialog_requires_explicit_evidence_selection_and_exposes_navigation() -> None:
+    application = QApplication.instance() or QApplication([])
+    navigated: list[CrossSessionEvidenceRecord] = []
+    dialog = CrossSessionSynthesisDialog(
+        CrossSessionDialogService(), navigate_callback=navigated.append
+    )
+
+    dialog.query_input.setText("关键词")
+    dialog._search()
+    application.processEvents()
+
+    assert dialog.result_list.count() == 2
+    assert dialog.evidence_list.count() == 3
+    assert dialog.synthesize_button.isEnabled() is False
+
+    first = dialog.evidence_list.item(0)
+    first.setCheckState(Qt.CheckState.Checked)
+    dialog.question_input.setText("比较授权证据")
+    application.processEvents()
+
+    assert dialog.synthesize_button.isEnabled() is True
+    assert dialog.service.preview_calls[-1] == ("比较授权证据", ("answer-version:1",))
+    dialog.result_list.setCurrentRow(1)
+    second = dialog.evidence_list.item(0)
+    second.setCheckState(Qt.CheckState.Checked)
+    application.processEvents()
+    assert dialog.service.preview_calls[-1] == (
+        "比较授权证据",
+        ("answer-version:1", "answer-version:4"),
+    )
+    dialog.result_list.setCurrentRow(0)
+    dialog.output.show()
+    dialog.navigate_button.setEnabled(True)
+    dialog.query_input.setText("无结果")
+    dialog._search()
+    assert dialog._selected_ids == set()
+    assert dialog.synthesize_button.isEnabled() is False
+    assert dialog.output.isHidden() is True
+    assert dialog.navigate_button.isEnabled() is False
+    dialog.query_input.setText("关键词")
+    dialog._search()
+    dialog.evidence_list.setCurrentRow(1)
+    dialog._navigate_current()
+    assert navigated[-1].stable_id == "transcript-version:2"
+    dialog.close()
+
+
+def test_main_window_navigates_cross_session_frame_to_timeline(tmp_path: Path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "cross-navigation.sqlite3")
+    session_id = database.create_session("可跳转会话", "2026-08-01T00:00:00+00:00")
+    frame_path = tmp_path / "navigation.webp"
+    Image.new("RGB", (320, 180), "navy").save(frame_path)
+    frame_id = database.add_frame(
+        session_id,
+        45_000,
+        frame_path,
+        "navigation-hash",
+        (320, 180),
+        source_id="display:2",
+    )
+    database.finish_session(session_id, "2026-08-01T00:01:00+00:00", "complete")
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    application.processEvents()
+
+    window._navigate_cross_session_evidence(
+        CrossSessionEvidenceRecord(
+            f"frame:{frame_id}",
+            session_id,
+            "可跳转会话",
+            "frame",
+            "display:2",
+            45_000,
+            45_000,
+            None,
+            frame_path,
+            frame_id=frame_id,
+        )
+    )
+    application.processEvents()
+
+    assert window._selected_session_id == session_id
+    assert window._selected_frame is not None
+    assert window._selected_frame.id == frame_id
+    assert window._timeline is not None
+    assert window._timeline.window_start_ms <= 45_000 <= window._timeline.window_end_ms
+    window.close()
+
+
+def test_main_window_navigates_historical_cross_session_transcript_version(
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "historical-navigation.sqlite3")
+    session_id = database.create_session("历史字幕会话", "2026-08-01T00:00:00+00:00")
+    chunk_id = database.add_audio_chunk(session_id, "system", 0, 5_000, tmp_path / "audio.wav")
+    segment_id = database.add_transcript(
+        session_id, chunk_id, "system", 1_000, 2_000, "原始版本", "zh", 0.9
+    )
+    original_version_id = database.transcript_versions(segment_id)[0].id
+    edited_version_id = database.add_transcript_version(segment_id, "user_edit", "当前编辑版本")
+    assert edited_version_id is not None
+    database.finish_session(session_id, "2026-08-01T00:01:00+00:00", "complete")
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    application.processEvents()
+
+    window._navigate_cross_session_evidence(
+        CrossSessionEvidenceRecord(
+            f"transcript-version:{original_version_id}",
+            session_id,
+            "历史字幕会话",
+            "transcript",
+            "system",
+            1_000,
+            2_000,
+            "原始版本",
+            None,
+            transcript_version_id=original_version_id,
+        )
+    )
+    application.processEvents()
+
+    assert window._selected_transcript is not None
+    assert window._selected_transcript.version_id == original_version_id
+    assert window._selected_transcript.text == "原始版本"
+    assert edited_version_id != original_version_id
+    window.close()
+
+
+def test_cross_session_dialog_exposes_retry_for_persisted_failure() -> None:
+    application = QApplication.instance() or QApplication([])
+    service = CrossSessionDialogService()
+    service.failed_items = (SimpleNamespace(id=42),)
+    service.saved_evidence[42] = (SimpleNamespace(stable_id="answer-version:1"),)
+    dialog = CrossSessionSynthesisDialog(service)
+
+    assert dialog._failed_synthesis_id == 42
+    assert dialog._selected_stable_ids() == ("answer-version:1",)
+    assert dialog.retry_button.isHidden() is False
+    dialog.query_input.setText("关键词")
+    dialog._search()
+    assert dialog._failed_synthesis_id is None
+    assert dialog.retry_button.isHidden() is True
+    dialog._show_synthesis_error(CrossSessionSynthesisError("模型失败", 43))
+    application.processEvents()
+
+    assert dialog.retry_button.isHidden() is False
+    assert dialog.retry_button.isEnabled() is True
+    dialog.close()
 
 
 def _frame_buttons(window: MainWindow) -> list[QPushButton]:

@@ -5,6 +5,7 @@ import keyring
 import pytest
 
 from jingzhi.config import Settings
+from jingzhi.context import SynthesisContext, SynthesisEvidence
 from jingzhi.database import Database
 from jingzhi.llm import OpenAIContextModel
 from jingzhi.model_roles import (
@@ -122,6 +123,60 @@ def test_reasoning_effort_is_only_sent_to_responses_protocol(monkeypatch) -> Non
 
     assert calls[0]["reasoning"] == {"effort": "medium"}
     assert "reasoning" not in calls[1]
+
+
+def test_synthesis_builds_provider_payload_from_only_the_authorized_context(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class Responses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text="综合结论", id="request-1", model="analysis-model")
+
+    model = OpenAIContextModel(
+        "analysis-model",
+        api_key="secret",
+        api_mode="responses",
+        reasoning_effort="high",
+    )
+    monkeypatch.setattr(model, "_client", lambda: SimpleNamespace(responses=Responses()))
+    context = SynthesisContext(
+        (
+            SynthesisEvidence(
+                "answer-version:1",
+                "session-1",
+                "会话一",
+                "answer",
+                "问答",
+                1_000,
+                1_000,
+                "已授权答案",
+                None,
+            ),
+            SynthesisEvidence(
+                "frame:2",
+                "session-2",
+                "会话二",
+                "frame",
+                "display:1",
+                2_000,
+                2_000,
+                None,
+                "data:image/png;base64,ZmFrZQ==",
+            ),
+        )
+    )
+
+    result = model.synthesize("比较已选证据", context)
+
+    assert result.text == "综合结论"
+    payload = calls[0]
+    content = payload["input"][0]["content"]
+    text = "\n".join(item["text"] for item in content if item["type"] == "input_text")
+    assert "已授权答案" in text
+    assert "未授权" not in text
+    assert sum(item["type"] == "input_image" for item in content) == 1
+    assert payload["reasoning"] == {"effort": "high"}
 
 
 def test_router_executes_authorized_fallbacks_and_records_actual_source(tmp_path) -> None:

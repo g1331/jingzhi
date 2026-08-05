@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -27,6 +28,22 @@ AdapterFactory = Callable[[ModelConnection, str, str | None], Any]
 class RoutedResult(Generic[T]):
     value: T
     invocation: ModelInvocationRecord
+
+
+def invocation_connection_json(invocation: ModelInvocationRecord) -> str:
+    return json.dumps(
+        {
+            "connection_id": invocation.connection_id,
+            "connection_name": invocation.connection_name,
+            "base_url": invocation.base_url,
+            "api_mode": invocation.api_mode,
+            "role": invocation.role,
+            "reasoning_level": invocation.reasoning_level,
+            "fallback_reason": invocation.fallback_reason,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 class ModelRoutingError(RuntimeError):
