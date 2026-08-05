@@ -450,7 +450,7 @@ def test_restore_rejects_target_replaced_with_symlink_after_preview(tmp_path: Pa
     target = tmp_path / "restored-data"
     outside = tmp_path / "outside"
     outside.mkdir()
-    original_preview = manager.preview_restore
+    original_preview = manager._preview_restore
 
     def preview_with_symlink(archive_path: Path, target_path: Path):
         preview = original_preview(archive_path, target_path)
@@ -462,7 +462,7 @@ def test_restore_rejects_target_replaced_with_symlink_after_preview(tmp_path: Pa
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"symlinks unavailable: {exc}")
     target.unlink()
-    manager.preview_restore = preview_with_symlink  # type: ignore[method-assign]
+    manager._preview_restore = preview_with_symlink  # type: ignore[method-assign]
 
     with pytest.raises(ArchiveError, match="符号链接"):
         manager.restore_backup(backup, target)
