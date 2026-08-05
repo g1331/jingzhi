@@ -12,7 +12,10 @@ from jingzhi.database import (
     AnswerEvidenceRecord,
     AnswerVersionRecord,
     Database,
+    MaterialEvidenceRecord,
+    QuestionNoteRecord,
     SessionAnswerRecord,
+    SessionMaterialVersionRecord,
     SessionNotificationKind,
     SessionRecord,
     SourceEventRecord,
@@ -24,6 +27,7 @@ from jingzhi.database import (
     TranscriptCorrectionSettingsRecord,
     TranscriptVersionRecord,
 )
+from jingzhi.materials import MaterialGenerationPreview
 from jingzhi.model_roles import RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter
 from jingzhi.storage import storage_writer
@@ -734,6 +738,63 @@ class JingzhiApplicationService:
 
     def session_answers(self, session_id: str) -> list[SessionAnswerRecord]:
         return self.database.session_answers(session_id)
+
+    def session_materials(self, session_id: str) -> list[SessionMaterialVersionRecord]:
+        return self.database.session_material_versions(session_id)
+
+    def material_generation_mode(self):
+        mode = getattr(self.recorder, "material_generation_mode", None)
+        return mode() if callable(mode) else None
+
+    def material_generation_preview(self, session_id: str) -> MaterialGenerationPreview:
+        preview = getattr(self.recorder, "material_generation_preview", None)
+        if not callable(preview):
+            raise TypeError("Session material generation is not configured")
+        return preview(session_id)
+
+    @storage_writer("生成会话材料")
+    def generate_material(
+        self, session_id: str, *, template_id: str | None = None
+    ) -> SessionMaterialVersionRecord:
+        generator = getattr(self.recorder, "generate_material", None)
+        if not callable(generator):
+            raise TypeError("Session material generation is not configured")
+        return generator(session_id, template_id=template_id)
+
+    @storage_writer("编辑会话材料")
+    def edit_material(
+        self, session_id: str, material_version_id: int, content: str
+    ) -> SessionMaterialVersionRecord:
+        material = self.database.material_version(material_version_id)
+        if material is None or material.session_id != session_id:
+            raise KeyError(f"Unknown material version for session: {material_version_id}")
+        editor = getattr(self.recorder, "edit_material", None)
+        if not callable(editor):
+            raise TypeError("Session material editing is not configured")
+        return editor(material_version_id, content)
+
+    def material_evidence_entries(
+        self, session_id: str, material_version_id: int
+    ) -> list[MaterialEvidenceRecord]:
+        material = self.database.material_version(material_version_id)
+        if material is None or material.session_id != session_id:
+            raise KeyError(f"Unknown material version for session: {material_version_id}")
+        return self.database.material_evidence(material_version_id)
+
+    @storage_writer("添加问题附注")
+    def add_question_note(
+        self, session_id: str, question_id: int, content: str
+    ) -> QuestionNoteRecord:
+        question = self.database.question(question_id)
+        if question is None or question.session_id != session_id or question.state != "submitted":
+            raise KeyError(f"Unknown submitted question for session: {question_id}")
+        return self.database.add_question_note(question_id, content)
+
+    def question_notes(self, session_id: str, question_id: int) -> list[QuestionNoteRecord]:
+        question = self.database.question(question_id)
+        if question is None or question.session_id != session_id:
+            raise KeyError(f"Unknown question for session: {question_id}")
+        return self.database.question_notes(question_id)
 
     @storage_writer("编辑字幕")
     def edit_transcript(self, segment_id: int, text: str) -> int:

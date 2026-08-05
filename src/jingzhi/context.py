@@ -122,3 +122,27 @@ class ContextAssembler:
             ),
             frames=tuple(frame_evidence),
         )
+
+    def for_material(self, session_id: str) -> QuestionContext:
+        """Build the exact effective transcript evidence for a whole session."""
+        transcripts = self.database.all_effective_transcripts(session_id)
+        if not transcripts:
+            raise RuntimeError("No transcript is available yet")
+        end_ms = max(item.end_ms for item in transcripts)
+        return QuestionContext(
+            start_ms=0,
+            end_ms=end_ms,
+            transcripts=tuple(
+                TranscriptEvidence(
+                    stable_id=f"transcript-version:{item.version_id}",
+                    segment_id=item.segment_id,
+                    version_id=item.version_id,
+                    source=item.source,
+                    start_ms=item.start_ms,
+                    end_ms=item.end_ms,
+                    text=item.text,
+                )
+                for item in transcripts
+            ),
+            frames=(),
+        )

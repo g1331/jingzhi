@@ -4,7 +4,7 @@ import json
 import logging
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -19,7 +19,16 @@ from jingzhi.capture.devices import (
 from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
-from jingzhi.database import Database, SourceEventRecord, TimelineEventKind
+from jingzhi.context import ContextAssembler
+from jingzhi.database import (
+    Database,
+    SessionMaterialVersionRecord,
+    SourceEventRecord,
+    TimelineEventKind,
+)
+from jingzhi.llm import MaterialModelResult
+from jingzhi.material_settings import MaterialGenerationMode, MaterialGenerationSettingsStore
+from jingzhi.materials import MaterialGenerationPreview, legacy_summary_to_markdown
 from jingzhi.model_roles import ModelRole, RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
@@ -85,6 +94,8 @@ class SessionManager:
         self.correction_batcher = CorrectionWindowBatcher(self.correction_window_seconds)
         self.correction_flush_event = threading.Event()
         self.provider_settings_store = ProviderSettingsStore(settings.data_dir)
+        self.material_generation_settings_store = MaterialGenerationSettingsStore(settings.data_dir)
+        self._material_generation_mode = self.material_generation_settings_store.load()
         self.whisper_settings_store = WhisperSettingsStore(settings.data_dir)
         self.whisper_settings = settings.whisper
         self.whisper_capabilities = whisper_capabilities or detect_whisper_capabilities()
@@ -221,6 +232,8 @@ class SessionManager:
         write_thread_names = {
             "answer-question",
             "reanswer-question",
+            "generate-material",
+            "edit-material",
             "summarize-session",
         }
         if any(thread.name in write_thread_names for thread in threading.enumerate()):
@@ -666,41 +679,128 @@ class SessionManager:
             raise RuntimeError("The selected question does not belong to the current session")
         return self.reanswer_question(self.last_question_id)
 
-    @storage_writer("生成会话材料")
-    def summarize(self) -> dict:
-        if self.session_id is None:
-            raise RuntimeError("There is no current session")
-        transcripts = self.database.all_effective_transcripts(self.session_id)
-        transcript = "\n".join(
-            f"[{item.start_ms / 1000:.1f}s][{item.source}] {item.text}" for item in transcripts
+    def material_generation_mode(self) -> MaterialGenerationMode | None:
+        return self._material_generation_mode
+
+    @storage_writer("保存会话材料生成策略")
+    def set_material_generation_mode(self, mode: MaterialGenerationMode) -> None:
+        self.material_generation_settings_store.save(mode)
+        self._material_generation_mode = mode
+
+    def material_generation_preview(self, session_id: str) -> MaterialGenerationPreview:
+        transcripts = self.database.all_effective_transcripts(session_id)
+        role = self.model_role(RoleName.DEEP_ANALYSIS)
+        connection = next(
+            (item for item in self.provider_settings.connections if item.id == role.connection_id),
+            None,
         )
-        if not transcript:
-            raise RuntimeError("No transcript is available yet")
+        if connection is None:
+            raise RuntimeError(f"Model connection is not configured: {role.connection_id}")
+        return MaterialGenerationPreview(
+            session_id=session_id,
+            transcript_count=len(transcripts),
+            character_count=sum(len(item.text) for item in transcripts),
+            connection_name=connection.name,
+            model=role.model,
+            base_url=connection.base_url,
+            reasoning_level=role.reasoning.value,
+        )
+
+    @storage_writer("生成会话材料")
+    def generate_material(
+        self, session_id: str | None = None, *, template_id: str | None = None
+    ) -> SessionMaterialVersionRecord:
+        target_session_id = session_id or self.session_id
+        if target_session_id is None:
+            raise RuntimeError("There is no session to generate material for")
+        context = ContextAssembler(self.database).for_material(target_session_id)
+        persistence_items = context.persistence_items()
         evidence = tuple(
             InvocationEvidence(
-                stable_id=f"transcript-version:{item.version_id}",
-                kind="transcript",
-                source=item.source,
-                start_ms=item.start_ms,
-                end_ms=item.end_ms,
-                transcript_version_id=item.version_id,
+                stable_id=str(item["stable_id"]),
+                kind=str(item["kind"]),
+                source=str(item["source"]),
+                start_ms=int(item["start_ms"]),
+                end_ms=int(item["end_ms"]),
+                transcript_version_id=(
+                    int(item["transcript_version_id"])
+                    if item.get("transcript_version_id") is not None
+                    else None
+                ),
+                frame_id=(int(item["frame_id"]) if item.get("frame_id") is not None else None),
             )
-            for item in transcripts
+            for item in persistence_items
         )
+
+        def generate(model):  # type: ignore[no-untyped-def]
+            method = getattr(model, "generate_material", None)
+            if callable(method):
+                return method(context, template_id=template_id)
+            legacy = model.summarize(context.transcript)
+            if isinstance(legacy, MaterialModelResult):
+                return legacy
+            if isinstance(legacy, str):
+                return MaterialModelResult(legacy)
+            if isinstance(legacy, Mapping):
+                return MaterialModelResult(legacy_summary_to_markdown(legacy))
+            raise TypeError("Material model returned an unsupported result")
+
         routed = self._model_router().invoke(
             RoleName.DEEP_ANALYSIS,
-            lambda model: model.summarize(transcript),
-            session_id=self.session_id,
+            generate,
+            session_id=target_session_id,
             evidence=evidence,
         )
         result = routed.value
-        created_at = datetime.now(UTC).isoformat()
-        for kind in ("summary", "knowledge_points", "mistakes"):
-            self.database.add_artifact(
-                self.session_id,
-                kind,
-                created_at,
-                json.dumps(result.get(kind), ensure_ascii=False),
-                routed.invocation.model,
-            )
-        return result
+        if isinstance(result, MaterialModelResult):
+            content = result.content
+            request_id = result.request_id
+            model_name = result.model or routed.invocation.model
+        elif isinstance(result, str):
+            content = result
+            request_id = None
+            model_name = routed.invocation.model
+        else:
+            raise TypeError("Material model returned an unsupported result")
+        return self.database.record_material_version(
+            target_session_id,
+            kind="generated",
+            content=content,
+            template_id=template_id,
+            model=model_name,
+            connection_json=self._connection_json(routed.invocation),
+            model_invocation_id=routed.invocation.id,
+            request_status="succeeded",
+            request_id=request_id,
+            error=None,
+            evidence_state="exact",
+            evidence=persistence_items,
+        )
+
+    @storage_writer("编辑会话材料")
+    def edit_material(self, material_version_id: int, content: str) -> SessionMaterialVersionRecord:
+        return self.database.record_material_edit(material_version_id, content)
+
+    def material_versions(self, session_id: str) -> list[SessionMaterialVersionRecord]:
+        return self.database.session_material_versions(session_id)
+
+    @storage_writer("生成会话材料")
+    def summarize(self) -> str:
+        """Compatibility entry point retained for callers of the old summary action."""
+        return self.generate_material().content
+
+    @staticmethod
+    def _connection_json(invocation) -> str:  # type: ignore[no-untyped-def]
+        return json.dumps(
+            {
+                "connection_id": invocation.connection_id,
+                "connection_name": invocation.connection_name,
+                "base_url": invocation.base_url,
+                "api_mode": invocation.api_mode,
+                "role": invocation.role,
+                "reasoning_level": invocation.reasoning_level,
+                "fallback_reason": invocation.fallback_reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
