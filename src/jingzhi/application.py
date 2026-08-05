@@ -4,8 +4,10 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Protocol
 
+from jingzhi.archive import ArchiveManager, RestorePreview, RestoreResult
 from jingzhi.capture.devices import RecordingSelection
 from jingzhi.context import ContextAssembler, QuestionContext
 from jingzhi.database import (
@@ -30,7 +32,7 @@ from jingzhi.database import (
 from jingzhi.materials import MaterialGenerationPreview
 from jingzhi.model_roles import RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter
-from jingzhi.storage import storage_writer
+from jingzhi.storage import storage_reader, storage_writer
 from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
     TranscriptCorrectionProcessor,
@@ -293,6 +295,7 @@ class JingzhiApplicationService:
     ) -> None:
         self.database = database
         self.recorder = recorder
+        self.archive = ArchiveManager(database, source_busy_reason=self.archive_storage_busy_reason)
         self._now = now or (lambda: datetime.now(UTC))
         self.correction_model = correction_model
         active_session_id = getattr(recorder, "session_id", None) if recorder.is_recording else None
@@ -304,9 +307,27 @@ class JingzhiApplicationService:
     def is_recording(self) -> bool:
         return self.recorder.is_recording
 
-    def session_storage_busy_reason(self, session_id: str) -> str | None:
-        if getattr(self.recorder, "session_id", None) != session_id:
-            return None
+    @storage_reader("导出会话")
+    def export_session(self, session_id: str, destination: Path) -> Path:
+        self._ensure_archive_source_idle()
+        return self.archive.export_session(session_id, destination)
+
+    @storage_reader("创建完整备份")
+    def create_backup(self, destination: Path) -> Path:
+        self._ensure_archive_source_idle()
+        return self.archive.create_backup(destination)
+
+    @storage_reader("检查完整备份")
+    def preview_restore(self, archive: Path, target_dir: Path) -> RestorePreview:
+        self._ensure_archive_source_idle()
+        return self.archive.preview_restore(archive, target_dir)
+
+    @storage_writer("恢复完整备份")
+    def restore_backup(self, archive: Path, target_dir: Path) -> RestoreResult:
+        self._ensure_archive_source_idle()
+        return self.archive.restore_backup(archive, target_dir)
+
+    def archive_storage_busy_reason(self) -> str | None:
         busy_reason = getattr(self.recorder, "storage_busy_reason", None)
         if callable(busy_reason):
             reason = busy_reason()
@@ -315,6 +336,16 @@ class JingzhiApplicationService:
         if self.recorder.is_recording:
             return "正在记录会话"
         return None
+
+    def _ensure_archive_source_idle(self) -> None:
+        reason = self.archive_storage_busy_reason()
+        if reason:
+            raise RuntimeError(f"归档需要等待当前写入完成：{reason}")
+
+    def session_storage_busy_reason(self, session_id: str) -> str | None:
+        if getattr(self.recorder, "session_id", None) != session_id:
+            return None
+        return self.archive_storage_busy_reason()
 
     def start_session(
         self,

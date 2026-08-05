@@ -6,8 +6,10 @@ import re
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import ClassVar
 
 from PIL.ImageQt import ImageQt
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -191,6 +194,11 @@ QLabel#statusPill[state="error"] {
     background: #321d1c;
     border-color: #713a36;
 }
+QLabel#statusPill[state="busy"] {
+    color: #c9d7d2;
+    background: #1d292b;
+    border-color: #3d5758;
+}
 QGroupBox {
     background: #141b1d;
     border: 1px solid #273235;
@@ -328,6 +336,10 @@ class UiBridge(QObject):
     provider_tested = Signal(str)
     maintenance_finished = Signal(object)
     maintenance_failed = Signal(str)
+    archive_finished = Signal(str, str)
+    archive_failed = Signal(str, str)
+    archive_preview_finished = Signal(object)
+    archive_preview_failed = Signal(str)
 
 
 class RecordingConfirmationDialog(QDialog):
@@ -700,6 +712,7 @@ class MainWindow(QMainWindow):
         self._storage_dialog: StorageSettingsDialog | None = None
         self._session_sort_newest = True
         self._maintenance_thread: threading.Thread | None = None
+        self._archive_operation: str | None = None
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
@@ -814,6 +827,7 @@ class MainWindow(QMainWindow):
         self.session_delete_button = QPushButton("删除")
         self.session_restore_button = QPushButton("恢复")
         self.session_complete_button = QPushButton("标记完成")
+        self.session_export_button = QPushButton("导出会话")
         action_row.addWidget(self.session_pin_button)
         action_row.addWidget(self.session_delete_button)
         action_row.addWidget(self.session_restore_button)
@@ -825,6 +839,13 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(self.session_library, 1)
         panel_layout.addLayout(action_row)
         panel_layout.addWidget(self.session_complete_button)
+        panel_layout.addWidget(self.session_export_button)
+        archive_row = QHBoxLayout()
+        self.backup_button = QPushButton("完整备份")
+        self.restore_backup_button = QPushButton("恢复备份")
+        archive_row.addWidget(self.backup_button)
+        archive_row.addWidget(self.restore_backup_button)
+        panel_layout.addLayout(archive_row)
         library_state = QLabel("未固定会话保留 30 天 · 回收区保留 7 天")
         library_state.setObjectName("hint")
         library_state.setWordWrap(True)
@@ -1694,23 +1715,26 @@ class MainWindow(QMainWindow):
         if not isinstance(record, SessionRecord):
             self.session_pin_button.setEnabled(False)
             self.session_delete_button.setEnabled(False)
+            self.session_export_button.setEnabled(False)
             self.session_restore_button.hide()
             self.session_complete_button.hide()
             return
         current = record.id == self._active_session_id()
         busy = self.service.session_storage_busy_reason(record.id) is not None
+        archive_busy = self._archive_operation is not None
         self.session_pin_button.setEnabled(
-            not current and not busy and record.trashed_at_utc is None
+            not archive_busy and not current and not busy and record.trashed_at_utc is None
         )
         self.session_pin_button.setText("取消固定" if record.pinned else "固定")
         self.session_delete_button.setEnabled(
-            not current and not busy and record.trashed_at_utc is None
+            not archive_busy and not current and not busy and record.trashed_at_utc is None
         )
+        self.session_export_button.setEnabled(not archive_busy and not busy)
         self.session_delete_button.setVisible(record.trashed_at_utc is None)
         self.session_restore_button.setVisible(record.trashed_at_utc is not None)
         interrupted = record.status == "interrupted" and record.trashed_at_utc is None
         self.session_complete_button.setVisible(interrupted)
-        self.session_complete_button.setEnabled(interrupted and not busy)
+        self.session_complete_button.setEnabled(interrupted and not busy and not archive_busy)
 
     def _toggle_session_sort(self) -> None:
         self._session_sort_newest = not self._session_sort_newest
@@ -1771,9 +1795,197 @@ class MainWindow(QMainWindow):
             return
         self._refresh_sessions(record.id)
 
+    def _archive_active(self) -> bool:
+        return self._archive_operation is not None
+
+    def _set_archive_buttons_enabled(self, enabled: bool) -> None:
+        self.backup_button.setEnabled(enabled)
+        self.restore_backup_button.setEnabled(enabled)
+        self._update_session_actions(self.session_library.currentItem())
+        self._refresh_recording_status()
+        if not enabled:
+            self.session_export_button.setEnabled(False)
+
+    def _run_archive_operation(self, operation: str, work: Callable[[], object]) -> None:
+        if self._archive_active():
+            return
+        self._archive_operation = operation
+        self._set_archive_buttons_enabled(False)
+        labels = {
+            "export": "正在导出会话",
+            "backup": "正在创建完整备份",
+            "restore": "正在恢复完整备份",
+        }
+        self._set_status(labels[operation], "busy")
+
+        def run() -> None:
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001 - transferred to the UI thread
+                self.bridge.archive_failed.emit(operation, str(exc))
+                return
+            target = getattr(result, "target_dir", result)
+            self.bridge.archive_finished.emit(operation, str(target))
+
+        threading.Thread(target=run, name=f"archive-{operation}", daemon=True).start()
+
+    def _run_restore_preview(self, archive: Path, target: Path) -> None:
+        if self._archive_active():
+            return
+        self._archive_operation = "restore-preview"
+        self._set_archive_buttons_enabled(False)
+        self._set_status("正在校验完整备份", "busy")
+
+        def run() -> None:
+            try:
+                preview = self.service.preview_restore(archive, target)
+            except Exception as exc:  # noqa: BLE001 - transferred to the UI thread
+                self.bridge.archive_preview_failed.emit(str(exc))
+                return
+            self.bridge.archive_preview_finished.emit(preview)
+
+        threading.Thread(target=run, name="archive-restore-preview", daemon=True).start()
+
+    @Slot()
+    def _export_selected_session(self) -> None:
+        record = self._selected_session_record()
+        if record is None:
+            return
+        busy_reason = self._storage_busy_reason()
+        if busy_reason:
+            self._show_action_error(f"当前不能导出会话：{busy_reason}")
+            return
+        busy_reason = self.service.session_storage_busy_reason(record.id)
+        if busy_reason:
+            self._show_action_error(f"会话仍在写入：{busy_reason}")
+            return
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "导出会话 ZIP",
+            str(self.settings.data_dir.parent / f"{record.id}.zip"),
+            "ZIP 归档 (*.zip)",
+        )
+        if not selected:
+            return
+        destination = self._zip_destination(selected)
+        self._run_archive_operation(
+            "export", lambda: self.service.export_session(record.id, destination)
+        )
+
+    @Slot()
+    def _create_full_backup(self) -> None:
+        busy_reason = self._storage_busy_reason()
+        if busy_reason:
+            self._show_action_error(f"当前不能创建完整备份：{busy_reason}")
+            return
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "创建完整备份",
+            str(self.settings.data_dir.parent / "jingzhi-backup.zip"),
+            "ZIP 备份 (*.zip)",
+        )
+        if not selected:
+            return
+        destination = self._zip_destination(selected)
+        self._run_archive_operation("backup", lambda: self.service.create_backup(destination))
+
+    @staticmethod
+    def _zip_destination(selected: str) -> Path:
+        destination = Path(selected)
+        return (
+            destination if destination.suffix.lower() == ".zip" else destination.with_suffix(".zip")
+        )
+
+    @Slot()
+    def _restore_full_backup(self) -> None:
+        busy_reason = self._storage_busy_reason()
+        if busy_reason:
+            self._show_action_error(f"当前不能恢复完整备份：{busy_reason}")
+            return
+        selected, _filter = QFileDialog.getOpenFileName(
+            self, "选择完整备份", str(self.settings.data_dir.parent), "ZIP 备份 (*.zip)"
+        )
+        if not selected:
+            return
+        archive = Path(selected)
+        selected_target = QFileDialog.getExistingDirectory(
+            self, "选择空的数据目录", str(self.settings.data_dir.parent)
+        )
+        if not selected_target:
+            return
+        self._run_restore_preview(archive, Path(selected_target))
+
+    @Slot(object)
+    def _restore_preview_finished(self, preview) -> None:  # type: ignore[no-untyped-def]
+        self._archive_operation = None
+        if not preview.can_restore:
+            reason = preview.reason or "恢复目标不可用。"
+            if preview.conflicting_session_ids:
+                reason += "\n重复会话：" + "、".join(preview.conflicting_session_ids)
+            self._set_archive_buttons_enabled(True)
+            self._show_action_error(reason)
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "确认恢复完整备份",
+            f"将把 {len(preview.session_ids)} 个会话恢复到：\n{preview.target_dir}\n\n"
+            "目标目录必须保持为空；恢复策略为拒绝已有数据，不覆盖或合并。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        self._set_archive_buttons_enabled(True)
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self._set_status("恢复已取消", "idle")
+            return
+        self._run_archive_operation(
+            "restore",
+            lambda: self.service.restore_backup(preview.archive, preview.target_dir),
+        )
+
+    @Slot(str)
+    def _restore_preview_failed(self, message: str) -> None:
+        self._archive_failed("restore-preview", message)
+
+    @Slot(str, str)
+    def _archive_finished(self, operation: str, target: str) -> None:
+        self._archive_operation = None
+        labels = {
+            "export": "会话导出完成",
+            "backup": "完整备份完成",
+            "restore": "完整备份恢复完成",
+        }
+        message = f"{labels.get(operation, '归档操作完成')}：{target}"
+        if operation == "restore":
+            restored_dir = Path(target)
+            startup_store = self.settings.startup_settings_store
+            if self.settings.data_dir_managed_by_env:
+                message += "\n当前数据目录由 STUDY_DATA_DIR 管理；本窗口未切换数据源。"
+            elif startup_store is None:
+                message += "\n已恢复到新目录；请重启境织后使用该目录。"
+            else:
+                try:
+                    startup_store.update(data_dir=restored_dir)
+                except Exception as exc:  # noqa: BLE001 - UI boundary reports persistence failures
+                    message += (
+                        f"\n已恢复，但未能设置下次启动目录：{self._compact_message(str(exc))}"
+                    )
+                else:
+                    message += "\n已设置为下次启动的数据目录；当前窗口将在重启后切换。"
+        self._set_archive_buttons_enabled(True)
+        self._set_status(labels.get(operation, "归档操作完成"), "success")
+        self.notice_text.setText(message)
+        self.notice.show()
+
+    @Slot(str, str)
+    def _archive_failed(self, operation: str, message: str) -> None:
+        self._archive_operation = None
+        self._set_archive_buttons_enabled(True)
+        self._set_status("归档操作失败", "error")
+        self.notice_text.setText(self._compact_message(message))
+        self.notice.show()
+
     def _refresh_recording_status(self) -> None:
         if not getattr(self.service, "is_recording", False):
-            if self._stop_in_flight:
+            if self._archive_active() or self._stop_in_flight:
                 self.start_button.setEnabled(False)
             else:
                 session_id = getattr(self.manager, "session_id", None)
@@ -2270,6 +2482,10 @@ class MainWindow(QMainWindow):
             "summarize-session",
             "whisper-model-download",
             "whisper-benchmark",
+            "archive-export",
+            "archive-backup",
+            "archive-restore",
+            "archive-restore-preview",
         }
         if any(thread.name in write_thread_names for thread in threading.enumerate()):
             return "后台任务仍在写入应用数据或模型缓存"
@@ -2301,6 +2517,9 @@ class MainWindow(QMainWindow):
         self.session_delete_button.clicked.connect(self._delete_selected_session)
         self.session_restore_button.clicked.connect(self._restore_selected_session)
         self.session_complete_button.clicked.connect(self._complete_selected_session)
+        self.session_export_button.clicked.connect(self._export_selected_session)
+        self.backup_button.clicked.connect(self._create_full_backup)
+        self.restore_backup_button.clicked.connect(self._restore_full_backup)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self._stop)
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -2356,6 +2575,10 @@ class MainWindow(QMainWindow):
         self.bridge.provider_tested.connect(self._provider_tested)
         self.bridge.maintenance_finished.connect(self._maintenance_finished)
         self.bridge.maintenance_failed.connect(self._maintenance_failed)
+        self.bridge.archive_finished.connect(self._archive_finished)
+        self.bridge.archive_failed.connect(self._archive_failed)
+        self.bridge.archive_preview_finished.connect(self._restore_preview_finished)
+        self.bridge.archive_preview_failed.connect(self._restore_preview_failed)
 
     @staticmethod
     def _compact_message(message: str) -> str:
@@ -2425,6 +2648,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start(self) -> None:
+        if self._archive_active():
+            self._show_action_error("归档操作正在进行，请等待完成后再开始会话。")
+            return
         catalog = getattr(self.manager, "device_catalog", None) or WindowsDeviceCatalog()
         dialog = RecordingConfirmationDialog(
             catalog,
@@ -3202,6 +3428,10 @@ class MainWindow(QMainWindow):
             self._maybe_generate_material_after_stop(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._archive_active():
+            self._show_action_error("归档操作正在进行，请等待完成后再退出境织。")
+            event.ignore()
+            return
         if self._storage_dialog is not None and self._storage_dialog.operation_active:
             self._storage_dialog.show()
             self._storage_dialog.raise_()

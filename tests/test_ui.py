@@ -131,6 +131,24 @@ def test_pause_control_starts_disabled_when_idle(tmp_path) -> None:
     window.close()
 
 
+def test_archive_controls_require_a_session_for_export_and_expose_backup_actions(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    application.processEvents()
+
+    assert window.session_export_button.isEnabled() is False
+    assert window.backup_button.isEnabled() is True
+    assert window.restore_backup_button.isEnabled() is True
+
+    session_id = window.service.database.create_session("可导出会话", "2026-08-04T10:00:00+00:00")
+    window.service.database.finish_session(session_id, "2026-08-04T10:01:00+00:00", "complete")
+    window._refresh_sessions(session_id)
+    application.processEvents()
+
+    assert window.session_export_button.isEnabled() is True
+    window.close()
+
+
 def test_start_waits_for_interrupted_workers_to_exit(tmp_path) -> None:
     application = QApplication.instance() or QApplication([])
     window = MainWindow(Settings(data_dir=tmp_path))
