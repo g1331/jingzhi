@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -87,6 +89,11 @@ from jingzhi.model_roles import (
     ReasoningLevel,
     RoleName,
 )
+from jingzhi.onboarding import (
+    DEFAULT_QUESTION_SHORTCUT,
+    ONBOARDING_STEPS,
+    OnboardingSettingsStore,
+)
 from jingzhi.provider_settings import SavedProviderSettings
 from jingzhi.recording_settings import (
     RecordingPreferences,
@@ -98,9 +105,37 @@ from jingzhi.rich_text import MarkdownDocument
 from jingzhi.session import SessionManager
 from jingzhi.storage_ui import StorageSettingsDialog
 from jingzhi.transcript_correction import CORRECTION_WINDOW_SECONDS
+from jingzhi.whisper_settings import (
+    PROFILE_PRESETS,
+    WhisperProfile,
+    create_builtin_whisper_sample,
+)
 from jingzhi.whisper_ui import WhisperSettingsDialog
 
 logger = logging.getLogger(__name__)
+
+
+def _confirm_recording_selection(
+    parent: QWidget,
+    manager: object,
+    settings: Settings,
+    *,
+    default_system_audio_enabled: bool,
+    default_microphone_enabled: bool,
+) -> RecordingSelection | None:
+    catalog = getattr(manager, "device_catalog", None) or WindowsDeviceCatalog()
+    dialog = RecordingConfirmationDialog(
+        catalog,
+        RecordingSettingsStore(settings.data_dir),
+        screen_interval_s=settings.screen_interval_s,
+        audio_storage_rate=settings.audio_storage_rate,
+        default_system_audio_enabled=default_system_audio_enabled,
+        default_microphone_enabled=default_microphone_enabled,
+        parent=parent,
+    )
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.recording_selection()
 
 
 def motion_enabled() -> bool:
@@ -1036,6 +1071,770 @@ class CrossSessionSynthesisDialog(QDialog):
             self.navigate_callback(candidate)
 
 
+class RecordingCapsule(QFrame):
+    def __init__(
+        self,
+        *,
+        default_system_audio_enabled: bool,
+        default_microphone_enabled: bool,
+        pause_enabled: bool,
+        object_name: str = "recordingCapsule",
+    ) -> None:
+        super().__init__()
+        self.setObjectName(object_name)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 8, 6)
+        layout.setSpacing(7)
+        self.status = QLabel("空闲")
+        self.status.setObjectName("statusPill")
+        self.status.setProperty("state", "idle")
+        self.title_input = QLineEdit("新会话")
+        self.title_input.setPlaceholderText("会话标题")
+        self.title_input.setMaximumWidth(150)
+        self.system_audio_check = QCheckBox("系统声音")
+        self.system_audio_check.setChecked(default_system_audio_enabled)
+        self.microphone_check = QCheckBox("麦克风")
+        self.microphone_check.setChecked(default_microphone_enabled)
+        self.pause_button = QPushButton("暂停")
+        self.pause_button.setEnabled(pause_enabled)
+        if not pause_enabled:
+            self.pause_button.setToolTip("当前采集适配器尚未提供暂停能力")
+        self.capsule_ask_button = QPushButton("提问")
+        self.start_button = QPushButton("开始记录")
+        self.start_button.setProperty("role", "primary")
+        self.stop_button = QPushButton("结束")
+        self.stop_button.setProperty("role", "danger")
+        self.stop_button.setEnabled(False)
+        for widget in (
+            self.status,
+            self.title_input,
+            self.system_audio_check,
+            self.microphone_check,
+            self.pause_button,
+            self.capsule_ask_button,
+            self.start_button,
+            self.stop_button,
+        ):
+            layout.addWidget(widget)
+
+
+class OnboardingDialog(QDialog):
+    provider_tested = Signal(str)
+    whisper_benchmarked = Signal(object)
+    task_failed = Signal(str, str)
+
+    def __init__(
+        self,
+        manager: object,
+        settings: Settings,
+        *,
+        parent: QWidget | None = None,
+        state_store: OnboardingSettingsStore | None = None,
+        question_callback: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.settings = settings
+        self.state_store = state_store or OnboardingSettingsStore(settings.data_dir)
+        self.state = self.state_store.load()
+        self._question_callback = question_callback
+        self._recording_selection: RecordingSelection | None = None
+        self._provider_test_creating = False
+        self._onboarding_task: str | None = None
+        self._provider_settings_before_test: SavedProviderSettings | None = None
+        self._whisper_settings_before_test = None
+        self._whisper_dialog: WhisperSettingsDialog | None = None
+        self._shortcut = QShortcut(QKeySequence(self.state.question_shortcut), self)
+        self._shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._shortcut.activated.connect(self._shortcut_triggered)
+        self.setModal(True)
+        self.setWindowTitle("境织 · 首次使用引导")
+        self.setMinimumSize(760, 560)
+        self.resize(820, 640)
+
+        root = QVBoxLayout(self)
+        heading = QLabel("先把境织设置成适合你的工作台")
+        heading.setObjectName("appTitle")
+        root.addWidget(heading)
+        self.progress_label = QLabel()
+        self.progress_label.setObjectName("hint")
+        root.addWidget(self.progress_label)
+
+        self.pages = QStackedWidget()
+        root.addWidget(self.pages, 1)
+        self._build_privacy_page()
+        self._build_provider_page()
+        self._build_whisper_page()
+        self._build_recording_page()
+        self._build_shortcuts_page()
+
+        navigation = QHBoxLayout()
+        self.later_button = QPushButton("稍后继续")
+        self.back_button = QPushButton("上一步")
+        self.skip_button = QPushButton("跳过此步")
+        self.next_button = QPushButton("下一步")
+        self.next_button.setProperty("role", "primary")
+        navigation.addWidget(self.later_button)
+        navigation.addStretch(1)
+        navigation.addWidget(self.back_button)
+        navigation.addWidget(self.skip_button)
+        navigation.addWidget(self.next_button)
+        root.addLayout(navigation)
+
+        self.later_button.clicked.connect(self.reject)
+        self.back_button.clicked.connect(self._previous_page)
+        self.skip_button.clicked.connect(self._skip_page)
+        self.next_button.clicked.connect(self._next_page)
+        self.provider_tested.connect(self._provider_test_succeeded)
+        self.whisper_benchmarked.connect(self._whisper_benchmark_succeeded)
+        self.task_failed.connect(self._task_failed)
+
+        self._hydrate_existing_configuration()
+        self._set_page(self.state.step_index)
+
+    @property
+    def recording_selection(self) -> RecordingSelection | None:
+        if self._recording_selection is not None:
+            return self._recording_selection
+        if self.state.recording_confirmed:
+            preferences = RecordingSettingsStore(self.settings.data_dir).load()
+            self._recording_selection = RecordingSelection(
+                display_ids=preferences.display_ids,
+                system_audio_id=(
+                    preferences.system_audio_id if preferences.system_audio_enabled else None
+                ),
+                microphone_id=(
+                    preferences.microphone_id if preferences.microphone_enabled else None
+                ),
+                estimated_duration_minutes=preferences.estimated_duration_minutes,
+            )
+        return self._recording_selection
+
+    def _save_state(self, **changes: object) -> None:
+        self.state = replace(self.state, **changes)
+        self.state_store.save(self.state)
+        self._update_navigation()
+
+    def _hydrate_existing_configuration(self) -> None:
+        provider_settings = getattr(self.manager, "provider_settings", None)
+        connections = getattr(provider_settings, "connections", ())
+        utility_role = next(
+            (
+                role
+                for role in getattr(provider_settings, "roles", ())
+                if role.name == RoleName.UTILITY
+            ),
+            None,
+        )
+        utility_connection = next(
+            (
+                connection
+                for connection in connections
+                if utility_role is None or connection.id == utility_role.connection_id
+            ),
+            None,
+        )
+        if utility_connection is not None and (
+            bool(getattr(utility_connection, "base_url", "").strip())
+            or bool(getattr(utility_connection, "api_key", ""))
+        ):
+            self.state = replace(self.state, provider_completed=True, provider_skipped=False)
+        whisper_settings = getattr(self.manager, "whisper_settings", None)
+        if getattr(whisper_settings, "first_run_completed", False):
+            self.state = replace(self.state, whisper_completed=True, whisper_skipped=False)
+        recording_store = RecordingSettingsStore(self.settings.data_dir)
+        if recording_store.path.is_file():
+            self.state = replace(self.state, recording_confirmed=True)
+        self.state_store.save(self.state)
+        if self.state.recording_confirmed:
+            self.recording_status.setText("已保存录制来源配置；重新打开可以修改全部选择。")
+
+    def _new_page(self, title: str, subtitle: str) -> tuple[QWidget, QVBoxLayout]:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        layout.addWidget(title_label)
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("hint")
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(subtitle_label)
+        self.pages.addWidget(page)
+        return page, layout
+
+    def _build_privacy_page(self) -> None:
+        _page, layout = self._new_page(
+            "隐私与数据生命周期",
+            "境织默认把会话保存在本机；只有你确认发送的模型任务才会上传完成任务所需的最小上下文。",
+        )
+        notice = QLabel(
+            "• 会话、字幕、关键帧、音频和模型调用记录默认保存在本机。\n"
+            "• 发送模型任务前会显示发送范围；应用不会无边界读取整个会话库。\n"
+            "• 未固定会话默认保留 30 天，通知后进入回收区，再保留 7 天后最终删除。\n"
+            "• 你可以固定重要会话、导出单个会话或创建完整备份。"
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        layout.addStretch(1)
+        self.privacy_check = QCheckBox("我已了解本地保存、最小上传、30 天保留和 7 天回收规则")
+        self.privacy_check.setObjectName("onboardingPrivacyAcknowledgement")
+        self.privacy_check.setChecked(self.state.privacy_acknowledged)
+        self.privacy_check.toggled.connect(
+            lambda checked: self._save_state(privacy_acknowledged=checked)
+        )
+        layout.addWidget(self.privacy_check)
+
+    def _build_provider_page(self) -> None:
+        _page, layout = self._new_page(
+            "模型连接",
+            "模型连接用于问答和材料任务。你可以现在测试，也可以先跳过，只使用本地采集与转写。",
+        )
+        provider_settings = getattr(self.manager, "provider_settings", None)
+        connections = list(getattr(provider_settings, "connections", ()))
+        utility_role = next(
+            (
+                role
+                for role in getattr(provider_settings, "roles", ())
+                if role.name == RoleName.UTILITY
+            ),
+            None,
+        )
+        utility_connection_id = getattr(utility_role, "connection_id", None)
+        connection = next(
+            (item for item in connections if item.id == utility_connection_id),
+            connections[0] if connections else ModelConnection("default", "默认连接"),
+        )
+        self._provider_target_connection_id = connection.id
+        group = QGroupBox("Utility 角色连接")
+        form = QGridLayout(group)
+        self.onboarding_provider_name = QLineEdit(connection.name)
+        self.onboarding_provider_name.setObjectName("onboardingProviderName")
+        self.onboarding_provider_url = QLineEdit(connection.base_url)
+        self.onboarding_provider_url.setObjectName("onboardingProviderUrl")
+        self.onboarding_provider_api_mode = QComboBox()
+        self.onboarding_provider_api_mode.addItem("Responses API", "responses")
+        self.onboarding_provider_api_mode.addItem("Chat Completions", "chat_completions")
+        self.onboarding_provider_api_mode.setCurrentIndex(
+            max(0, self.onboarding_provider_api_mode.findData(connection.api_mode))
+        )
+        self.onboarding_provider_key = QLineEdit(connection.api_key)
+        self.onboarding_provider_key.setObjectName("onboardingProviderKey")
+        self.onboarding_provider_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.onboarding_provider_model = QLineEdit(
+            utility_role.model if utility_role is not None else "gpt-5.5"
+        )
+        self.onboarding_provider_model.setObjectName("onboardingProviderModel")
+        fields = (
+            ("连接名称", self.onboarding_provider_name),
+            ("Base URL", self.onboarding_provider_url),
+            ("接口类型", self.onboarding_provider_api_mode),
+            ("API Key", self.onboarding_provider_key),
+            ("测试模型", self.onboarding_provider_model),
+        )
+        for row, (label, field) in enumerate(fields):
+            form.addWidget(QLabel(label), row, 0)
+            form.addWidget(field, row, 1)
+        layout.addWidget(group)
+        self.provider_status = QLabel()
+        self.provider_status.setObjectName("onboardingProviderStatus")
+        self.provider_status.setWordWrap(True)
+        layout.addWidget(self.provider_status)
+        provider_buttons = QHBoxLayout()
+        self.provider_test_button = QPushButton("保存并测试连接")
+        self.provider_test_button.setObjectName("onboardingTestProvider")
+        self.provider_create_button = QPushButton("创建为新连接并测试")
+        self.provider_create_button.setObjectName("onboardingCreateProvider")
+        self.provider_test_button.clicked.connect(self._test_provider)
+        self.provider_create_button.clicked.connect(lambda: self._test_provider(create_new=True))
+        provider_buttons.addWidget(self.provider_test_button)
+        provider_buttons.addWidget(self.provider_create_button)
+        provider_buttons.addStretch(1)
+        layout.addLayout(provider_buttons)
+        layout.addStretch(1)
+
+    def _build_whisper_page(self) -> None:
+        _page, layout = self._new_page(
+            "本地 Whisper",
+            "选择本地转写档位。样本测试会下载或加载模型并报告识别、速度和资源结果；没有网络或模型不可用时也可以跳过。",
+        )
+        group = QGroupBox("转写档位")
+        form = QGridLayout(group)
+        self.onboarding_whisper_profile = QComboBox()
+        self.onboarding_whisper_profile.setObjectName("onboardingWhisperProfile")
+        for profile in WhisperProfile:
+            self.onboarding_whisper_profile.addItem(PROFILE_PRESETS[profile].label, profile.value)
+        current_whisper = getattr(self.manager, "whisper_settings", None)
+        current_profile = getattr(current_whisper, "profile", WhisperProfile.BALANCED)
+        self.onboarding_whisper_profile.setCurrentIndex(
+            max(0, self.onboarding_whisper_profile.findData(current_profile.value))
+        )
+        self.whisper_impact = QLabel()
+        self.whisper_impact.setObjectName("onboardingWhisperImpact")
+        self.whisper_impact.setWordWrap(True)
+        form.addWidget(QLabel("档位"), 0, 0)
+        form.addWidget(self.onboarding_whisper_profile, 0, 1)
+        form.addWidget(self.whisper_impact, 1, 0, 1, 2)
+        layout.addWidget(group)
+        self.whisper_status = QLabel()
+        self.whisper_status.setObjectName("onboardingWhisperStatus")
+        self.whisper_status.setWordWrap(True)
+        layout.addWidget(self.whisper_status)
+        buttons = QHBoxLayout()
+        self.whisper_benchmark_button = QPushButton("运行内置中文样本")
+        self.whisper_benchmark_button.setObjectName("onboardingBenchmarkWhisper")
+        self.whisper_advanced_button = QPushButton("打开高级设置")
+        self.whisper_advanced_button.setObjectName("onboardingAdvancedWhisper")
+        buttons.addWidget(self.whisper_benchmark_button)
+        buttons.addWidget(self.whisper_advanced_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        layout.addStretch(1)
+        self.onboarding_whisper_profile.currentIndexChanged.connect(self._whisper_profile_changed)
+        self.whisper_benchmark_button.clicked.connect(self._run_whisper_benchmark)
+        self.whisper_advanced_button.clicked.connect(self._show_advanced_whisper)
+        self._whisper_profile_changed()
+
+    def _build_recording_page(self) -> None:
+        _page, layout = self._new_page(
+            "录制前确认",
+            "开始首个会话前，境织会真实枚举显示器、系统声音和麦克风，显示缩略图、电平和预计存储占用。",
+        )
+        self.capsule_preview = RecordingCapsule(
+            default_system_audio_enabled=self.settings.capture_system_audio,
+            default_microphone_enabled=self.settings.capture_microphone,
+            pause_enabled=False,
+            object_name="recordingCapsulePreview",
+        )
+        self.capsule_preview_question = self.capsule_preview.capsule_ask_button
+        self.capsule_preview_question.setObjectName("onboardingCapsuleQuestion")
+        self.capsule_preview_start = self.capsule_preview.start_button
+        self.capsule_preview_start.setObjectName("onboardingCapsuleStart")
+        self.capsule_preview_status = QLabel("显示器 · 系统声音 · 麦克风")
+        self.capsule_preview_status.setObjectName("onboardingCapsuleStatus")
+        self.capsule_preview_question.clicked.connect(self._preview_question)
+        self.capsule_preview_start.clicked.connect(self._open_recording_confirmation)
+        layout.addWidget(self.capsule_preview)
+        layout.addWidget(self.capsule_preview_status)
+        capsule_hint = QLabel(
+            "这里的开始按钮会打开真实录制确认；完成引导后，主窗口会显示同样的录制胶囊并直接进入首个会话。"
+        )
+        capsule_hint.setObjectName("hint")
+        capsule_hint.setWordWrap(True)
+        layout.addWidget(capsule_hint)
+        self.recording_status = QLabel()
+        self.recording_status.setObjectName("onboardingRecordingStatus")
+        self.recording_status.setWordWrap(True)
+        layout.addWidget(self.recording_status)
+        self.open_recording_button = QPushButton("打开真实录制确认")
+        self.open_recording_button.setObjectName("onboardingOpenRecordingConfirmation")
+        self.open_recording_button.clicked.connect(self._open_recording_confirmation)
+        layout.addWidget(self.open_recording_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        if self.state.recording_confirmed:
+            self.recording_status.setText("已保存录制来源配置；重新打开可以修改全部选择。")
+        else:
+            self.recording_status.setText("尚未确认录制来源。")
+
+    def _build_shortcuts_page(self) -> None:
+        _page, layout = self._new_page(
+            "快捷键与首个会话",
+            "提问快捷键和录制胶囊是录制期间的即时控制入口。完成后会直接开始第一个会话。",
+        )
+        shortcut_group = QGroupBox("提问快捷键")
+        shortcut_layout = QGridLayout(shortcut_group)
+        shortcut_layout.addWidget(QLabel("当前快捷键"), 0, 0)
+        self.onboarding_shortcut = QKeySequenceEdit(QKeySequence(self.state.question_shortcut))
+        self.onboarding_shortcut.setObjectName("onboardingQuestionShortcut")
+        self.onboarding_shortcut.keySequenceChanged.connect(self._shortcut_changed)
+        shortcut_layout.addWidget(self.onboarding_shortcut, 0, 1)
+        self.test_shortcut_button = QPushButton("按下快捷键测试")
+        self.test_shortcut_button.setObjectName("onboardingTestShortcut")
+        self.test_shortcut_button.clicked.connect(
+            lambda: self.shortcut_status.setText(
+                f"请在当前窗口按 {self.state.question_shortcut}；也可以直接点击“我已了解”。"
+            )
+        )
+        shortcut_layout.addWidget(self.test_shortcut_button, 1, 0, 1, 2)
+        layout.addWidget(shortcut_group)
+        self.shortcut_status = QLabel()
+        self.shortcut_status.setObjectName("onboardingShortcutStatus")
+        self.shortcut_status.setWordWrap(True)
+        layout.addWidget(self.shortcut_status)
+        self.confirm_shortcut_button = QPushButton("我已了解并继续")
+        self.confirm_shortcut_button.setObjectName("onboardingConfirmShortcut")
+        self.confirm_shortcut_button.clicked.connect(self._confirm_shortcut)
+        layout.addWidget(self.confirm_shortcut_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        self.shortcut_status.setText(f"完成引导后，{self.state.question_shortcut} 会聚焦提问框。")
+
+    def _set_page(self, index: int) -> None:
+        index = max(0, min(index, len(ONBOARDING_STEPS) - 1))
+        self.state_store.save(replace(self.state, step=ONBOARDING_STEPS[index]))
+        self.state = replace(self.state, step=ONBOARDING_STEPS[index])
+        is_shortcut_page = index == len(ONBOARDING_STEPS) - 1
+        self.setModal(not is_shortcut_page)
+        self.setWindowModality(
+            Qt.WindowModality.NonModal if is_shortcut_page else Qt.WindowModality.WindowModal
+        )
+        self.pages.setCurrentIndex(index)
+        self.progress_label.setText(f"第 {index + 1} 步，共 {len(ONBOARDING_STEPS)} 步")
+        self._update_navigation()
+
+    def _step_ready(self) -> bool:
+        index = self.pages.currentIndex()
+        return (
+            self.state.privacy_acknowledged,
+            self.state.provider_ready,
+            self.state.whisper_ready,
+            self.state.recording_confirmed,
+            self.state.shortcuts_completed,
+        )[index]
+
+    def _update_navigation(self) -> None:
+        if not hasattr(self, "back_button"):
+            return
+        index = self.pages.currentIndex()
+        task_running = self._onboarding_task is not None
+        self.later_button.setEnabled(not task_running)
+        self.back_button.setEnabled(index > 0 and not task_running)
+        self.skip_button.setVisible(index in {1, 2})
+        self.skip_button.setEnabled(not task_running)
+        self.next_button.setEnabled(self._step_ready() and not task_running)
+        self.next_button.setText(
+            "完成并开始第一个会话" if index == len(ONBOARDING_STEPS) - 1 else "下一步"
+        )
+
+    def _next_page(self) -> None:
+        if not self._step_ready():
+            return
+        index = self.pages.currentIndex()
+        if index == 2:
+            self._whisper_settings_before_test = self.manager.whisper_settings
+            self._onboarding_task = "whisper"
+            try:
+                self._save_whisper_settings()
+            except Exception as exc:  # noqa: BLE001 - Whisper settings boundary
+                self._task_failed("whisper", str(exc))
+                return
+            self._onboarding_task = None
+            self._whisper_settings_before_test = None
+        if index == len(ONBOARDING_STEPS) - 1:
+            self.state = replace(self.state, completed=False, step="shortcuts")
+            self.state_store.save(self.state)
+            self.accept()
+            return
+        self._set_page(index + 1)
+
+    def _previous_page(self) -> None:
+        self._set_page(self.pages.currentIndex() - 1)
+
+    def mark_completed(self) -> None:
+        if not self.state.ready_to_finish:
+            raise RuntimeError("Onboarding is not ready to finish")
+        self.state = replace(self.state, completed=True, step="shortcuts")
+        self.state_store.save(self.state)
+
+    def _skip_page(self) -> None:
+        index = self.pages.currentIndex()
+        if index == 1:
+            self._save_state(provider_completed=False, provider_skipped=True)
+        elif index == 2:
+            self._whisper_settings_before_test = self.manager.whisper_settings
+            self._onboarding_task = "whisper"
+            try:
+                self._save_whisper_settings(first_run_completed=True)
+            except Exception as exc:  # noqa: BLE001 - settings boundary
+                self._task_failed("whisper", str(exc))
+                return
+            self._onboarding_task = None
+            self._whisper_settings_before_test = None
+            self._save_state(whisper_completed=False, whisper_skipped=True)
+        self._set_page(index + 1)
+
+    def _provider_settings_from_form(self, *, create_new: bool = False) -> SavedProviderSettings:
+        current = getattr(self.manager, "provider_settings", None)
+        connections = list(getattr(current, "connections", ()))
+        if not connections:
+            connections = [ModelConnection("default", "默认连接")]
+        target_index = next(
+            (
+                index
+                for index, connection in enumerate(connections)
+                if connection.id == self._provider_target_connection_id
+            ),
+            0,
+        )
+        primary = replace(
+            connections[target_index],
+            id=uuid.uuid4().hex if create_new else connections[target_index].id,
+            name=self.onboarding_provider_name.text().strip() or "默认连接",
+            base_url=self.onboarding_provider_url.text().strip(),
+            api_key=self.onboarding_provider_key.text().strip(),
+            api_mode=str(self.onboarding_provider_api_mode.currentData()),
+        )
+        if create_new:
+            connections.insert(0, primary)
+            self._provider_target_connection_id = primary.id
+        else:
+            connections[target_index] = primary
+        roles = []
+        model = self.onboarding_provider_model.text().strip()
+        for role in getattr(current, "roles", ()):
+            if role.name == RoleName.UTILITY:
+                roles.append(
+                    replace(
+                        role,
+                        connection_id=primary.id if create_new else role.connection_id,
+                        model=model or role.model,
+                    )
+                )
+            else:
+                roles.append(role)
+        return SavedProviderSettings(tuple(connections), tuple(roles))
+
+    @Slot()
+    def _test_provider(self, *, create_new: bool = False) -> None:
+        if self._onboarding_task is not None:
+            return
+        self._provider_settings_before_test = getattr(self.manager, "provider_settings", None)
+        self._provider_test_creating = create_new
+        self.provider_test_button.setEnabled(False)
+        self.provider_create_button.setEnabled(False)
+        self._update_navigation()
+        self.provider_status.setText("正在测试模型连接…")
+        settings = self._provider_settings_from_form(create_new=create_new)
+        self._onboarding_task = "provider"
+        self._update_navigation()
+
+        def work() -> None:
+            try:
+                self.manager.configure_provider(settings)
+                result = self.manager.test_provider()
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                self.task_failed.emit("provider", str(exc))
+            else:
+                self.provider_tested.emit(result)
+
+        threading.Thread(target=work, name="onboarding-test-provider", daemon=True).start()
+
+    @Slot(str)
+    def _provider_test_succeeded(self, result: str) -> None:
+        if self._onboarding_task != "provider":
+            return
+        self.provider_test_button.setEnabled(True)
+        self.provider_create_button.setEnabled(True)
+        self._update_navigation()
+        try:
+            self.manager.save_provider()
+        except Exception as exc:  # noqa: BLE001 - credential boundary
+            self._task_failed("provider", str(exc))
+            return
+        self._save_state(provider_completed=True, provider_skipped=False)
+        self._onboarding_task = None
+        self._provider_settings_before_test = None
+        self._update_navigation()
+        action = (
+            "新模型连接已创建并测试成功" if self._provider_test_creating else "模型连接测试成功"
+        )
+        self.provider_status.setText(f"{action}：{self._compact_text(result)}")
+
+    def _whisper_profile_changed(self) -> None:
+        profile = WhisperProfile(str(self.onboarding_whisper_profile.currentData()))
+        self.whisper_impact.setText(PROFILE_PRESETS[profile].hardware_impact)
+        self._update_navigation()
+
+    def _save_whisper_settings(self, *, first_run_completed: bool = False) -> None:
+        profile = WhisperProfile(str(self.onboarding_whisper_profile.currentData()))
+        current = self.manager.whisper_settings
+        selected = current if current.profile == profile else PROFILE_PRESETS[profile].settings
+        self.manager.configure_whisper(
+            replace(
+                selected,
+                first_run_completed=first_run_completed or current.first_run_completed,
+            )
+        )
+        self.manager.save_whisper()
+
+    @Slot()
+    def _run_whisper_benchmark(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        self._whisper_settings_before_test = self.manager.whisper_settings
+        self._onboarding_task = "whisper"
+        try:
+            self._save_whisper_settings()
+        except Exception as exc:  # noqa: BLE001 - Whisper settings boundary
+            self._task_failed("whisper", str(exc))
+            return
+        self.whisper_benchmark_button.setEnabled(False)
+        self._update_navigation()
+        self.whisper_status.setText("正在准备本地模型并运行样本…")
+
+        def work() -> None:
+            try:
+                sample = create_builtin_whisper_sample(self.settings.data_dir)
+                result = self.manager.benchmark_whisper(sample)
+            except Exception as exc:  # noqa: BLE001 - benchmark boundary
+                self.task_failed.emit("whisper", str(exc))
+            else:
+                self.whisper_benchmarked.emit(result)
+
+        threading.Thread(target=work, name="onboarding-whisper-benchmark", daemon=True).start()
+
+    @Slot(object)
+    def _whisper_benchmark_succeeded(self, result: object) -> None:
+        if self._onboarding_task != "whisper":
+            return
+        self.whisper_benchmark_button.setEnabled(True)
+        self._update_navigation()
+        elapsed = getattr(result, "elapsed_seconds", 0.0)
+        factor = getattr(result, "realtime_factor", 0.0)
+        self._save_state(whisper_completed=True, whisper_skipped=False)
+        self._onboarding_task = None
+        self._whisper_settings_before_test = None
+        self._update_navigation()
+        self.whisper_status.setText(f"样本测试完成：耗时 {elapsed:.2f} 秒，实时系数 {factor:.2f}。")
+
+    @Slot()
+    def _show_advanced_whisper(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        if self._whisper_dialog is None:
+            self._whisper_dialog = WhisperSettingsDialog(self.manager, self)
+        self._whisper_dialog.show()
+        self._whisper_dialog.raise_()
+        self._whisper_dialog.activateWindow()
+
+    @Slot()
+    def _open_recording_confirmation(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        self._onboarding_task = "recording"
+        self._update_navigation()
+        try:
+            selection = _confirm_recording_selection(
+                self,
+                self.manager,
+                self.settings,
+                default_system_audio_enabled=self.capsule_preview.system_audio_check.isChecked(),
+                default_microphone_enabled=self.capsule_preview.microphone_check.isChecked(),
+            )
+        except Exception as exc:  # noqa: BLE001 - recording settings boundary
+            self._task_failed("recording", str(exc))
+            return
+        if selection is None:
+            self._onboarding_task = None
+            self._update_navigation()
+            return
+        self._recording_selection = selection
+        self._save_state(recording_confirmed=True)
+        self._onboarding_task = None
+        self._update_navigation()
+        self.recording_status.setText("录制来源已确认并保存；可以重新打开修改。")
+
+    @Slot()
+    def _preview_question(self) -> None:
+        self._shortcut_triggered()
+        self.capsule_preview_status.setText("提问入口已触发；正式会话中会聚焦真实提问框。")
+
+    @Slot()
+    def _shortcut_triggered(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        if self._question_callback is not None:
+            self._question_callback()
+        self._confirm_shortcut()
+
+    @Slot(QKeySequence)
+    def _shortcut_changed(self, sequence: QKeySequence) -> None:
+        value = sequence.toString(QKeySequence.SequenceFormat.PortableText)
+        if not value:
+            value = DEFAULT_QUESTION_SHORTCUT
+            self.onboarding_shortcut.setKeySequence(QKeySequence(value))
+        self._shortcut.setKey(QKeySequence(value))
+        parent = self.parentWidget()
+        parent_shortcut = getattr(parent, "ask_shortcut", None)
+        if parent_shortcut is not None:
+            parent_shortcut.setKey(QKeySequence(value))
+        self._save_state(question_shortcut=value)
+        self.shortcut_status.setText(f"当前快捷键：{value}。按下它测试提问入口。")
+
+    @Slot()
+    def _confirm_shortcut(self) -> None:
+        self._save_state(shortcuts_completed=True)
+        self.shortcut_status.setText(
+            f"快捷键测试完成。完成引导后仍可按 {self.state.question_shortcut} 聚焦提问框。"
+        )
+
+    def show_start_failure(self) -> None:
+        self._set_page(len(ONBOARDING_STEPS) - 1)
+        self.shortcut_status.setText("首个会话启动失败；请检查录制设备后重试，当前引导进度已保留。")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    @Slot(str, str)
+    def _task_failed(self, task: str, message: str) -> None:
+        if self._onboarding_task is not None and self._onboarding_task != task:
+            return
+        rollback_error = ""
+        try:
+            if task == "provider" and self._provider_settings_before_test is not None:
+                configure_provider = getattr(self.manager, "configure_provider", None)
+                if callable(configure_provider):
+                    configure_provider(self._provider_settings_before_test)
+                utility_role = next(
+                    (
+                        role
+                        for role in self._provider_settings_before_test.roles
+                        if role.name == RoleName.UTILITY
+                    ),
+                    None,
+                )
+                if utility_role is not None:
+                    self._provider_target_connection_id = utility_role.connection_id
+            elif task == "whisper" and self._whisper_settings_before_test is not None:
+                configure_whisper = getattr(self.manager, "configure_whisper", None)
+                if callable(configure_whisper):
+                    configure_whisper(self._whisper_settings_before_test)
+                save_whisper = getattr(self.manager, "save_whisper", None)
+                if callable(save_whisper):
+                    save_whisper()
+        except Exception as exc:  # noqa: BLE001 - best-effort rollback boundary
+            rollback_error = f"；恢复旧配置失败：{exc}"
+        finally:
+            self._provider_settings_before_test = None
+            self._whisper_settings_before_test = None
+            self._onboarding_task = None
+            self._provider_test_creating = False
+            self.provider_test_button.setEnabled(True)
+            self.provider_create_button.setEnabled(True)
+            self.whisper_benchmark_button.setEnabled(True)
+            self._update_navigation()
+        if task == "whisper":
+            self.whisper_status.setText(f"样本测试失败：{message}{rollback_error}")
+        elif task == "recording":
+            self.recording_status.setText(f"录制确认失败：{message}{rollback_error}")
+        else:
+            self.provider_status.setText(f"模型连接失败：{message}{rollback_error}")
+
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip()[:240] or "服务已响应。"
+
+    def accept(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        self.state_store.save(self.state)
+        super().accept()
+
+    def reject(self) -> None:
+        if self._onboarding_task is not None:
+            return
+        self.state_store.save(self.state)
+        super().reject()
+
+
 class MainWindow(QMainWindow):
     CORRECTION_STATE_LABELS: ClassVar[dict[str, str]] = {
         "recognizing": "识别中",
@@ -1055,6 +1854,7 @@ class MainWindow(QMainWindow):
         settings: Settings,
         *,
         service: JingzhiApplicationService | None = None,
+        show_onboarding: bool = False,
     ) -> None:
         super().__init__()
         self.setWindowTitle("境织")
@@ -1076,6 +1876,8 @@ class MainWindow(QMainWindow):
         if hasattr(self.manager, "on_source_event"):
             self.manager.on_source_event = self.bridge.source_event.emit
         self.settings = settings
+        self._onboarding_store = OnboardingSettingsStore(settings.data_dir)
+        self._onboarding_dialog: OnboardingDialog | None = None
         self._selected_session_id: str | None = None
         self._reanswer_question_id: int | None = None
         self._selected_answer_version_id: int | None = None
@@ -1124,11 +1926,8 @@ class MainWindow(QMainWindow):
         self._refresh_sessions()
         QTimer.singleShot(0, self._run_session_maintenance)
         self._whisper_dialog: WhisperSettingsDialog | None = None
-        if (
-            callable(getattr(self.manager, "configure_whisper", None))
-            and not self.manager.whisper_settings.first_run_completed
-        ):
-            QTimer.singleShot(0, self._show_whisper_settings)
+        if show_onboarding:
+            QTimer.singleShot(0, self._maybe_show_onboarding)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -1139,39 +1938,19 @@ class MainWindow(QMainWindow):
         capsule_row = QHBoxLayout()
         capsule_row.setContentsMargins(220, 8, 280, 6)
         capsule_row.addStretch(1)
-        capsule = QFrame()
-        capsule.setObjectName("recordingCapsule")
-        capsule_layout = QHBoxLayout(capsule)
-        capsule_layout.setContentsMargins(10, 6, 8, 6)
-        capsule_layout.setSpacing(7)
-        self.status = QLabel("空闲")
-        self.status.setObjectName("statusPill")
-        self.status.setProperty("state", "idle")
-        self.title_input = QLineEdit("新会话")
-        self.title_input.setPlaceholderText("会话标题")
-        self.title_input.setMaximumWidth(150)
-        self.system_audio_check = QCheckBox("系统声音")
-        self.system_audio_check.setChecked(self.settings.capture_system_audio)
-        self.microphone_check = QCheckBox("麦克风")
-        self.microphone_check.setChecked(self.settings.capture_microphone)
-        self.start_button = QPushButton("开始记录")
-        self.start_button.setProperty("role", "primary")
-        self.stop_button = QPushButton("结束")
-        self.stop_button.setProperty("role", "danger")
-        self.stop_button.setEnabled(False)
-        self.pause_button = QPushButton("暂停")
-        self.pause_button.setEnabled(callable(getattr(self.manager, "pause", None)))
-        if not self.pause_button.isEnabled():
-            self.pause_button.setToolTip("当前采集适配器尚未提供暂停能力")
-        self.capsule_ask_button = QPushButton("提问")
-        capsule_layout.addWidget(self.status)
-        capsule_layout.addWidget(self.title_input)
-        capsule_layout.addWidget(self.system_audio_check)
-        capsule_layout.addWidget(self.microphone_check)
-        capsule_layout.addWidget(self.pause_button)
-        capsule_layout.addWidget(self.capsule_ask_button)
-        capsule_layout.addWidget(self.start_button)
-        capsule_layout.addWidget(self.stop_button)
+        capsule = RecordingCapsule(
+            default_system_audio_enabled=self.settings.capture_system_audio,
+            default_microphone_enabled=self.settings.capture_microphone,
+            pause_enabled=callable(getattr(self.manager, "pause", None)),
+        )
+        self.status = capsule.status
+        self.title_input = capsule.title_input
+        self.system_audio_check = capsule.system_audio_check
+        self.microphone_check = capsule.microphone_check
+        self.pause_button = capsule.pause_button
+        self.capsule_ask_button = capsule.capsule_ask_button
+        self.start_button = capsule.start_button
+        self.stop_button = capsule.stop_button
         capsule_row.addWidget(capsule)
         capsule_row.addStretch(1)
         layout.addLayout(capsule_row)
@@ -1278,7 +2057,10 @@ class MainWindow(QMainWindow):
         self.whisper_settings_button.setProperty("role", "quiet")
         self.storage_settings_button = QPushButton("存储")
         self.storage_settings_button.setProperty("role", "quiet")
+        self.onboarding_button = QPushButton("首次引导")
+        self.onboarding_button.setProperty("role", "quiet")
         header.addWidget(self.storage_settings_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        header.addWidget(self.onboarding_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.whisper_settings_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.provider_toggle_button, alignment=Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.summary_button, alignment=Qt.AlignmentFlag.AlignBottom)
@@ -2855,6 +3637,72 @@ class MainWindow(QMainWindow):
         return panel
 
     @Slot()
+    def _maybe_show_onboarding(self) -> None:
+        if self._onboarding_store.load().completed:
+            if (
+                callable(getattr(self.manager, "configure_whisper", None))
+                and not self.manager.whisper_settings.first_run_completed
+            ):
+                self._show_whisper_settings()
+            return
+        self._show_onboarding()
+
+    @Slot()
+    def _show_onboarding(self, *, reset: bool = False) -> None:
+        if self._onboarding_dialog is not None:
+            self._onboarding_dialog.raise_()
+            self._onboarding_dialog.activateWindow()
+            return
+        if self.service.is_recording:
+            self._show_action_error("录制期间不能打开首次使用引导。")
+            return
+        if reset:
+            self._onboarding_store.reset()
+        self._onboarding_dialog = OnboardingDialog(
+            self.manager,
+            self.settings,
+            parent=self,
+            state_store=self._onboarding_store,
+            question_callback=self._focus_question,
+        )
+        self._onboarding_dialog.finished.connect(self._onboarding_finished)
+        self._onboarding_dialog.show()
+        self._onboarding_dialog.raise_()
+        self._onboarding_dialog.activateWindow()
+
+    @Slot(int)
+    def _onboarding_finished(self, result: int) -> None:
+        dialog = self._onboarding_dialog
+        if dialog is None:
+            return
+        selection = dialog.recording_selection if result == QDialog.DialogCode.Accepted else None
+        if result == QDialog.DialogCode.Accepted:
+            self._reload_provider_settings_from_manager()
+            if self._start(selection=selection):
+                self.ask_shortcut.setKey(QKeySequence(dialog.state.question_shortcut))
+                dialog.mark_completed()
+            else:
+                dialog.show_start_failure()
+                return
+        dialog.deleteLater()
+        self._onboarding_dialog = None
+
+    def _reload_provider_settings_from_manager(self) -> None:
+        provider_settings = getattr(self.manager, "provider_settings", None)
+        connections = getattr(provider_settings, "connections", ())
+        roles = getattr(provider_settings, "roles", ())
+        if not connections:
+            return
+        self._provider_connections = list(connections)
+        self._provider_roles = {role.name: role for role in roles}
+        self._active_connection_index = min(
+            self._active_connection_index, len(self._provider_connections) - 1
+        )
+        if hasattr(self, "connection_selector"):
+            self._refresh_provider_connection_choices(self._active_connection_index)
+            self._load_provider_role_form_values()
+
+    @Slot()
     def _show_whisper_settings(self) -> None:
         if not callable(getattr(self.manager, "configure_whisper", None)):
             return
@@ -3014,7 +3862,7 @@ class MainWindow(QMainWindow):
         self.backup_button.clicked.connect(self._create_full_backup)
         self.restore_backup_button.clicked.connect(self._restore_full_backup)
         self.cross_session_button.clicked.connect(self._open_cross_session_synthesis)
-        self.start_button.clicked.connect(self._start)
+        self.start_button.clicked.connect(lambda: self._start())
         self.stop_button.clicked.connect(self._stop)
         self.pause_button.clicked.connect(self._toggle_pause)
         self.capsule_ask_button.clicked.connect(self._focus_question)
@@ -3035,7 +3883,8 @@ class MainWindow(QMainWindow):
         self.voice_button.pressed.connect(self._start_question_voice)
         self.voice_button.released.connect(self._finish_question_voice)
         self.speak_button.clicked.connect(self._speak_answer)
-        self.ask_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Q"), self)
+        shortcut = self._onboarding_store.load().question_shortcut
+        self.ask_shortcut = QShortcut(QKeySequence(shortcut), self)
         self.ask_shortcut.activated.connect(self._focus_question)
         self.ask_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.summary_button.clicked.connect(self._summarize)
@@ -3056,6 +3905,7 @@ class MainWindow(QMainWindow):
         )
         self.whisper_settings_button.clicked.connect(self._show_whisper_settings)
         self.storage_settings_button.clicked.connect(self._show_storage_settings)
+        self.onboarding_button.clicked.connect(lambda: self._show_onboarding(reset=True))
         self.output.render_failed.connect(self._show_worker_warning)
         self.bridge.action_error.connect(self._show_action_error)
         self.bridge.answer.connect(self._show_answer)
@@ -3141,29 +3991,30 @@ class MainWindow(QMainWindow):
         self._set_status("回答原文已复制", "success")
 
     @Slot()
-    def _start(self) -> None:
+    def _start(self, selection: RecordingSelection | None = None) -> bool:
         if self._archive_active():
             self._show_action_error("归档操作正在进行，请等待完成后再开始会话。")
-            return
-        catalog = getattr(self.manager, "device_catalog", None) or WindowsDeviceCatalog()
-        dialog = RecordingConfirmationDialog(
-            catalog,
-            RecordingSettingsStore(self.settings.data_dir),
-            screen_interval_s=self.settings.screen_interval_s,
-            audio_storage_rate=self.settings.audio_storage_rate,
-            default_system_audio_enabled=self.system_audio_check.isChecked(),
-            default_microphone_enabled=self.microphone_check.isChecked(),
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return False
+        if selection is None:
+            try:
+                selection = _confirm_recording_selection(
+                    self,
+                    self.manager,
+                    self.settings,
+                    default_system_audio_enabled=self.system_audio_check.isChecked(),
+                    default_microphone_enabled=self.microphone_check.isChecked(),
+                )
+            except Exception as exc:  # noqa: BLE001 - UI boundary must surface selection failures
+                self._show_action_error(str(exc))
+                return False
+            if selection is None:
+                return False
         try:
-            selection = dialog.recording_selection()
             self._configure_correction()
             session_id = self.service.start_session(self.title_input.text(), selection=selection)
         except Exception as exc:  # noqa: BLE001 - UI boundary must surface worker failures
             self._show_action_error(str(exc))
-            return
+            return False
         self.system_audio_check.setChecked(selection.system_audio_id is not None)
         self.microphone_check.setChecked(selection.microphone_id is not None)
         self._set_status(f"记录中 · {session_id[:8]}", "recording")
@@ -3176,6 +4027,7 @@ class MainWindow(QMainWindow):
         self.correction_window_input.setEnabled(False)
         self._refresh_recording_status()
         self._refresh_sessions(session_id)
+        return True
 
     @Slot()
     def _configure_correction(self) -> None:
@@ -3264,6 +4116,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _focus_question(self) -> None:
+        self.activateWindow()
+        self.raise_()
         if self.question.hasFocus():
             self._capture_question_anchor()
         else:
@@ -3483,6 +4337,36 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(max(0, combo.findData(selections[name])))
         self._active_connection_index = selected_index
         self._load_active_connection_form()
+
+    def _load_provider_role_form_values(self) -> None:
+        for name, role in self._provider_roles.items():
+            connection_input = self.role_connection_inputs[name]
+            connection_input.setCurrentIndex(max(0, connection_input.findData(role.connection_id)))
+            self.role_model_inputs[name].setText(role.model)
+            self.role_reasoning_inputs[name].setCurrentIndex(
+                max(0, self.role_reasoning_inputs[name].findData(role.reasoning.value))
+            )
+            fallback_groups = (
+                (
+                    self.role_fallback_connection_inputs[name],
+                    self.role_fallback_model_inputs[name],
+                    self.role_cross_auth_checks[name],
+                ),
+                (
+                    self.role_second_fallback_connection_inputs[name],
+                    self.role_second_fallback_model_inputs[name],
+                    self.role_second_cross_auth_checks[name],
+                ),
+            )
+            for controls, fallback in zip(
+                fallback_groups, (*role.fallbacks, None, None)[:2], strict=True
+            ):
+                connection_input, model_input, authorization = controls
+                connection_input.setCurrentIndex(
+                    max(0, connection_input.findData(fallback.connection_id if fallback else ""))
+                )
+                model_input.setText(fallback.model if fallback else "")
+                authorization.setChecked(bool(fallback and fallback.cross_connection_authorized))
 
     def _provider_settings_from_form(self) -> SavedProviderSettings:
         self._store_active_connection_form()
@@ -3956,7 +4840,7 @@ class MainWindow(QMainWindow):
 def run_app(settings: Settings) -> int:
     application = QApplication.instance() or QApplication([])
     application.setStyle("Fusion")
-    window = MainWindow(settings)
+    window = MainWindow(settings, show_onboarding=True)
     window.show()
     if settings.startup_settings_store is not None:
         settings.startup_settings_store.complete_successful_startup(settings.data_dir)
