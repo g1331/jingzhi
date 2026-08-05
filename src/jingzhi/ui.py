@@ -65,8 +65,11 @@ from jingzhi.capture.devices import (
     WindowsDeviceCatalog,
 )
 from jingzhi.config import Settings
+from jingzhi.cross_session import CrossSessionSynthesisError
 from jingzhi.database import (
     AnswerEvidenceRecord,
+    CrossSessionEvidenceRecord,
+    CrossSessionSearchResult,
     MaterialEvidenceRecord,
     SessionAnswerRecord,
     SessionMaterialVersionRecord,
@@ -641,6 +644,398 @@ class RecordingConfirmationDialog(QDialog):
         super().done(result)
 
 
+class CrossSessionSynthesisDialog(QDialog):
+    synthesis_finished = Signal(object)
+    synthesis_failed = Signal(object)
+
+    KIND_LABELS: ClassVar[dict[str, str]] = {
+        "transcript": "字幕版本",
+        "frame": "关键帧",
+        "answer": "问答版本",
+        "material": "材料版本",
+    }
+
+    def __init__(
+        self,
+        service: JingzhiApplicationService,
+        *,
+        navigate_callback: Callable[[CrossSessionEvidenceRecord], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.navigate_callback = navigate_callback
+        self.setWindowTitle("跨会话综合")
+        self.resize(980, 700)
+        self._results: dict[str, CrossSessionSearchResult] = {}
+        self._selected_ids: set[str] = set()
+        self._selection_order: list[str] = []
+        self._candidate_by_id: dict[str, CrossSessionEvidenceRecord] = {}
+        self._failed_synthesis_id: int | None = None
+        self._busy = False
+        self._thread: threading.Thread | None = None
+
+        root = QVBoxLayout(self)
+        heading = QLabel("跨会话搜索与综合")
+        heading.setObjectName("sectionTitle")
+        root.addWidget(heading)
+        hint = QLabel(
+            "只会把你在下方明确勾选的字幕、关键帧、问答或材料发送给深度分析模型；"
+            "回收区会话不会出现在搜索结果中。"
+        )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        search_row = QHBoxLayout()
+        self.query_input = QLineEdit()
+        self.query_input.setObjectName("crossSessionQuery")
+        self.query_input.setPlaceholderText("搜索字幕、问答或材料中的关键词")
+        self.search_button = QPushButton("搜索")
+        search_row.addWidget(self.query_input, 1)
+        search_row.addWidget(self.search_button)
+        root.addLayout(search_row)
+
+        lists = QSplitter(Qt.Orientation.Horizontal)
+        self.result_list = QListWidget()
+        self.result_list.setObjectName("crossSessionResults")
+        self.result_list.setToolTip("选择搜索结果后查看可授权证据")
+        self.evidence_list = QListWidget()
+        self.evidence_list.setObjectName("crossSessionEvidence")
+        self.evidence_list.setToolTip("勾选后才会授权给模型")
+        lists.addWidget(self.result_list)
+        lists.addWidget(self.evidence_list)
+        lists.setSizes([430, 510])
+        root.addWidget(lists, 1)
+
+        self.result_hint = QLabel("输入关键词后搜索。")
+        self.result_hint.setObjectName("hint")
+        self.result_hint.setWordWrap(True)
+        root.addWidget(self.result_hint)
+
+        question_row = QHBoxLayout()
+        question_row.addWidget(QLabel("综合问题"))
+        self.question_input = QLineEdit()
+        self.question_input.setObjectName("crossSessionQuestion")
+        self.question_input.setPlaceholderText("例如：比较这些会话中反复出现的问题")
+        question_row.addWidget(self.question_input, 1)
+        root.addLayout(question_row)
+
+        self.authorization_status = QLabel("尚未选择证据")
+        self.authorization_status.setObjectName("answerEvidenceStatus")
+        self.authorization_status.setWordWrap(True)
+        root.addWidget(self.authorization_status)
+
+        self.synthesize_button = QPushButton("确认证据并开始综合")
+        self.synthesize_button.setProperty("role", "primary")
+        self.synthesize_button.setEnabled(False)
+        root.addWidget(self.synthesize_button)
+        self.retry_button = QPushButton("重试上次失败的综合")
+        self.retry_button.setObjectName("crossSessionRetry")
+        self.retry_button.clicked.connect(self._retry_failed_synthesis)
+        self.retry_button.hide()
+        root.addWidget(self.retry_button)
+
+        self.output = MarkdownDocument()
+        self.output.setObjectName("crossSessionOutput")
+        self.output.setMinimumHeight(180)
+        root.addWidget(self.output, 1)
+        self.output.hide()
+
+        self.navigate_button = QPushButton("跳转当前证据")
+        self.navigate_button.setEnabled(False)
+        root.addWidget(self.navigate_button)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.search_button.clicked.connect(self._search)
+        self.query_input.returnPressed.connect(self._search)
+        self.result_list.currentItemChanged.connect(
+            lambda current, _previous: self._show_result_evidence(current)
+        )
+        self.evidence_list.itemChanged.connect(self._evidence_changed)
+        self.evidence_list.itemDoubleClicked.connect(lambda _item: self._navigate_current())
+        self.question_input.textChanged.connect(self._update_preview)
+        self.synthesize_button.clicked.connect(self._synthesize)
+        self.navigate_button.clicked.connect(self._navigate_current)
+        self.synthesis_finished.connect(self._show_synthesis)
+        self.synthesis_failed.connect(self._show_synthesis_error)
+        self._load_retry_queue()
+
+    def _load_retry_queue(self) -> None:
+        method = getattr(self.service, "failed_cross_session_syntheses", None)
+        if not callable(method):
+            return
+        try:
+            failed = method(limit=1)
+        except Exception:  # noqa: BLE001 - optional retry queue boundary
+            return
+        if failed:
+            self._failed_synthesis_id = failed[0].id
+            self.retry_button.setEnabled(True)
+            self.retry_button.show()
+            evidence_method = getattr(self.service, "cross_session_synthesis_evidence", None)
+            if callable(evidence_method):
+                try:
+                    saved = evidence_method(failed[0].id)
+                except Exception:  # noqa: BLE001 - optional retry queue boundary
+                    saved = ()
+                self._selection_order = [item.stable_id for item in saved]
+                self._selected_ids = set(self._selection_order)
+                self._populate_saved_evidence()
+            self.authorization_status.setText("有一次失败的跨会话综合等待重试。")
+
+    @Slot()
+    def _search(self) -> None:
+        self._failed_synthesis_id = None
+        self.retry_button.hide()
+        self.output.set_markdown("")
+        self.output.hide()
+        self.navigate_button.setEnabled(False)
+        query = self.query_input.text().strip()
+        try:
+            results = self.service.cross_session_search(query, limit=50)
+        except Exception as exc:  # noqa: BLE001 - application boundary
+            self._selected_ids.clear()
+            self._selection_order.clear()
+            self.result_list.clear()
+            self.evidence_list.clear()
+            self.result_hint.setText(f"搜索失败：{exc}")
+            self._update_preview()
+            return
+        self._selected_ids.clear()
+        self._selection_order.clear()
+        self._results = {item.stable_id: item for item in results}
+        self.result_list.clear()
+        self.evidence_list.clear()
+        if not results:
+            self._selected_ids.clear()
+            self._selection_order.clear()
+            self._candidate_by_id.clear()
+            self.result_hint.setText("没有找到未回收会话中的匹配内容。")
+            self._update_preview()
+            return
+        self.result_hint.setText(f"找到 {len(results)} 条结果；选择一条结果查看可授权证据。")
+        for result in results:
+            item = QListWidgetItem(self._result_text(result))
+            item.setData(Qt.ItemDataRole.UserRole, result)
+            self.result_list.addItem(item)
+        self.result_list.setCurrentRow(0)
+
+    def _result_text(self, result: CrossSessionSearchResult) -> str:
+        version = f" · {result.version_kind}" if result.version_kind else ""
+        return (
+            f"[{self.KIND_LABELS.get(result.kind, result.kind)}{version}] "
+            f"{result.session_title} · {result.start_ms / 1000:.1f}s · {result.stable_id}\n"
+            f"{result.snippet}"
+        )
+
+    @Slot(QListWidgetItem, QListWidgetItem)
+    def _show_result_evidence(
+        self, item: QListWidgetItem | None, _previous: QListWidgetItem | None = None
+    ) -> None:
+        self.evidence_list.blockSignals(True)
+        self.evidence_list.clear()
+        self._candidate_by_id.clear()
+        if item is None:
+            self.evidence_list.blockSignals(False)
+            self._update_preview()
+            return
+        result = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            candidates = self.service.cross_session_evidence_candidates((result.stable_id,))
+        except Exception as exc:  # noqa: BLE001 - application boundary
+            self.result_hint.setText(f"证据预览失败：{exc}")
+            candidates = []
+        for candidate in candidates:
+            self._candidate_by_id[candidate.stable_id] = candidate
+            evidence_item = QListWidgetItem(self._evidence_text(candidate))
+            evidence_item.setData(Qt.ItemDataRole.UserRole, candidate)
+            evidence_item.setFlags(
+                evidence_item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            evidence_item.setCheckState(
+                Qt.CheckState.Checked
+                if candidate.stable_id in self._selected_ids
+                else Qt.CheckState.Unchecked
+            )
+            self.evidence_list.addItem(evidence_item)
+        self.evidence_list.blockSignals(False)
+        self._update_preview()
+
+    def _evidence_text(self, candidate: CrossSessionEvidenceRecord) -> str:
+        detail = candidate.content_text or "（关键帧图像）"
+        return (
+            f"[{self.KIND_LABELS.get(candidate.kind, candidate.kind)}] "
+            f"{candidate.session_title} · {candidate.start_ms / 1000:.1f}s · {candidate.source} · "
+            f"{candidate.stable_id}\n{detail[:180]}"
+        )
+
+    @Slot(QListWidgetItem)
+    def _evidence_changed(self, item: QListWidgetItem) -> None:
+        stable_id = item.data(Qt.ItemDataRole.UserRole).stable_id
+        if item.checkState() == Qt.CheckState.Checked:
+            self._selected_ids.add(stable_id)
+            if stable_id not in self._selection_order:
+                self._selection_order.append(stable_id)
+        else:
+            self._selected_ids.discard(stable_id)
+            self._selection_order = [
+                selected_id for selected_id in self._selection_order if selected_id != stable_id
+            ]
+        self._update_preview()
+
+    def _selected_stable_ids(self) -> tuple[str, ...]:
+        return tuple(
+            stable_id for stable_id in self._selection_order if stable_id in self._selected_ids
+        )
+
+    @Slot()
+    def _update_preview(self) -> None:
+        try:
+            preview = self.service.cross_session_synthesis_preview(
+                self.question_input.text(), self._selected_stable_ids()
+            )
+        except Exception as exc:  # noqa: BLE001 - application boundary
+            self.authorization_status.setText(f"无法检查综合条件：{exc}")
+            self.synthesize_button.setEnabled(False)
+            return
+        if preview.can_synthesize:
+            self.authorization_status.setText(
+                f"已授权 {preview.evidence_count} 条证据，共 {preview.character_count} 字；"
+                f"关键帧 {preview.frame_count} 个。模型：{preview.model} · 连接：{preview.connection_name}"
+            )
+        else:
+            self.authorization_status.setText(preview.reason or "当前不能开始综合。")
+        self.synthesize_button.setEnabled(preview.can_synthesize and not self._busy)
+
+    @Slot()
+    def _synthesize(self) -> None:
+        if self._busy:
+            return
+        question = self.question_input.text().strip()
+        stable_ids = self._selected_stable_ids()
+        preview = self.service.cross_session_synthesis_preview(question, stable_ids)
+        if not preview.can_synthesize:
+            self._update_preview()
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "确认综合范围",
+            (
+                f"将把 {preview.evidence_count} 条已选证据（{preview.character_count} 字、"
+                f"{preview.frame_count} 个关键帧）发送给深度分析模型。\n"
+                f"模型：{preview.model}\n连接：{preview.connection_name}\n\n继续吗？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        self._failed_synthesis_id = None
+        self.retry_button.hide()
+        self._start_synthesis(lambda: self.service.synthesize_cross_session(question, stable_ids))
+
+    def _start_synthesis(self, operation: Callable[[], object]) -> None:
+        self._busy = True
+        self.synthesize_button.setEnabled(False)
+        self.retry_button.setEnabled(False)
+        self.authorization_status.setText("正在综合已授权证据……")
+
+        def run() -> None:
+            try:
+                self.synthesis_finished.emit(operation())
+            except Exception as exc:  # noqa: BLE001 - model boundary
+                self.synthesis_failed.emit(exc)
+
+        self._thread = threading.Thread(target=run, name="cross-session-synthesis", daemon=True)
+        self._thread.start()
+
+    @Slot()
+    def _retry_failed_synthesis(self) -> None:
+        if self._busy or self._failed_synthesis_id is None:
+            return
+        synthesis_id = self._failed_synthesis_id
+        self._start_synthesis(lambda: self.service.retry_cross_session_synthesis(synthesis_id))
+
+    @Slot(object)
+    def _show_synthesis(self, result: object) -> None:
+        self._busy = False
+        self._failed_synthesis_id = None
+        self.retry_button.hide()
+        self.output.set_markdown(result.answer or "")
+        self.output.show()
+        self.authorization_status.setText(
+            f"综合已保存：模型 {result.model or '未知'} · 证据状态 {result.evidence_state}"
+        )
+        self._update_preview()
+        self._populate_saved_evidence()
+
+    @Slot(object)
+    def _show_synthesis_error(self, error: object) -> None:
+        self._busy = False
+        message = str(error)
+        lowered = message.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "context length",
+                "maximum context",
+                "context_length",
+                "too many tokens",
+                "token limit",
+                "上下文",
+                "超限",
+            )
+        ):
+            message = f"模型上下文超限：{message}。请减少已授权证据后重试。"
+        self.authorization_status.setText(f"综合失败：{message}")
+        if isinstance(error, CrossSessionSynthesisError):
+            self._failed_synthesis_id = error.synthesis_id
+            self.retry_button.setEnabled(True)
+            self.retry_button.show()
+        else:
+            self._failed_synthesis_id = None
+            self.retry_button.hide()
+        self._update_preview()
+
+    def _populate_saved_evidence(self) -> None:
+        selected: list[CrossSessionEvidenceRecord] = []
+        for stable_id in self._selected_stable_ids():
+            candidates = self.service.cross_session_evidence_candidates((stable_id,))
+            candidate = next((item for item in candidates if item.stable_id == stable_id), None)
+            if candidate is not None:
+                selected.append(candidate)
+        self._candidate_by_id = {item.stable_id: item for item in selected}
+        self.evidence_list.blockSignals(True)
+        self.evidence_list.clear()
+        for candidate in selected:
+            item = QListWidgetItem(self._evidence_text(candidate))
+            item.setData(Qt.ItemDataRole.UserRole, candidate)
+            item.setFlags(
+                item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setCheckState(Qt.CheckState.Checked)
+            self.evidence_list.addItem(item)
+        self.evidence_list.blockSignals(False)
+        if selected:
+            self.evidence_list.setCurrentRow(0)
+        self.navigate_button.setEnabled(bool(selected) and self.navigate_callback is not None)
+
+    @Slot()
+    def _navigate_current(self) -> None:
+        if self.navigate_callback is None:
+            return
+        item = self.evidence_list.currentItem()
+        if item is None:
+            return
+        candidate = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(candidate, CrossSessionEvidenceRecord):
+            self.navigate_callback(candidate)
+
+
 class MainWindow(QMainWindow):
     CORRECTION_STATE_LABELS: ClassVar[dict[str, str]] = {
         "recognizing": "识别中",
@@ -710,6 +1105,7 @@ class MainWindow(QMainWindow):
         self._speech: QTextToSpeech | None = None
         self._animations_enabled = motion_enabled()
         self._storage_dialog: StorageSettingsDialog | None = None
+        self._cross_session_dialog: CrossSessionSynthesisDialog | None = None
         self._session_sort_newest = True
         self._maintenance_thread: threading.Thread | None = None
         self._archive_operation: str | None = None
@@ -835,6 +1231,10 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(subtitle)
         panel_layout.addSpacing(6)
         panel_layout.addWidget(self.session_search)
+        self.cross_session_button = QPushButton("跨会话综合")
+        self.cross_session_button.setObjectName("crossSessionButton")
+        self.cross_session_button.setToolTip("搜索并选择多个会话的证据后进行深度综合")
+        panel_layout.addWidget(self.cross_session_button)
         panel_layout.addLayout(filter_row)
         panel_layout.addWidget(self.session_library, 1)
         panel_layout.addLayout(action_row)
@@ -2486,6 +2886,7 @@ class MainWindow(QMainWindow):
             "archive-backup",
             "archive-restore",
             "archive-restore-preview",
+            "cross-session-synthesis",
         }
         if any(thread.name in write_thread_names for thread in threading.enumerate()):
             return "后台任务仍在写入应用数据或模型缓存"
@@ -2506,6 +2907,98 @@ class MainWindow(QMainWindow):
         self._storage_dialog.raise_()
         self._storage_dialog.activateWindow()
 
+    @Slot()
+    def _open_cross_session_synthesis(self) -> None:
+        if self._cross_session_dialog is None:
+            self._cross_session_dialog = CrossSessionSynthesisDialog(
+                self.service,
+                navigate_callback=self._navigate_cross_session_evidence,
+                parent=self,
+            )
+        self._cross_session_dialog.show()
+        self._cross_session_dialog.raise_()
+        self._cross_session_dialog.activateWindow()
+
+    def _navigate_cross_session_evidence(self, candidate: CrossSessionEvidenceRecord) -> None:
+        if candidate.session_id != self._selected_session_id:
+            self.session_search.clear()
+            all_index = self.session_filter.findData("all")
+            if all_index >= 0:
+                self.session_filter.setCurrentIndex(all_index)
+            self._refresh_sessions(candidate.session_id)
+        current = self.session_library.currentItem()
+        if current is None or str(current.data(Qt.ItemDataRole.UserRole)) != candidate.session_id:
+            self._show_evidence_navigation_error("目标会话当前不可用")
+            return
+        self._zoom_key = "1-minute"
+        zoom_button = self.findChild(QPushButton, "zoom-1-minute")
+        if zoom_button is not None:
+            zoom_button.setChecked(True)
+        self._window_start_ms = max(0, candidate.start_ms - 30_000)
+        target_answer_id = candidate.answer_version_id if candidate.kind == "answer" else None
+        target_material_id = candidate.material_version_id if candidate.kind == "material" else None
+        self._open_session_item(current)
+        if target_answer_id is not None:
+            self._selected_answer_version_id = target_answer_id
+            self._content_kind = "answer"
+            self._open_session_item(current)
+        elif target_material_id is not None:
+            self._selected_material_version_id = target_material_id
+            self._content_kind = "material"
+            self._open_session_item(current)
+        if self._timeline is None:
+            return
+        if candidate.kind == "frame" and candidate.frame_id is not None:
+            visible = next(
+                (item for item in self._timeline.frames if item.id == candidate.frame_id), None
+            )
+            object_name = f"keyframe-{candidate.frame_id}"
+            track = self.keyframe_track
+        elif candidate.kind == "transcript" and candidate.transcript_version_id is not None:
+            visible = next(
+                (
+                    item
+                    for item in self._timeline.transcripts
+                    if item.version_id == candidate.transcript_version_id
+                ),
+                None,
+            )
+            object_name = ""
+            track = self.transcript_track
+        else:
+            visible = None
+            object_name = ""
+            track = None
+        if visible is None and candidate.kind == "transcript":
+            historical = self.service.timeline_transcript_version(
+                candidate.session_id,
+                candidate.transcript_version_id or 0,
+                candidate.start_ms,
+                candidate.end_ms,
+            )
+            if historical is not None and self._timeline is not None:
+                transcripts = tuple(
+                    historical if item.id == historical.id else item
+                    for item in self._timeline.transcripts
+                )
+                self._timeline = replace(self._timeline, transcripts=transcripts)
+                self._render_timeline(self._timeline)
+                visible = historical
+        if visible is not None:
+            if candidate.kind == "frame":
+                self._select_frame(visible)
+                object_name = f"keyframe-{visible.id}"
+            else:
+                self._select_transcript(visible)
+                object_name = f"transcript-{visible.id}"
+            if track is not None:
+                button = self.findChild(QPushButton, object_name)
+                scroll = track.findChild(QScrollArea)
+                if button is not None and scroll is not None:
+                    scroll.ensureWidgetVisible(button)
+        if self._cross_session_dialog is not None:
+            self._cross_session_dialog.hide()
+
     def _connect_signals(self) -> None:
         self.session_library.currentItemChanged.connect(
             lambda current, _previous: self._select_session_item(current)
@@ -2520,6 +3013,7 @@ class MainWindow(QMainWindow):
         self.session_export_button.clicked.connect(self._export_selected_session)
         self.backup_button.clicked.connect(self._create_full_backup)
         self.restore_backup_button.clicked.connect(self._restore_full_backup)
+        self.cross_session_button.clicked.connect(self._open_cross_session_synthesis)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(self._stop)
         self.pause_button.clicked.connect(self._toggle_pause)

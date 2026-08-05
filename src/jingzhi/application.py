@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,9 +9,14 @@ from typing import Protocol
 from jingzhi.archive import ArchiveManager, RestorePreview, RestoreResult
 from jingzhi.capture.devices import RecordingSelection
 from jingzhi.context import ContextAssembler, QuestionContext
+from jingzhi.cross_session import CrossSessionSynthesisPreview
 from jingzhi.database import (
     AnswerEvidenceRecord,
     AnswerVersionRecord,
+    CrossSessionEvidenceRecord,
+    CrossSessionSearchResult,
+    CrossSessionSynthesisEvidenceRecord,
+    CrossSessionSynthesisRecord,
     Database,
     MaterialEvidenceRecord,
     QuestionNoteRecord,
@@ -31,7 +35,7 @@ from jingzhi.database import (
 )
 from jingzhi.materials import MaterialGenerationPreview
 from jingzhi.model_roles import RoleName
-from jingzhi.model_routing import InvocationEvidence, ModelRouter
+from jingzhi.model_routing import InvocationEvidence, ModelRouter, invocation_connection_json
 from jingzhi.storage import storage_reader, storage_writer
 from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
@@ -151,7 +155,7 @@ class QuestionAnsweringService:
             self.database.record_answer_version(
                 question_id,
                 model=invocation.model,
-                connection_json=self._connection_json(invocation),
+                connection_json=invocation_connection_json(invocation),
                 request_status="failed",
                 request_id=invocation.request_id,
                 answer=None,
@@ -164,29 +168,13 @@ class QuestionAnsweringService:
         return self.database.record_answer_version(
             question_id,
             model=result.model or routed.invocation.model,
-            connection_json=self._connection_json(routed.invocation),
+            connection_json=invocation_connection_json(routed.invocation),
             request_status="succeeded",
             request_id=result.request_id,
             answer=result.text,
             error=None,
             evidence_state="exact",
             evidence=evidence,
-        )
-
-    @staticmethod
-    def _connection_json(invocation) -> str:
-        return json.dumps(
-            {
-                "connection_id": invocation.connection_id,
-                "connection_name": invocation.connection_name,
-                "base_url": invocation.base_url,
-                "api_mode": invocation.api_mode,
-                "role": invocation.role,
-                "reasoning_level": invocation.reasoning_level,
-                "fallback_reason": invocation.fallback_reason,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
         )
 
 
@@ -346,6 +334,51 @@ class JingzhiApplicationService:
         if getattr(self.recorder, "session_id", None) != session_id:
             return None
         return self.archive_storage_busy_reason()
+
+    def cross_session_search(
+        self, query: str, *, limit: int = 50
+    ) -> list[CrossSessionSearchResult]:
+        return self.database.cross_session_search(query, limit=limit)
+
+    def cross_session_evidence_candidates(
+        self, stable_ids: tuple[str, ...]
+    ) -> list[CrossSessionEvidenceRecord]:
+        return self.database.cross_session_evidence_candidates(stable_ids)
+
+    def failed_cross_session_syntheses(
+        self, *, limit: int = 10
+    ) -> tuple[CrossSessionSynthesisRecord, ...]:
+        method = getattr(self.recorder, "failed_cross_session_syntheses", None)
+        if not callable(method):
+            return ()
+        return method(limit=limit)
+
+    def cross_session_synthesis_preview(
+        self, question: str, stable_ids: tuple[str, ...]
+    ) -> CrossSessionSynthesisPreview:
+        method = getattr(self.recorder, "cross_session_synthesis_preview", None)
+        if not callable(method):
+            raise TypeError("当前应用未配置跨会话综合模型")
+        return method(question, stable_ids)
+
+    def synthesize_cross_session(
+        self, question: str, stable_ids: tuple[str, ...]
+    ) -> CrossSessionSynthesisRecord:
+        method = getattr(self.recorder, "synthesize_cross_session", None)
+        if not callable(method):
+            raise TypeError("当前应用未配置跨会话综合模型")
+        return method(question, stable_ids)
+
+    def retry_cross_session_synthesis(self, synthesis_id: int) -> CrossSessionSynthesisRecord:
+        method = getattr(self.recorder, "retry_cross_session_synthesis", None)
+        if not callable(method):
+            raise TypeError("当前应用未配置跨会话综合模型")
+        return method(synthesis_id)
+
+    def cross_session_synthesis_evidence(
+        self, synthesis_id: int
+    ) -> tuple[CrossSessionSynthesisEvidenceRecord, ...]:
+        return self.database.cross_session_synthesis_evidence(synthesis_id)
 
     def start_session(
         self,
@@ -700,6 +733,14 @@ class JingzhiApplicationService:
 
     def transcript_versions(self, segment_id: int) -> list[TranscriptVersionRecord]:
         return self.database.transcript_versions(segment_id)
+
+    def timeline_transcript_version(
+        self, session_id: str, version_id: int, start_ms: int, end_ms: int
+    ) -> TimelineTranscriptRecord | None:
+        records = self.database.timeline_transcript_versions(
+            session_id, (version_id,), start_ms, end_ms
+        )
+        return records[0] if records else None
 
     def answer_evidence_entries(
         self, session_id: str, answer_version_id: int

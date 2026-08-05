@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from jingzhi.database import Database
+from jingzhi.database import CROSS_SESSION_FTS_CONTENT_QUERY, Database
 from jingzhi.storage import storage_reader, storage_writer
 
 ARCHIVE_FORMAT_VERSION = 1
@@ -26,6 +26,8 @@ _PATH_COLUMNS = (
     ("audio_chunks", "path"),
     ("answer_evidence", "resource_path"),
     ("session_material_evidence", "resource_path"),
+    ("model_invocation_content_evidence", "resource_path"),
+    ("cross_session_synthesis_evidence", "resource_path"),
     ("pending_media_deletions", "path"),
 )
 _CONFIG_FILES = ("provider.json", "whisper.json", "recording.json", "material.json")
@@ -62,6 +64,10 @@ _SESSION_TABLE_QUERIES = (
     ("model_invocations", "session_id = ?"),
     (
         "model_invocation_evidence",
+        "invocation_id IN (SELECT id FROM model_invocations WHERE session_id = ?)",
+    ),
+    (
+        "model_invocation_content_evidence",
         "invocation_id IN (SELECT id FROM model_invocations WHERE session_id = ?)",
     ),
     ("session_material_versions", "session_id = ?"),
@@ -490,6 +496,20 @@ class ArchiveManager:
             actual_fts = Counter((str(row[0]), str(row[1]), str(row[2])) for row in fts_rows)
             if actual_fts != expected_fts:
                 raise ArchiveError("全文索引与字幕片段不一致")
+            expected_cross_fts = Counter(
+                tuple(str(value) if value is not None else "" for value in row)
+                for row in connection.execute(CROSS_SESSION_FTS_CONTENT_QUERY)
+            )
+            actual_cross_fts = Counter(
+                tuple(str(value) if value is not None else "" for value in row)
+                for row in connection.execute(
+                    """SELECT entry_id, session_id, kind, source_id, source, start_ms,
+                              end_ms, version_kind, text
+                       FROM cross_session_fts"""
+                )
+            )
+            if actual_cross_fts != expected_cross_fts:
+                raise ArchiveError("跨会话全文索引与内容不一致")
             if media_root is not None:
                 _validate_database_paths(connection, media_root)
         except sqlite3.DatabaseError as exc:
@@ -592,14 +612,26 @@ def _database_paths(database_path: Path, data_dir: Path) -> set[Path]:
     connection = sqlite3.connect(database_path)
     try:
         for table, column in _PATH_COLUMNS:
-            rows = connection.execute(
-                f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL"
-            ).fetchall()
+            rows = connection.execute(_path_rows_query(table, column)).fetchall()
             for (value,) in rows:
                 paths.add(_resolve_stored_path(str(value), data_dir))
     finally:
         connection.close()
     return paths
+
+
+def _path_rows_query(table: str, column: str, *, with_rowid: bool = False) -> str:
+    if table == "cross_session_synthesis_evidence":
+        prefix = "evidence.rowid, " if with_rowid else ""
+        return (
+            f"SELECT {prefix}evidence.{column} "
+            "FROM cross_session_synthesis_evidence AS evidence "
+            "JOIN cross_session_syntheses AS synthesis "
+            "ON synthesis.id = evidence.synthesis_id "
+            "WHERE evidence.resource_path IS NOT NULL AND synthesis.evidence_state = 'exact'"
+        )
+    prefix = "rowid, " if with_rowid else ""
+    return f"SELECT {prefix}{column} FROM {table} WHERE {column} IS NOT NULL"
 
 
 def _prepare_archive_destination(destination: Path) -> Path:
@@ -825,9 +857,7 @@ def _rewrite_database_paths(database_path: Path, data_dir: Path, path_map: dict[
     connection = sqlite3.connect(database_path)
     try:
         for table, column in _PATH_COLUMNS:
-            rows = connection.execute(
-                f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
-            ).fetchall()
+            rows = connection.execute(_path_rows_query(table, column, with_rowid=True)).fetchall()
             for row_id, value in rows:
                 source = _resolve_stored_path(str(value), data_dir)
                 try:
@@ -846,9 +876,7 @@ def _rewrite_archive_paths_to_target(database_path: Path, target_dir: Path) -> N
     connection = sqlite3.connect(database_path)
     try:
         for table, column in _PATH_COLUMNS:
-            rows = connection.execute(
-                f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
-            ).fetchall()
+            rows = connection.execute(_path_rows_query(table, column, with_rowid=True)).fetchall()
             for row_id, value in rows:
                 relative = _safe_archive_path(str(value))
                 if not relative.parts or relative.parts[0] != "media":
@@ -865,9 +893,7 @@ def _rewrite_archive_paths_to_target(database_path: Path, target_dir: Path) -> N
 
 def _validate_database_paths(connection: sqlite3.Connection, media_root: Path) -> None:
     for table, column in _PATH_COLUMNS:
-        rows = connection.execute(
-            f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL"
-        ).fetchall()
+        rows = connection.execute(_path_rows_query(table, column)).fetchall()
         for (value,) in rows:
             path = Path(value)
             if not path.is_absolute():

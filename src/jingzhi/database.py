@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import uuid
@@ -184,6 +185,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
     segment_id UNINDEXED, session_id UNINDEXED, text, tokenize='unicode61'
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS cross_session_fts USING fts5(
+    entry_id UNINDEXED,
+    session_id UNINDEXED,
+    kind UNINDEXED,
+    source_id UNINDEXED,
+    source UNINDEXED,
+    start_ms UNINDEXED,
+    end_ms UNINDEXED,
+    version_kind UNINDEXED,
+    text,
+    tokenize='unicode61'
+);
+
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -274,6 +288,22 @@ CREATE TABLE IF NOT EXISTS model_invocation_evidence (
     UNIQUE(invocation_id, stable_id)
 );
 
+CREATE TABLE IF NOT EXISTS model_invocation_content_evidence (
+    invocation_id INTEGER NOT NULL REFERENCES model_invocations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stable_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('answer', 'material')),
+    source TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    answer_version_id INTEGER,
+    material_version_id INTEGER,
+    content_text TEXT,
+    resource_path TEXT,
+    PRIMARY KEY(invocation_id, ordinal),
+    UNIQUE(invocation_id, stable_id)
+);
+
 CREATE TABLE IF NOT EXISTS session_material_versions (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -310,6 +340,45 @@ CREATE TABLE IF NOT EXISTS session_material_evidence (
     UNIQUE(material_version_id, stable_id)
 );
 
+CREATE TABLE IF NOT EXISTS cross_session_syntheses (
+    id INTEGER PRIMARY KEY,
+    question TEXT NOT NULL,
+    answer TEXT,
+    model TEXT,
+    connection_json TEXT,
+    model_invocation_id INTEGER REFERENCES model_invocations(id) ON DELETE SET NULL,
+    request_status TEXT NOT NULL CHECK (request_status IN ('succeeded', 'failed')),
+    upstream_request_id TEXT,
+    error TEXT,
+    evidence_state TEXT NOT NULL CHECK (evidence_state IN ('exact', 'unavailable')),
+    created_at_utc TEXT NOT NULL,
+    retry_of_id INTEGER REFERENCES cross_session_syntheses(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS cross_session_synthesis_history
+ON cross_session_syntheses(created_at_utc, id);
+
+CREATE TABLE IF NOT EXISTS cross_session_synthesis_evidence (
+    synthesis_id INTEGER NOT NULL REFERENCES cross_session_syntheses(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stable_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    session_title TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('transcript', 'frame', 'answer', 'material')),
+    source TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    transcript_version_id INTEGER REFERENCES transcript_versions(id) ON DELETE SET NULL,
+    frame_id INTEGER REFERENCES frames(id) ON DELETE SET NULL,
+    answer_version_id INTEGER REFERENCES answer_versions(id) ON DELETE SET NULL,
+    material_version_id INTEGER REFERENCES session_material_versions(id) ON DELETE SET NULL,
+    content_text TEXT,
+    resource_path TEXT,
+    PRIMARY KEY(synthesis_id, ordinal),
+    UNIQUE(synthesis_id, stable_id)
+);
+CREATE INDEX IF NOT EXISTS cross_session_synthesis_evidence_session
+ON cross_session_synthesis_evidence(session_id, synthesis_id);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -325,7 +394,35 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 15
+
+CROSS_SESSION_FTS_CONTENT_QUERY = """
+SELECT 'transcript-version:' || version.id, segment.session_id, 'transcript',
+       version.id, segment.source, segment.start_ms, segment.end_ms,
+       version.kind, version.text
+FROM transcript_segments AS segment
+JOIN effective_transcript_versions AS version
+  ON version.segment_id = segment.id
+UNION ALL
+SELECT 'answer-version:' || answer.id, question.session_id, 'answer',
+       answer.id, '问答', question.asked_at_ms, question.asked_at_ms,
+       NULL, COALESCE(question.question, '') || char(10) || COALESCE(answer.answer, '')
+FROM answer_versions AS answer
+JOIN questions AS question ON question.id = answer.question_id
+WHERE question.state = 'submitted'
+  AND answer.request_status = 'succeeded'
+  AND answer.answer IS NOT NULL
+UNION ALL
+SELECT 'material-version:' || material.id, material.session_id, 'material',
+       material.id, '材料',
+       COALESCE((SELECT MIN(start_ms) FROM session_material_evidence
+                 WHERE material_version_id = material.id), 0),
+       COALESCE((SELECT MAX(end_ms) FROM session_material_evidence
+                 WHERE material_version_id = material.id), 0),
+       material.kind, material.content
+FROM session_material_versions AS material
+WHERE material.request_status = 'succeeded'
+"""
 
 
 class SessionNotificationKind(StrEnum):
@@ -628,6 +725,10 @@ class ModelInvocationEvidenceRecord:
     end_ms: int
     transcript_version_id: int | None = None
     frame_id: int | None = None
+    answer_version_id: int | None = None
+    material_version_id: int | None = None
+    content_text: str | None = None
+    resource_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +766,73 @@ class ModelInvocationRecord:
     started_at_utc: str
     completed_at_utc: str | None
     evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSessionSearchResult:
+    stable_id: str
+    session_id: str
+    session_title: str
+    kind: str
+    source_id: int
+    source: str
+    start_ms: int
+    end_ms: int
+    version_kind: str | None
+    text: str
+    snippet: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSessionEvidenceRecord:
+    stable_id: str
+    session_id: str
+    session_title: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    content_text: str | None
+    resource_path: Path | None
+    transcript_version_id: int | None = None
+    frame_id: int | None = None
+    answer_version_id: int | None = None
+    material_version_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSessionSynthesisRecord:
+    id: int
+    question: str
+    answer: str | None
+    model: str | None
+    connection_json: str | None
+    model_invocation_id: int | None
+    request_status: str
+    request_id: str | None
+    error: str | None
+    evidence_state: str
+    created_at_utc: str
+    retry_of_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSessionSynthesisEvidenceRecord:
+    synthesis_id: int
+    ordinal: int
+    stable_id: str
+    session_id: str
+    session_title: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    content_text: str | None
+    resource_path: Path | None
+    transcript_version_id: int | None
+    frame_id: int | None
+    answer_version_id: int | None
+    material_version_id: int | None
 
 
 class Database:
@@ -737,11 +905,88 @@ class Database:
                    WHERE answer IS NOT NULL OR error IS NOT NULL""",
                 (applied_at,),
             )
+        if previous_version < 14:
+            self._migrate_cross_session_evidence_snapshots(connection)
+        if previous_version < 15:
+            synthesis_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(cross_session_syntheses)"
+                ).fetchall()
+            }
+            if "retry_of_id" not in synthesis_columns:
+                connection.execute(
+                    "ALTER TABLE cross_session_syntheses ADD COLUMN retry_of_id INTEGER "
+                    "REFERENCES cross_session_syntheses(id) ON DELETE SET NULL"
+                )
+        if previous_version < 13:
+            self._rebuild_cross_session_fts(connection)
         connection.executemany(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
             [(version, applied_at) for version in range(1, LATEST_SCHEMA_VERSION + 1)],
         )
         connection.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_cross_session_evidence_snapshots(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(cross_session_synthesis_evidence)"
+            ).fetchall()
+        }
+        if "session_title" in columns:
+            return
+        connection.execute(
+            """CREATE TABLE cross_session_synthesis_evidence_v14 (
+                   synthesis_id INTEGER NOT NULL REFERENCES cross_session_syntheses(id)
+                       ON DELETE CASCADE,
+                   ordinal INTEGER NOT NULL,
+                   stable_id TEXT NOT NULL,
+                   session_id TEXT NOT NULL,
+                   session_title TEXT NOT NULL,
+                   kind TEXT NOT NULL CHECK (kind IN (
+                       'transcript', 'frame', 'answer', 'material'
+                   )),
+                   source TEXT NOT NULL,
+                   start_ms INTEGER NOT NULL,
+                   end_ms INTEGER NOT NULL,
+                   transcript_version_id INTEGER REFERENCES transcript_versions(id)
+                       ON DELETE SET NULL,
+                   frame_id INTEGER REFERENCES frames(id) ON DELETE SET NULL,
+                   answer_version_id INTEGER REFERENCES answer_versions(id)
+                       ON DELETE SET NULL,
+                   material_version_id INTEGER REFERENCES session_material_versions(id)
+                       ON DELETE SET NULL,
+                   content_text TEXT,
+                   resource_path TEXT,
+                   PRIMARY KEY(synthesis_id, ordinal),
+                   UNIQUE(synthesis_id, stable_id)
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO cross_session_synthesis_evidence_v14(
+                   synthesis_id, ordinal, stable_id, session_id, session_title, kind, source,
+                   start_ms, end_ms, transcript_version_id, frame_id, answer_version_id,
+                   material_version_id, content_text, resource_path
+               )
+               SELECT evidence.synthesis_id, evidence.ordinal, evidence.stable_id,
+                      evidence.session_id, COALESCE(sessions.title, '已删除会话'),
+                      evidence.kind, evidence.source,
+                      evidence.start_ms, evidence.end_ms, evidence.transcript_version_id,
+                      evidence.frame_id, evidence.answer_version_id, evidence.material_version_id,
+                      evidence.content_text, evidence.resource_path
+               FROM cross_session_synthesis_evidence AS evidence
+               LEFT JOIN sessions ON sessions.id = evidence.session_id"""
+        )
+        connection.execute("DROP TABLE cross_session_synthesis_evidence")
+        connection.execute(
+            "ALTER TABLE cross_session_synthesis_evidence_v14 RENAME TO cross_session_synthesis_evidence"
+        )
+        connection.execute(
+            """CREATE INDEX cross_session_synthesis_evidence_session
+               ON cross_session_synthesis_evidence(session_id, synthesis_id)"""
+        )
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -749,6 +994,422 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
+
+    @staticmethod
+    def _fts_match_query(query: str) -> str:
+        terms = re.findall(r"[\w\u0080-\uffff]+", query, flags=re.UNICODE)
+        escaped = [f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms]
+        return " OR ".join(escaped)
+
+    @staticmethod
+    def _fts_result(row: sqlite3.Row) -> CrossSessionSearchResult:
+        text = str(row["text"])
+        return CrossSessionSearchResult(
+            stable_id=str(row["entry_id"]),
+            session_id=str(row["session_id"]),
+            session_title=str(row["session_title"]),
+            kind=str(row["kind"]),
+            source_id=int(row["source_id"]),
+            source=str(row["source"]),
+            start_ms=int(row["start_ms"]),
+            end_ms=int(row["end_ms"]),
+            version_kind=str(row["version_kind"]) if row["version_kind"] else None,
+            text=text,
+            snippet=text[:240],
+        )
+
+    def _rebuild_cross_session_fts(self, connection: sqlite3.Connection) -> None:
+        connection.execute("DELETE FROM cross_session_fts")
+        connection.execute(
+            """INSERT INTO cross_session_fts(
+                   entry_id, session_id, kind, source_id, source, start_ms, end_ms,
+                   version_kind, text
+               ) """
+            + CROSS_SESSION_FTS_CONTENT_QUERY
+        )
+
+    @staticmethod
+    def _replace_cross_session_fts_entry(
+        connection: sqlite3.Connection,
+        *,
+        stable_id: str,
+        session_id: str,
+        kind: str,
+        source_id: int,
+        source: str,
+        start_ms: int,
+        end_ms: int,
+        version_kind: str | None,
+        text: str,
+    ) -> None:
+        connection.execute("DELETE FROM cross_session_fts WHERE entry_id = ?", (stable_id,))
+        if text:
+            connection.execute(
+                """INSERT INTO cross_session_fts(
+                       entry_id, session_id, kind, source_id, source, start_ms, end_ms,
+                       version_kind, text
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    stable_id,
+                    session_id,
+                    kind,
+                    source_id,
+                    source,
+                    start_ms,
+                    end_ms,
+                    version_kind,
+                    text,
+                ),
+            )
+
+    def _reindex_transcript_segment(self, connection: sqlite3.Connection, segment_id: int) -> None:
+        version_rows = connection.execute(
+            "SELECT id FROM transcript_versions WHERE segment_id = ?", (segment_id,)
+        ).fetchall()
+        for row in version_rows:
+            connection.execute(
+                "DELETE FROM cross_session_fts WHERE entry_id = ?",
+                (f"transcript-version:{row['id']}",),
+            )
+        row = connection.execute(
+            """SELECT segment.session_id, segment.source, segment.start_ms, segment.end_ms,
+                      version.id, version.kind, version.text
+               FROM transcript_segments AS segment
+               JOIN effective_transcript_versions AS version
+                 ON version.segment_id = segment.id
+               WHERE segment.id = ?""",
+            (segment_id,),
+        ).fetchone()
+        if row is not None:
+            self._replace_cross_session_fts_entry(
+                connection,
+                stable_id=f"transcript-version:{row['id']}",
+                session_id=row["session_id"],
+                kind="transcript",
+                source_id=int(row["id"]),
+                source=row["source"],
+                start_ms=int(row["start_ms"]),
+                end_ms=int(row["end_ms"]),
+                version_kind=row["kind"],
+                text=row["text"],
+            )
+
+    def _index_answer_version(self, connection: sqlite3.Connection, answer_id: int) -> None:
+        stable_id = f"answer-version:{answer_id}"
+        connection.execute("DELETE FROM cross_session_fts WHERE entry_id = ?", (stable_id,))
+        row = connection.execute(
+            """SELECT answer.id, question.session_id, question.question,
+                      question.asked_at_ms, answer.answer
+               FROM answer_versions AS answer
+               JOIN questions AS question ON question.id = answer.question_id
+               WHERE answer.id = ? AND question.state = 'submitted'
+                 AND answer.request_status = 'succeeded' AND answer.answer IS NOT NULL""",
+            (answer_id,),
+        ).fetchone()
+        if row is not None:
+            self._replace_cross_session_fts_entry(
+                connection,
+                stable_id=stable_id,
+                session_id=row["session_id"],
+                kind="answer",
+                source_id=int(row["id"]),
+                source="问答",
+                start_ms=int(row["asked_at_ms"]),
+                end_ms=int(row["asked_at_ms"]),
+                version_kind=None,
+                text=f"{row['question']}\n{row['answer']}".strip(),
+            )
+
+    def _index_material_version(self, connection: sqlite3.Connection, material_id: int) -> None:
+        stable_id = f"material-version:{material_id}"
+        connection.execute("DELETE FROM cross_session_fts WHERE entry_id = ?", (stable_id,))
+        row = connection.execute(
+            """SELECT material.id, material.session_id, material.kind, material.content,
+                      COALESCE((SELECT MIN(start_ms) FROM session_material_evidence
+                                WHERE material_version_id = material.id), 0) AS start_ms,
+                      COALESCE((SELECT MAX(end_ms) FROM session_material_evidence
+                                WHERE material_version_id = material.id), 0) AS end_ms
+               FROM session_material_versions AS material
+               WHERE material.id = ? AND material.request_status = 'succeeded'""",
+            (material_id,),
+        ).fetchone()
+        if row is not None:
+            self._replace_cross_session_fts_entry(
+                connection,
+                stable_id=stable_id,
+                session_id=row["session_id"],
+                kind="material",
+                source_id=int(row["id"]),
+                source="材料",
+                start_ms=int(row["start_ms"]),
+                end_ms=int(row["end_ms"]),
+                version_kind=row["kind"],
+                text=row["content"],
+            )
+
+    def cross_session_search(
+        self, query: str, *, limit: int = 50
+    ) -> list[CrossSessionSearchResult]:
+        query = query.strip()
+        if not query or limit <= 0:
+            return []
+        limit = min(limit, 100)
+        match_query = self._fts_match_query(query)
+        if not match_query:
+            return []
+        select = """SELECT entry.entry_id, entry.session_id, sessions.title AS session_title,
+                          entry.kind, entry.source_id, entry.source, entry.start_ms, entry.end_ms,
+                          entry.version_kind, entry.text
+                   FROM cross_session_fts AS entry
+                   JOIN sessions ON sessions.id = entry.session_id
+                   WHERE sessions.trashed_at_utc IS NULL
+                     AND cross_session_fts MATCH ?
+                   ORDER BY bm25(cross_session_fts), entry.entry_id
+                   LIMIT ?"""
+        with self.connect() as connection:
+            try:
+                rows = connection.execute(select, (match_query, limit)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            like_rows = connection.execute(
+                """SELECT entry.entry_id, entry.session_id, sessions.title AS session_title,
+                          entry.kind, entry.source_id, entry.source, entry.start_ms,
+                          entry.end_ms, entry.version_kind, entry.text
+                   FROM cross_session_fts AS entry
+                   JOIN sessions ON sessions.id = entry.session_id
+                   WHERE sessions.trashed_at_utc IS NULL AND entry.text LIKE ?
+                   ORDER BY entry.entry_id LIMIT ?""",
+                (f"%{query}%", limit),
+            ).fetchall()
+        merged: list[sqlite3.Row] = []
+        seen: set[str] = set()
+        for row in (*rows, *like_rows):
+            stable_id = str(row["entry_id"])
+            if stable_id not in seen:
+                merged.append(row)
+                seen.add(stable_id)
+            if len(merged) >= limit:
+                break
+        return [self._fts_result(row) for row in merged]
+
+    def cross_session_selected_evidence(
+        self, stable_ids: tuple[str, ...]
+    ) -> list[CrossSessionEvidenceRecord]:
+        selected: list[CrossSessionEvidenceRecord] = []
+        seen: set[str] = set()
+        for stable_id in stable_ids:
+            candidates = self._cross_session_evidence_for_id(stable_id)
+            if candidates and candidates[0].stable_id not in seen:
+                selected.append(candidates[0])
+                seen.add(candidates[0].stable_id)
+        return selected
+
+    def cross_session_evidence_candidates(
+        self, stable_ids: tuple[str, ...]
+    ) -> list[CrossSessionEvidenceRecord]:
+        candidates: list[CrossSessionEvidenceRecord] = []
+        seen: set[str] = set()
+        for stable_id in stable_ids:
+            for candidate in self._cross_session_evidence_for_id(stable_id):
+                if candidate.stable_id not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate.stable_id)
+        return candidates
+
+    def _cross_session_evidence_for_id(self, stable_id: str) -> list[CrossSessionEvidenceRecord]:
+        prefix, _, raw_id = stable_id.partition(":")
+        if not raw_id.isdigit():
+            return []
+        source_id = int(raw_id)
+        with self.connect() as connection:
+            if prefix == "transcript-version":
+                row = connection.execute(
+                    """SELECT version.id, segment.session_id, sessions.title, segment.source,
+                              segment.start_ms, segment.end_ms, version.text
+                       FROM transcript_versions AS version
+                       JOIN transcript_segments AS segment ON segment.id = version.segment_id
+                       JOIN sessions ON sessions.id = segment.session_id
+                       WHERE version.id = ? AND sessions.trashed_at_utc IS NULL""",
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    return []
+                candidates = [
+                    CrossSessionEvidenceRecord(
+                        stable_id=stable_id,
+                        session_id=row["session_id"],
+                        session_title=row["title"],
+                        kind="transcript",
+                        source=row["source"],
+                        start_ms=row["start_ms"],
+                        end_ms=row["end_ms"],
+                        content_text=row["text"],
+                        resource_path=None,
+                        transcript_version_id=row["id"],
+                    )
+                ]
+                frame_rows = connection.execute(
+                    """SELECT frame.id, frame.session_id, frame.source_id, frame.ts_ms, frame.path,
+                              sessions.title
+                       FROM frames AS frame JOIN sessions ON sessions.id = frame.session_id
+                       WHERE frame.session_id = ? AND sessions.trashed_at_utc IS NULL
+                         AND frame.ts_ms BETWEEN ? AND ?
+                       ORDER BY abs(frame.ts_ms - ?), frame.id LIMIT 4""",
+                    (
+                        row["session_id"],
+                        max(0, row["start_ms"] - 30_000),
+                        row["end_ms"] + 30_000,
+                        row["start_ms"],
+                    ),
+                ).fetchall()
+                candidates.extend(
+                    CrossSessionEvidenceRecord(
+                        stable_id=f"frame:{frame['id']}",
+                        session_id=frame["session_id"],
+                        session_title=frame["title"],
+                        kind="frame",
+                        source=frame["source_id"],
+                        start_ms=frame["ts_ms"],
+                        end_ms=frame["ts_ms"],
+                        content_text=None,
+                        resource_path=Path(frame["path"]),
+                        frame_id=frame["id"],
+                    )
+                    for frame in frame_rows
+                )
+                return candidates
+            if prefix == "answer-version":
+                row = connection.execute(
+                    """SELECT answer.id, answer.question_id, answer.answer,
+                              question.session_id, sessions.title, question.asked_at_ms,
+                              question.context_start_ms, question.context_end_ms
+                       FROM answer_versions AS answer
+                       JOIN questions AS question ON question.id = answer.question_id
+                       JOIN sessions ON sessions.id = question.session_id
+                       WHERE answer.id = ? AND answer.request_status = 'succeeded'
+                         AND answer.answer IS NOT NULL AND question.state = 'submitted'
+                         AND sessions.trashed_at_utc IS NULL""",
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    return []
+                result = [
+                    CrossSessionEvidenceRecord(
+                        stable_id=stable_id,
+                        session_id=row["session_id"],
+                        session_title=row["title"],
+                        kind="answer",
+                        source="问答",
+                        start_ms=row["context_start_ms"] or row["asked_at_ms"],
+                        end_ms=row["context_end_ms"] or row["asked_at_ms"],
+                        content_text=row["answer"],
+                        resource_path=None,
+                        answer_version_id=row["id"],
+                    )
+                ]
+                result.extend(self._answer_or_material_evidence(connection, "answer", source_id))
+                return result
+            if prefix == "material-version":
+                row = connection.execute(
+                    """SELECT material.id, material.session_id, sessions.title, material.content,
+                              COALESCE((SELECT MIN(start_ms) FROM session_material_evidence
+                                        WHERE material_version_id = material.id), 0) AS start_ms,
+                              COALESCE((SELECT MAX(end_ms) FROM session_material_evidence
+                                        WHERE material_version_id = material.id), 0) AS end_ms
+                       FROM session_material_versions AS material
+                       JOIN sessions ON sessions.id = material.session_id
+                       WHERE material.id = ? AND material.request_status = 'succeeded'
+                         AND sessions.trashed_at_utc IS NULL""",
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    return []
+                result = [
+                    CrossSessionEvidenceRecord(
+                        stable_id=stable_id,
+                        session_id=row["session_id"],
+                        session_title=row["title"],
+                        kind="material",
+                        source="材料",
+                        start_ms=row["start_ms"],
+                        end_ms=row["end_ms"],
+                        content_text=row["content"],
+                        resource_path=None,
+                        material_version_id=row["id"],
+                    )
+                ]
+                result.extend(self._answer_or_material_evidence(connection, "material", source_id))
+                return result
+            if prefix == "frame":
+                row = connection.execute(
+                    """SELECT frame.id, frame.session_id, sessions.title, frame.source_id,
+                              frame.ts_ms, frame.path
+                       FROM frames AS frame JOIN sessions ON sessions.id = frame.session_id
+                       WHERE frame.id = ? AND sessions.trashed_at_utc IS NULL""",
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    return []
+                return [
+                    CrossSessionEvidenceRecord(
+                        stable_id=stable_id,
+                        session_id=row["session_id"],
+                        session_title=row["title"],
+                        kind="frame",
+                        source=row["source_id"],
+                        start_ms=row["ts_ms"],
+                        end_ms=row["ts_ms"],
+                        content_text=None,
+                        resource_path=Path(row["path"]),
+                        frame_id=row["id"],
+                    )
+                ]
+        return []
+
+    @staticmethod
+    def _answer_or_material_evidence(
+        connection: sqlite3.Connection, owner: str, owner_id: int
+    ) -> list[CrossSessionEvidenceRecord]:
+        if owner == "answer":
+            rows = connection.execute(
+                """SELECT evidence.*, question.session_id, sessions.title
+                   FROM answer_evidence AS evidence
+                   JOIN answer_versions AS answer ON answer.id = evidence.answer_version_id
+                   JOIN questions AS question ON question.id = answer.question_id
+                   JOIN sessions ON sessions.id = question.session_id
+                   WHERE evidence.answer_version_id = ? AND sessions.trashed_at_utc IS NULL
+                   ORDER BY evidence.ordinal""",
+                (owner_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """SELECT evidence.*, material.session_id, sessions.title
+                   FROM session_material_evidence AS evidence
+                   JOIN session_material_versions AS material
+                     ON material.id = evidence.material_version_id
+                   JOIN sessions ON sessions.id = material.session_id
+                   WHERE evidence.material_version_id = ? AND sessions.trashed_at_utc IS NULL
+                   ORDER BY evidence.ordinal""",
+                (owner_id,),
+            ).fetchall()
+        return [
+            CrossSessionEvidenceRecord(
+                stable_id=row["stable_id"],
+                session_id=row["session_id"],
+                session_title=row["title"],
+                kind=row["kind"],
+                source=row["source"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                content_text=row["content_text"],
+                resource_path=Path(row["resource_path"]) if row["resource_path"] else None,
+                transcript_version_id=row["transcript_version_id"],
+                frame_id=row["frame_id"],
+                answer_version_id=row["answer_version_id"] if owner == "answer" else None,
+                material_version_id=row["material_version_id"] if owner == "material" else None,
+            )
+            for row in rows
+        ]
 
     def create_session(self, title: str, started_at_utc: str) -> str:
         session_id = str(uuid.uuid4())
@@ -1075,7 +1736,19 @@ class Database:
                     deleted = False
                 else:
                     connection.execute(
+                        """UPDATE cross_session_syntheses
+                           SET evidence_state = 'unavailable'
+                           WHERE id IN (
+                               SELECT synthesis_id FROM cross_session_synthesis_evidence
+                               WHERE session_id = ?
+                           )""",
+                        (session_id,),
+                    )
+                    connection.execute(
                         "DELETE FROM transcript_fts WHERE session_id = ?", (session_id,)
+                    )
+                    connection.execute(
+                        "DELETE FROM cross_session_fts WHERE session_id = ?", (session_id,)
                     )
                     if staged_dir is not None:
                         connection.execute(
@@ -1456,6 +2129,7 @@ class Database:
                 "INSERT INTO transcript_fts(segment_id, session_id, text) VALUES (?, ?, ?)",
                 (segment_id, session_id, text),
             )
+            self._reindex_transcript_segment(connection, segment_id)
             return segment_id
 
     def set_chunk_state(self, chunk_id: int, state: str, error: str | None = None) -> None:
@@ -1566,7 +2240,9 @@ class Database:
                    ) VALUES (?, ?, ?, ?, ?, 1)""",
                 (segment_id, kind, text, datetime.now(UTC).isoformat(), model),
             )
-            return int(cursor.lastrowid)
+            version_id = int(cursor.lastrowid)
+            self._reindex_transcript_segment(connection, segment_id)
+            return version_id
 
     def undo_transcript_correction(self, segment_id: int) -> None:
         with self.connect() as connection:
@@ -1575,6 +2251,7 @@ class Database:
                    WHERE segment_id = ? AND kind = 'correction'""",
                 (segment_id,),
             )
+            self._reindex_transcript_segment(connection, segment_id)
 
     def configure_transcript_correction(
         self, session_id: str, *, enabled: bool, window_ms: int
@@ -1890,6 +2567,7 @@ class Database:
                     for ordinal, item in enumerate(evidence)
                 ],
             )
+            self._index_answer_version(connection, answer_version_id)
         return AnswerVersionRecord(
             answer_version_id,
             question_id,
@@ -2083,6 +2761,7 @@ class Database:
                     for ordinal, item in enumerate(evidence)
                 ],
             )
+            self._index_material_version(connection, material_id)
         return SessionMaterialVersionRecord(
             material_id,
             session_id,
@@ -2273,6 +2952,30 @@ class Database:
                         item.frame_id,
                     )
                     for ordinal, item in enumerate(evidence)
+                    if item.kind in {"transcript", "frame"}
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO model_invocation_content_evidence(
+                       invocation_id, ordinal, stable_id, kind, source, start_ms, end_ms,
+                       answer_version_id, material_version_id, content_text, resource_path
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        invocation_id,
+                        ordinal,
+                        item.stable_id,
+                        item.kind,
+                        item.source,
+                        item.start_ms,
+                        item.end_ms,
+                        item.answer_version_id,
+                        item.material_version_id,
+                        item.content_text,
+                        str(item.resource_path) if item.resource_path else None,
+                    )
+                    for ordinal, item in enumerate(evidence)
+                    if item.kind in {"answer", "material"}
                 ],
             )
             return invocation_id
@@ -2317,12 +3020,19 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""SELECT invocation.*,
-                           GROUP_CONCAT(evidence.stable_id, char(31)) AS evidence_ids
+                           (SELECT GROUP_CONCAT(stable_id, char(31))
+                            FROM (
+                                SELECT stable_id, ordinal, 0 AS source_order
+                                FROM model_invocation_evidence
+                                WHERE invocation_id = invocation.id
+                                UNION ALL
+                                SELECT stable_id, ordinal, 1 AS source_order
+                                FROM model_invocation_content_evidence
+                                WHERE invocation_id = invocation.id
+                                ORDER BY ordinal, source_order
+                            )) AS evidence_ids
                     FROM model_invocations AS invocation
-                    LEFT JOIN model_invocation_evidence AS evidence
-                      ON evidence.invocation_id = invocation.id
                     {where}
-                    GROUP BY invocation.id
                     ORDER BY invocation.id""",
                 parameters,
             ).fetchall()
@@ -2346,6 +3056,169 @@ class Database:
                 evidence_ids=tuple((row["evidence_ids"] or "").split(chr(31)))
                 if row["evidence_ids"]
                 else (),
+            )
+            for row in rows
+        )
+
+    def record_cross_session_synthesis(
+        self,
+        *,
+        question: str,
+        answer: str | None,
+        model: str | None,
+        connection_json: str | None,
+        model_invocation_id: int | None,
+        request_status: str,
+        request_id: str | None,
+        error: str | None,
+        evidence_state: str,
+        evidence: tuple[CrossSessionEvidenceRecord, ...],
+        retry_of_id: int | None = None,
+    ) -> CrossSessionSynthesisRecord:
+        if request_status not in {"succeeded", "failed"}:
+            raise ValueError(f"Invalid synthesis status: {request_status}")
+        if evidence_state not in {"exact", "unavailable"}:
+            raise ValueError(f"Invalid synthesis evidence state: {evidence_state}")
+        created_at = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO cross_session_syntheses(
+                       question, answer, model, connection_json, model_invocation_id,
+                       request_status, upstream_request_id, error, evidence_state,
+                       created_at_utc, retry_of_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    question,
+                    answer,
+                    model,
+                    connection_json,
+                    model_invocation_id,
+                    request_status,
+                    request_id,
+                    error,
+                    evidence_state,
+                    created_at,
+                    retry_of_id,
+                ),
+            )
+            synthesis_id = int(cursor.lastrowid)
+            connection.executemany(
+                """INSERT INTO cross_session_synthesis_evidence(
+                       synthesis_id, ordinal, stable_id, session_id, session_title, kind, source,
+                       start_ms, end_ms, transcript_version_id, frame_id,
+                       answer_version_id, material_version_id, content_text, resource_path
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        synthesis_id,
+                        ordinal,
+                        item.stable_id,
+                        item.session_id,
+                        item.session_title,
+                        item.kind,
+                        item.source,
+                        item.start_ms,
+                        item.end_ms,
+                        item.transcript_version_id,
+                        item.frame_id,
+                        item.answer_version_id,
+                        item.material_version_id,
+                        item.content_text,
+                        str(item.resource_path) if item.resource_path else None,
+                    )
+                    for ordinal, item in enumerate(evidence)
+                ],
+            )
+        record = self.cross_session_synthesis(synthesis_id)
+        if record is None:
+            raise RuntimeError("Cross-session synthesis was not persisted")
+        return record
+
+    def cross_session_synthesis(self, synthesis_id: int) -> CrossSessionSynthesisRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM cross_session_syntheses WHERE id = ?", (synthesis_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return CrossSessionSynthesisRecord(
+            id=row["id"],
+            question=row["question"],
+            answer=row["answer"],
+            model=row["model"],
+            connection_json=row["connection_json"],
+            model_invocation_id=row["model_invocation_id"],
+            request_status=row["request_status"],
+            request_id=row["upstream_request_id"],
+            error=row["error"],
+            evidence_state=row["evidence_state"],
+            created_at_utc=row["created_at_utc"],
+            retry_of_id=row["retry_of_id"],
+        )
+
+    def cross_session_syntheses(
+        self, *, limit: int = 50, request_status: str | None = None
+    ) -> tuple[CrossSessionSynthesisRecord, ...]:
+        bounded_limit = min(max(limit, 0), 100)
+        with self.connect() as connection:
+            if request_status is None:
+                rows = connection.execute(
+                    """SELECT id FROM cross_session_syntheses
+                       ORDER BY id LIMIT ?""",
+                    (bounded_limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT id FROM cross_session_syntheses
+                       WHERE request_status = ?
+                     AND evidence_state = 'exact'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cross_session_syntheses AS successor
+                         WHERE successor.retry_of_id = cross_session_syntheses.id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cross_session_synthesis_evidence AS evidence
+                         LEFT JOIN sessions ON sessions.id = evidence.session_id
+                         WHERE evidence.synthesis_id = cross_session_syntheses.id
+                           AND (sessions.id IS NULL OR sessions.trashed_at_utc IS NOT NULL)
+                     )
+                   ORDER BY id DESC LIMIT ?""",
+                    (request_status, bounded_limit),
+                ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := self.cross_session_synthesis(int(row["id"]))) is not None
+        )
+
+    def cross_session_synthesis_evidence(
+        self, synthesis_id: int
+    ) -> tuple[CrossSessionSynthesisEvidenceRecord, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT evidence.*
+                   FROM cross_session_synthesis_evidence AS evidence
+                   WHERE evidence.synthesis_id = ?
+                   ORDER BY evidence.ordinal""",
+                (synthesis_id,),
+            ).fetchall()
+        return tuple(
+            CrossSessionSynthesisEvidenceRecord(
+                synthesis_id=row["synthesis_id"],
+                ordinal=row["ordinal"],
+                stable_id=row["stable_id"],
+                session_id=row["session_id"],
+                session_title=row["session_title"],
+                kind=row["kind"],
+                source=row["source"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                content_text=row["content_text"],
+                resource_path=Path(row["resource_path"]) if row["resource_path"] else None,
+                transcript_version_id=row["transcript_version_id"],
+                frame_id=row["frame_id"],
+                answer_version_id=row["answer_version_id"],
+                material_version_id=row["material_version_id"],
             )
             for row in rows
         )

@@ -12,7 +12,7 @@ import pytest
 import jingzhi.archive as archive_module
 from jingzhi.application import JingzhiApplicationService
 from jingzhi.archive import ArchiveConflictError, ArchiveError, ArchiveManager
-from jingzhi.database import Database
+from jingzhi.database import CrossSessionEvidenceRecord, Database
 
 
 def _seed_session(data_dir: Path) -> tuple[Database, str, int, int]:
@@ -203,6 +203,56 @@ def test_session_export_rejects_source_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(ArchiveError, match="不允许符号链接"):
         ArchiveManager(database).export_session(session_id, tmp_path / "export.zip")
+
+
+def test_full_backup_keeps_unavailable_cross_session_snapshots_without_missing_media(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "jingzhi.sqlite3")
+    session_id = database.create_session("将被删除", "2026-08-04T10:00:00+00:00")
+    media_path = tmp_path / "sessions" / session_id / "frame.webp"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"frame")
+    frame_id = database.add_frame(
+        session_id, 1_000, media_path, "hash", (10, 10), source_id="display:1"
+    )
+    database.finish_session(session_id, "2026-08-04T10:01:00+00:00", "complete")
+    database.move_session_to_trash(
+        session_id,
+        "2026-08-05T10:00:00+00:00",
+        "2026-08-12T10:00:00+00:00",
+    )
+    synthesis = database.record_cross_session_synthesis(
+        question="删除媒体后？",
+        answer="仍可解释",
+        model="analysis-model",
+        connection_json="{}",
+        model_invocation_id=None,
+        request_status="succeeded",
+        request_id=None,
+        error=None,
+        evidence_state="exact",
+        evidence=(
+            CrossSessionEvidenceRecord(
+                f"frame:{frame_id}",
+                session_id,
+                "将被删除",
+                "frame",
+                "display:1",
+                1_000,
+                1_000,
+                None,
+                media_path,
+                frame_id=frame_id,
+            ),
+        ),
+    )
+    assert database.permanently_delete_session(session_id) is True
+    assert database.cross_session_synthesis(synthesis.id).evidence_state == "unavailable"
+
+    backup = ArchiveManager(database).create_backup(tmp_path / "backup.zip")
+
+    assert backup.is_file()
 
 
 def test_session_export_contains_markdown_media_versions_and_relative_evidence(

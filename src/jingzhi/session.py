@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import threading
@@ -20,7 +19,14 @@ from jingzhi.capture.screen import ScreenCaptureWorker
 from jingzhi.clock import SessionClock
 from jingzhi.config import Settings
 from jingzhi.context import ContextAssembler
+from jingzhi.cross_session import (
+    CrossSessionSynthesisPreview,
+    CrossSessionSynthesisService,
+)
 from jingzhi.database import (
+    CrossSessionEvidenceRecord,
+    CrossSessionSearchResult,
+    CrossSessionSynthesisRecord,
     Database,
     SessionMaterialVersionRecord,
     SourceEventRecord,
@@ -30,7 +36,12 @@ from jingzhi.llm import MaterialModelResult
 from jingzhi.material_settings import MaterialGenerationMode, MaterialGenerationSettingsStore
 from jingzhi.materials import MaterialGenerationPreview, legacy_summary_to_markdown
 from jingzhi.model_roles import ModelRole, RoleName
-from jingzhi.model_routing import InvocationEvidence, ModelRouter, RoutedTranscriptCorrectionModel
+from jingzhi.model_routing import (
+    InvocationEvidence,
+    ModelRouter,
+    RoutedTranscriptCorrectionModel,
+    invocation_connection_json,
+)
 from jingzhi.provider_settings import ProviderSettingsStore, SavedProviderSettings
 from jingzhi.recording_settings import RecordingPreferences, resolve_recording_selection
 from jingzhi.storage import canonical_whisper_repository_id, storage_writer
@@ -768,7 +779,7 @@ class SessionManager:
             content=content,
             template_id=template_id,
             model=model_name,
-            connection_json=self._connection_json(routed.invocation),
+            connection_json=invocation_connection_json(routed.invocation),
             model_invocation_id=routed.invocation.id,
             request_status="succeeded",
             request_id=request_id,
@@ -784,23 +795,41 @@ class SessionManager:
     def material_versions(self, session_id: str) -> list[SessionMaterialVersionRecord]:
         return self.database.session_material_versions(session_id)
 
+    def cross_session_search(
+        self, query: str, *, limit: int = 50
+    ) -> list[CrossSessionSearchResult]:
+        return self.database.cross_session_search(query, limit=limit)
+
+    def cross_session_evidence_candidates(
+        self, stable_ids: tuple[str, ...]
+    ) -> list[CrossSessionEvidenceRecord]:
+        return self.database.cross_session_evidence_candidates(stable_ids)
+
+    def failed_cross_session_syntheses(
+        self, *, limit: int = 10
+    ) -> tuple[CrossSessionSynthesisRecord, ...]:
+        return self.database.cross_session_syntheses(limit=limit, request_status="failed")
+
+    def cross_session_synthesis_preview(
+        self, question: str, stable_ids: tuple[str, ...]
+    ) -> CrossSessionSynthesisPreview:
+        return CrossSessionSynthesisService(self.database, self._model_router()).preview(
+            question, stable_ids
+        )
+
+    @storage_writer("执行跨会话综合")
+    def synthesize_cross_session(
+        self, question: str, stable_ids: tuple[str, ...]
+    ) -> CrossSessionSynthesisRecord:
+        return CrossSessionSynthesisService(self.database, self._model_router()).synthesize(
+            question, stable_ids
+        )
+
+    @storage_writer("重试跨会话综合")
+    def retry_cross_session_synthesis(self, synthesis_id: int) -> CrossSessionSynthesisRecord:
+        return CrossSessionSynthesisService(self.database, self._model_router()).retry(synthesis_id)
+
     @storage_writer("生成会话材料")
     def summarize(self) -> str:
         """Compatibility entry point retained for callers of the old summary action."""
         return self.generate_material().content
-
-    @staticmethod
-    def _connection_json(invocation) -> str:  # type: ignore[no-untyped-def]
-        return json.dumps(
-            {
-                "connection_id": invocation.connection_id,
-                "connection_name": invocation.connection_name,
-                "base_url": invocation.base_url,
-                "api_mode": invocation.api_mode,
-                "role": invocation.role,
-                "reasoning_level": invocation.reasoning_level,
-                "fallback_reason": invocation.fallback_reason,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )

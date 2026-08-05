@@ -4,7 +4,7 @@ import base64
 from dataclasses import dataclass
 from pathlib import Path
 
-from jingzhi.database import Database
+from jingzhi.database import CrossSessionEvidenceRecord, Database
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +74,47 @@ class QuestionContext:
         return items
 
 
+@dataclass(frozen=True, slots=True)
+class SynthesisEvidence:
+    stable_id: str
+    session_id: str
+    session_title: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    text: str | None
+    image_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisContext:
+    evidence: tuple[SynthesisEvidence, ...]
+
+    @property
+    def prompt_text(self) -> str:
+        sections = [
+            "以下内容仅包含用户明确选择并授权用于本次综合的证据。",
+            "只能根据这些证据回答问题；不要补充未提供的会话内容，也不要把推测写成事实。",
+        ]
+        for item in self.evidence:
+            time_range = (
+                f"{item.start_ms / 1000:.1f}s-{item.end_ms / 1000:.1f}s"
+                if item.start_ms != item.end_ms
+                else f"{item.start_ms / 1000:.1f}s"
+            )
+            content = item.text or "（关键帧图像见附件）"
+            sections.append(
+                f"[{item.stable_id}] 会话={item.session_title}({item.session_id}) "
+                f"时间={time_range} 类型={item.kind} 来源={item.source}\n{content}"
+            )
+        return "\n\n".join(sections)
+
+    @property
+    def image_urls(self) -> tuple[str, ...]:
+        return tuple(item.image_url for item in self.evidence if item.image_url is not None)
+
+
 class ContextAssembler:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -122,6 +163,43 @@ class ContextAssembler:
             ),
             frames=tuple(frame_evidence),
         )
+
+    def for_cross_session(
+        self, records: tuple[CrossSessionEvidenceRecord, ...]
+    ) -> SynthesisContext:
+        evidence: list[SynthesisEvidence] = []
+        for record in records:
+            image_url = None
+            if record.kind == "frame":
+                if record.resource_path is None:
+                    raise RuntimeError(f"关键帧 {record.stable_id} 缺少文件路径")
+                try:
+                    image_bytes = record.resource_path.read_bytes()
+                except OSError as exc:
+                    raise RuntimeError(f"关键帧 {record.stable_id} 无法读取") from exc
+                suffix = record.resource_path.suffix.lower()
+                media_type = {
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                }.get(suffix, "image/png")
+                image_url = (
+                    f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+                )
+            evidence.append(
+                SynthesisEvidence(
+                    stable_id=record.stable_id,
+                    session_id=record.session_id,
+                    session_title=record.session_title,
+                    kind=record.kind,
+                    source=record.source,
+                    start_ms=record.start_ms,
+                    end_ms=record.end_ms,
+                    text=record.content_text,
+                    image_url=image_url,
+                )
+            )
+        return SynthesisContext(tuple(evidence))
 
     def for_material(self, session_id: str) -> QuestionContext:
         """Build the exact effective transcript evidence for a whole session."""
