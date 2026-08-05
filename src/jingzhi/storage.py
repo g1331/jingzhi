@@ -47,14 +47,31 @@ class MigrationResult:
 class StorageActivity:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._active_reads = 0
         self._active_writes = 0
         self._migration_active = False
+
+    @contextmanager
+    def reading(self, description: str) -> Iterator[None]:
+        with self._lock:
+            if self._migration_active:
+                raise RuntimeError(f"存储迁移正在进行，不能{description}")
+            if self._active_writes:
+                raise RuntimeError(f"后台任务正在写入，不能{description}")
+            self._active_reads += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_reads -= 1
 
     @contextmanager
     def writing(self, description: str) -> Iterator[None]:
         with self._lock:
             if self._migration_active:
                 raise RuntimeError(f"存储迁移正在进行，不能{description}")
+            if self._active_reads:
+                raise RuntimeError(f"归档正在读取，不能{description}")
             self._active_writes += 1
         try:
             yield
@@ -67,6 +84,8 @@ class StorageActivity:
         with self._lock:
             if self._migration_active:
                 raise RuntimeError("已有存储迁移正在进行")
+            if self._active_reads:
+                raise RuntimeError("归档正在读取，不能迁移存储")
             if self._active_writes:
                 raise RuntimeError("后台任务仍在写入应用数据或模型缓存")
             reason = busy_reason()
@@ -81,6 +100,18 @@ class StorageActivity:
 
 
 storage_activity = StorageActivity()
+
+
+def storage_reader(description: str):  # type: ignore[no-untyped-def]
+    def decorate(function):  # type: ignore[no-untyped-def]
+        @wraps(function)
+        def guarded(*args, **kwargs):  # type: ignore[no-untyped-def]
+            with storage_activity.reading(description):
+                return function(*args, **kwargs)
+
+        return guarded
+
+    return decorate
 
 
 def storage_writer(description: str):  # type: ignore[no-untyped-def]

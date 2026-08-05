@@ -247,6 +247,24 @@ def test_migration_rejects_target_nested_inside_source(tmp_path: Path) -> None:
         manager.migrate_data(paths.data_dir / "nested")
 
 
+def test_storage_activity_prevents_writes_during_archive_reads() -> None:
+    activity = StorageActivity()
+
+    with (
+        activity.reading("导出会话"),
+        pytest.raises(RuntimeError, match="归档正在读取"),
+        activity.writing("保存配置"),
+    ):
+        pass
+
+    with (
+        activity.reading("创建完整备份"),
+        pytest.raises(RuntimeError, match="归档正在读取"),
+        activity.migrating(lambda: None),
+    ):
+        pass
+
+
 def test_storage_activity_prevents_writes_for_full_migration_scope() -> None:
     activity = StorageActivity()
 
