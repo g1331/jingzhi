@@ -1142,6 +1142,55 @@ def test_session_library_search_filter_pin_delete_and_restore(tmp_path, monkeypa
     window.close()
 
 
+def test_material_completion_does_not_cross_selected_session(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "material-ui.sqlite3")
+    first_id = database.create_session("第一会话", "2026-08-04T10:00:00+00:00")
+    second_id = database.create_session("第二会话", "2026-08-04T11:00:00+00:00")
+    material = database.record_material_version(
+        first_id,
+        kind="generated",
+        content="# 第一会话材料",
+        template_id=None,
+        model="analysis",
+        connection_json='{"connection_name":"主连接"}',
+        model_invocation_id=None,
+        request_status="succeeded",
+        request_id="request-1",
+        error=None,
+        evidence_state="exact",
+        evidence=[],
+    )
+    service = JingzhiApplicationService(database, recorder=NoHardwareRecorder())
+    window = MainWindow(Settings(data_dir=tmp_path), service=service)
+    window._selected_session_id = second_id
+    window._material_generation_in_flight = True
+
+    window._show_material(material)
+
+    assert material.id not in window._materials_by_id
+    assert window._material_generation_in_flight is False
+    assert "材料已保存" in window.status.text()
+    window._selected_session_id = first_id
+    window._materials_by_id = {material.id: material}
+    window._selected_material_version_id = material.id
+    window._show_material(material)
+    application.processEvents()
+    assert window.material_selector.currentData() == material.id
+    window.close()
+
+
+def test_answer_completion_does_not_replace_another_selected_session(tmp_path) -> None:
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window._selected_session_id = "current-session"
+
+    window._show_answer(99, "过期回答", "original-session")
+
+    assert "原会话" in window.notice_text.text()
+    assert window._last_answer == ""
+    window.close()
+
+
 def test_interrupted_session_timeline_retains_status(tmp_path) -> None:
     application = QApplication.instance() or QApplication([])
     database = Database(tmp_path / "interrupted-ui.sqlite3")

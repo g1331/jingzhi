@@ -64,13 +64,16 @@ from jingzhi.capture.devices import (
 from jingzhi.config import Settings
 from jingzhi.database import (
     AnswerEvidenceRecord,
+    MaterialEvidenceRecord,
     SessionAnswerRecord,
+    SessionMaterialVersionRecord,
     SessionNotificationKind,
     SessionRecord,
     SourceEventRecord,
     TimelineFrameRecord,
     TimelineTranscriptRecord,
 )
+from jingzhi.material_settings import MaterialGenerationMode
 from jingzhi.model_roles import (
     ModelConnection,
     ModelFallback,
@@ -302,6 +305,7 @@ QLabel#answerEvidenceStatus[state="unavailable"] {
 QLabel#answerEvidenceStatus[state="insufficient"] {
     color: #f2d49d; background: #2b2316; border-color: #765522;
 }
+QLabel#questionNotes { color: #b9c8c2; background: #182221; border: 1px solid #33413e; padding: 7px; }
 
 QLabel#emptyState { color: #71827c; font-size: 12px; }
 """
@@ -312,11 +316,12 @@ class UiBridge(QObject):
     worker_warning = Signal(str)
     source_event = Signal(object)
     action_error = Signal(str)
-    answer = Signal(int, str)
+    answer = Signal(int, str, str)
 
     voice_transcript = Signal(int, str)
     voice_error = Signal(int, str)
     summary = Signal(str)
+    material = Signal(object)
     stopped = Signal(str)
     stop_failed = Signal(str)
     pause_finished = Signal(bool)
@@ -668,6 +673,10 @@ class MainWindow(QMainWindow):
         self._reanswer_question_id: int | None = None
         self._selected_answer_version_id: int | None = None
         self._answers_by_id: dict[int, SessionAnswerRecord] = {}
+        self._selected_material_version_id: int | None = None
+        self._materials_by_id: dict[int, SessionMaterialVersionRecord] = {}
+        self._content_kind = "answer"
+        self._material_generation_in_flight = False
         provider_settings = getattr(self.manager, "provider_settings", settings.provider_settings)
         self._provider_connections = list(provider_settings.connections)
         self._provider_roles = {role.name: role for role in provider_settings.roles}
@@ -900,9 +909,7 @@ class MainWindow(QMainWindow):
         active = self._provider_connections[0]
         self.connection_name_input = QLineEdit(active.name)
         self.base_url_input = QLineEdit(active.base_url)
-        self.base_url_input.setPlaceholderText(
-            "例如 https://provider.example/v1；官方 OpenAI 可留空"
-        )
+        self.base_url_input.setPlaceholderText("例如 https://api.example/v1；官方 OpenAI 可留空")
         self.base_url_input.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.api_mode_input = QComboBox()
         self.api_mode_input.addItem("Responses API", "responses")
@@ -1255,6 +1262,13 @@ class MainWindow(QMainWindow):
         if session_changed or self._selected_answer_version_id not in self._answers_by_id:
             self._selected_answer_version_id = answers[-1].id if answers else None
         self._populate_answer_selector(answers)
+        materials = self.service.session_materials(session_id)
+        self._materials_by_id = {material.id: material for material in materials}
+        if session_changed or self._selected_material_version_id not in self._materials_by_id:
+            self._selected_material_version_id = materials[-1].id if materials else None
+        self._populate_material_selector(materials)
+        if session_changed:
+            self._content_kind = "answer" if answers else "material"
 
         window_duration = self.ZOOM_WINDOWS[self._zoom_key]
         try:
@@ -1271,8 +1285,13 @@ class MainWindow(QMainWindow):
         self._selected_frame = None
         self._selected_transcript = None
         self._render_timeline(timeline)
-        self._show_selected_answer(timeline)
+        if self._content_kind == "material" and self._selected_material_version_id is not None:
+            self._show_selected_material()
+        else:
+            self._content_kind = "answer"
+            self._show_selected_answer(timeline)
         self._refresh_reanswer_target()
+        self._refresh_material_controls()
         self._refresh_invocation_audit()
         self._prompt_pending_source_events(session_id)
 
@@ -1301,7 +1320,149 @@ class MainWindow(QMainWindow):
         self.answer_selector.setEnabled(bool(answers))
         self.answer_selector.blockSignals(False)
 
+    def _populate_material_selector(self, materials: list[SessionMaterialVersionRecord]) -> None:
+        self.material_selector.blockSignals(True)
+        self.material_selector.clear()
+        for material in materials:
+            kind = "生成" if material.kind == "generated" else "编辑"
+            self.material_selector.addItem(
+                f"版本 {material.version_number} · {kind} · {self._format_time_string(material.created_at_utc)}",
+                material.id,
+            )
+        selected_index = self.material_selector.findData(self._selected_material_version_id)
+        self.material_selector.setCurrentIndex(selected_index)
+        self.material_selector.setEnabled(bool(materials))
+        self.material_selector.blockSignals(False)
+
+    @staticmethod
+    def _format_time_string(value: str) -> str:
+        return value.replace("T", " ").split("+", 1)[0][:16]
+
+    def _refresh_material_controls(self) -> None:
+        has_materials = bool(self._materials_by_id)
+        self.material_edit_button.setEnabled(
+            has_materials
+            and self._content_kind == "material"
+            and not self._material_generation_in_flight
+        )
+        self.summary_button.setText("重新生成材料" if has_materials else "生成会话材料")
+        self.summary_button.setEnabled(
+            self._selected_session_id is not None and not self._material_generation_in_flight
+        )
+
+    def _show_selected_material(self) -> None:
+        material = self._materials_by_id.get(self._selected_material_version_id or -1)
+        if material is None:
+            self._show_selected_answer(self._timeline) if self._timeline is not None else None
+            return
+        self._content_kind = "material"
+        self.question_notes_label.hide()
+        self.answer_evidence_status.setText(
+            f"材料证据 · 版本 {material.version_number} · {material.evidence_state}"
+        )
+        material_evidence_state = (
+            material.evidence_state
+            if material.evidence_state in {"exact", "unavailable"}
+            else "unavailable"
+        )
+        self.answer_evidence_status.setProperty("state", material_evidence_state)
+        self.answer_evidence_status.setToolTip(
+            "模型来源："
+            + (material.connection_json or "未记录")
+            + "\n\n证据标识：\n"
+            + "\n".join(
+                item.stable_id
+                for item in self.service.material_evidence_entries(
+                    self._selected_session_id or "", material.id
+                )
+            )
+        )
+        self.answer_evidence_status.style().unpolish(self.answer_evidence_status)
+        self.answer_evidence_status.style().polish(self.answer_evidence_status)
+        self.answer_evidence_status.show()
+        self._render_material_evidence_entries(material.id)
+        self.output.set_markdown(material.content)
+        self._last_answer = material.content
+        self.speak_button.setEnabled(False)
+        self.add_note_button.setEnabled(False)
+        self._refresh_reanswer_target()
+
+    def _render_material_evidence_entries(self, material_version_id: int) -> None:
+        self._clear_layout(self.answer_evidence_layout)
+        if self._selected_session_id is None:
+            self.answer_evidence_entries.hide()
+            return
+        evidence = self.service.material_evidence_entries(
+            self._selected_session_id, material_version_id
+        )
+        for item in evidence:
+            button = QPushButton(self._material_evidence_label(item))
+            button.setObjectName(f"material-evidence-{item.ordinal}")
+            button.setProperty("role", "quiet")
+            button.setProperty("stableId", item.stable_id)
+            button.setToolTip(f"定位证据：{item.stable_id}")
+            button.clicked.connect(
+                lambda _checked=False, material_id=material_version_id, stable_id=item.stable_id: (
+                    self._navigate_to_material_evidence(material_id, stable_id)
+                )
+            )
+            self.answer_evidence_layout.addWidget(button)
+        self.answer_evidence_entries.setVisible(bool(evidence))
+
+    def _material_evidence_label(self, evidence: MaterialEvidenceRecord) -> str:
+        kind = "关键帧" if evidence.kind == "frame" else "字幕"
+        return f"{kind} · {self._format_time(evidence.start_ms)} · {evidence.source}"
+
+    def _navigate_to_material_evidence(self, material_version_id: int, stable_id: str) -> None:
+        if self._selected_session_id is None or self._timeline is None:
+            return
+        evidence = next(
+            (
+                item
+                for item in self.service.material_evidence_entries(
+                    self._selected_session_id, material_version_id
+                )
+                if item.stable_id == stable_id
+            ),
+            None,
+        )
+        if evidence is None:
+            self._show_evidence_navigation_error("材料证据目标不存在")
+            return
+        target_ms = evidence.start_ms
+        self._zoom_key = "1-minute"
+        zoom_button = self.findChild(QPushButton, "zoom-1-minute")
+        if zoom_button is not None:
+            zoom_button.setChecked(True)
+        self._window_start_ms = max(0, target_ms - 30_000)
+        current = self.session_library.currentItem()
+        if current is None:
+            return
+        self._content_kind = "material"
+        self._open_session_item(current)
+        if self._timeline is None:
+            return
+        visible = next(
+            (
+                item
+                for item in self._timeline.transcripts
+                if item.version_id == evidence.transcript_version_id
+            ),
+            None,
+        )
+        if visible is None:
+            self._show_evidence_navigation_error("材料证据不属于当前会话")
+            return
+        self._select_transcript(visible)
+        button = self.findChild(QPushButton, f"transcript-{visible.id}")
+        scroll = self.transcript_track.findChild(QScrollArea)
+        if button is not None and scroll is not None:
+            scroll.ensureWidgetVisible(button)
+
     def _show_selected_answer(self, timeline: SessionTimeline) -> None:
+        self._content_kind = "answer"
+        self.material_edit_button.setEnabled(False)
+        self.question_notes_label.hide()
         answer = self._answers_by_id.get(timeline.selected_answer_id or -1)
         if answer is None:
             self.answer_evidence_status.hide()
@@ -1310,6 +1471,7 @@ class MainWindow(QMainWindow):
             self.output.set_markdown("")
             self._last_answer = ""
             self.speak_button.setEnabled(False)
+            self.add_note_button.setEnabled(False)
             return
 
         summary = timeline.answer_evidence_summary
@@ -1347,6 +1509,21 @@ class MainWindow(QMainWindow):
         self._last_answer = content
         self.output.set_markdown(content)
         self.speak_button.setEnabled(bool(answer.answer and answer.answer.strip()))
+        self.add_note_button.setEnabled(True)
+        self._render_question_notes(answer.question_id)
+
+    def _render_question_notes(self, question_id: int) -> None:
+        if self._selected_session_id is None:
+            self.question_notes_label.hide()
+            return
+        notes = self.service.question_notes(self._selected_session_id, question_id)
+        if not notes:
+            self.question_notes_label.hide()
+            return
+        self.question_notes_label.setText(
+            "用户附注：\n" + "\n".join(f"- {note.content}" for note in notes)
+        )
+        self.question_notes_label.show()
 
     def _render_answer_evidence_entries(self, answer_version_id: int) -> None:
         self._clear_layout(self.answer_evidence_layout)
@@ -1443,9 +1620,62 @@ class MainWindow(QMainWindow):
     def _select_answer(self) -> None:
         answer_id = self.answer_selector.currentData()
         self._selected_answer_version_id = int(answer_id) if answer_id is not None else None
+        self._content_kind = "answer"
         current = self.session_library.currentItem()
         if current is not None:
             self._open_session_item(current)
+
+    @Slot()
+    def _select_material(self) -> None:
+        material_id = self.material_selector.currentData()
+        self._selected_material_version_id = int(material_id) if material_id is not None else None
+        if material_id is None:
+            return
+        self._content_kind = "material"
+        self._show_selected_material()
+        self._refresh_material_controls()
+
+    @Slot()
+    def _add_question_note(self) -> None:
+        if self._selected_session_id is None or self._selected_answer_version_id is None:
+            return
+        answer = self._answers_by_id.get(self._selected_answer_version_id)
+        if answer is None:
+            return
+        content, accepted = QInputDialog.getMultiLineText(self, "添加问题附注", "附注内容", "")
+        if not accepted or not content.strip():
+            return
+        try:
+            self.service.add_question_note(self._selected_session_id, answer.question_id, content)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports validation failures
+            self._show_action_error(str(exc))
+            return
+        self._render_question_notes(answer.question_id)
+        self._set_status("附注已保存", "success")
+
+    @Slot()
+    def _edit_selected_material(self) -> None:
+        if self._selected_session_id is None or self._selected_material_version_id is None:
+            return
+        material = self._materials_by_id.get(self._selected_material_version_id)
+        if material is None:
+            return
+        content, accepted = QInputDialog.getMultiLineText(
+            self, "编辑会话材料", "Markdown 内容", material.content
+        )
+        if not accepted or not content.strip() or content == material.content:
+            return
+        try:
+            edited = self.service.edit_material(self._selected_session_id, material.id, content)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports validation failures
+            self._show_action_error(str(exc))
+            return
+        self._materials_by_id[edited.id] = edited
+        self._selected_material_version_id = edited.id
+        self._content_kind = "material"
+        self._populate_material_selector(list(self._materials_by_id.values()))
+        self._show_selected_material()
+        self._set_status(f"材料版本 {edited.version_number} 已保存", "success")
 
     def _select_session_item(self, item: QListWidgetItem | None) -> None:
         self._window_start_ms = 0
@@ -1904,6 +2134,15 @@ class MainWindow(QMainWindow):
         self.timeline_navigator.setRange(0, 0)
         self.timeline_navigator.setEnabled(False)
         self.event_text.setText("尚未开始会话")
+        self._answers_by_id = {}
+        self._materials_by_id = {}
+        self._selected_answer_version_id = None
+        self._selected_material_version_id = None
+        self._content_kind = "answer"
+        self._populate_answer_selector([])
+        self._populate_material_selector([])
+        self.question_notes_label.hide()
+        self._refresh_material_controls()
 
     def _build_answer_panel(self) -> QWidget:
         panel = QFrame()
@@ -1945,11 +2184,29 @@ class MainWindow(QMainWindow):
         answer_selection_row.addWidget(self.answer_selector, 1)
         answer_selection_row.addWidget(self.answer_evidence_status, 2)
         self.answer_evidence_entries = QWidget()
+        material_selection_row = QHBoxLayout()
+        material_selection_label = QLabel("选择材料")
+        material_selection_label.setObjectName("trackLabel")
+        self.material_selector = QComboBox()
+        self.material_selector.setObjectName("materialSelector")
+        self.material_selector.setEnabled(False)
+        self.material_edit_button = QPushButton("编辑材料")
+        self.material_edit_button.setObjectName("materialEditButton")
+        self.material_edit_button.setProperty("role", "quiet")
+        self.material_edit_button.setEnabled(False)
+        material_selection_row.addWidget(material_selection_label)
+        material_selection_row.addWidget(self.material_selector, 1)
+        material_selection_row.addWidget(self.material_edit_button)
+
         self.answer_evidence_entries.setObjectName("answerEvidenceEntries")
         self.answer_evidence_layout = QHBoxLayout(self.answer_evidence_entries)
         self.answer_evidence_layout.setContentsMargins(0, 0, 0, 0)
         self.answer_evidence_layout.setSpacing(6)
         self.answer_evidence_entries.hide()
+        self.question_notes_label = QLabel()
+        self.question_notes_label.setObjectName("questionNotes")
+        self.question_notes_label.setWordWrap(True)
+        self.question_notes_label.hide()
 
         answer_header = QHBoxLayout()
         heading = QLabel("回答与会话材料")
@@ -1960,6 +2217,9 @@ class MainWindow(QMainWindow):
         self.speak_button = QPushButton("朗读回答")
         self.speak_button.setProperty("role", "quiet")
         self.speak_button.setEnabled(False)
+        self.add_note_button = QPushButton("添加附注")
+        self.add_note_button.setProperty("role", "quiet")
+        self.add_note_button.setEnabled(False)
         self.output_source_button = QPushButton("查看原文")
         self.output_source_button.setProperty("role", "quiet")
         self.copy_output_button = QPushButton("复制原文")
@@ -1967,13 +2227,16 @@ class MainWindow(QMainWindow):
         answer_header.addWidget(heading)
         answer_header.addStretch(1)
         answer_header.addWidget(self.speak_button)
+        answer_header.addWidget(self.add_note_button)
         answer_header.addWidget(self.reanswer_button)
         answer_header.addWidget(self.output_source_button)
         answer_header.addWidget(self.copy_output_button)
         self.output = MarkdownDocument()
         panel_layout.addLayout(question_row)
         panel_layout.addLayout(answer_selection_row)
+        panel_layout.addLayout(material_selection_row)
         panel_layout.addWidget(self.answer_evidence_entries)
+        panel_layout.addWidget(self.question_notes_label)
 
         panel_layout.addLayout(answer_header)
         panel_layout.addWidget(self.output, 1)
@@ -2002,6 +2265,8 @@ class MainWindow(QMainWindow):
             "test-provider",
             "answer-question",
             "reanswer-question",
+            "generate-material",
+            "edit-material",
             "summarize-session",
             "whisper-model-download",
             "whisper-benchmark",
@@ -2046,6 +2311,9 @@ class MainWindow(QMainWindow):
         self.bridge.worker_warning.connect(self._show_worker_warning)
         self.bridge.source_event.connect(self._source_event_reported)
         self.answer_selector.currentIndexChanged.connect(self._select_answer)
+        self.material_selector.currentIndexChanged.connect(self._select_material)
+        self.material_edit_button.clicked.connect(self._edit_selected_material)
+        self.add_note_button.clicked.connect(self._add_question_note)
 
         self.question.focused.connect(self._capture_question_anchor)
         self.question.returnPressed.connect(self._ask)
@@ -2081,6 +2349,7 @@ class MainWindow(QMainWindow):
         self.bridge.voice_transcript.connect(self._show_voice_transcript)
         self.bridge.voice_error.connect(self._show_voice_error)
         self.bridge.summary.connect(self._show_summary)
+        self.bridge.material.connect(self._show_material)
         self.bridge.stopped.connect(self._recording_stopped)
         self.bridge.stop_failed.connect(self._stop_failed)
         self.bridge.pause_finished.connect(self._pause_operation_finished)
@@ -2254,7 +2523,8 @@ class MainWindow(QMainWindow):
         else:
             self._reanswer_question_id = None
         self.reanswer_button.setEnabled(
-            self._reanswer_question_id is not None
+            self._content_kind == "answer"
+            and self._reanswer_question_id is not None
             and callable(getattr(self.manager, "reanswer_question", None))
         )
 
@@ -2610,13 +2880,16 @@ class MainWindow(QMainWindow):
         self.ask_button.setEnabled(False)
         self.output.set_markdown("_正在结合字幕和关键画面回答…_")
 
+        question_record = self.service.database.question(question_id)
+        origin_session_id = question_record.session_id if question_record is not None else ""
+
         def work() -> None:
             try:
                 result = self.service.submit_question(question)
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
-                self.bridge.answer.emit(question_id, result)
+                self.bridge.answer.emit(question_id, result, origin_session_id)
 
         threading.Thread(target=work, name="answer-question", daemon=True).start()
 
@@ -2628,6 +2901,8 @@ class MainWindow(QMainWindow):
         self.ask_button.setEnabled(False)
         self.reanswer_button.setEnabled(False)
         self.output.set_markdown("_正在基于最新有效字幕重新回答…_")
+        question_record = self.service.database.question(question_id)
+        origin_session_id = question_record.session_id if question_record is not None else ""
 
         def work() -> None:
             try:
@@ -2635,26 +2910,68 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
-                self.bridge.answer.emit(question_id, result)
+                self.bridge.answer.emit(question_id, result, origin_session_id)
 
         threading.Thread(target=work, name="reanswer-question", daemon=True).start()
 
     @Slot()
     def _summarize(self) -> None:
+        session_id = self._selected_session_id
+        if session_id is None:
+            self._show_action_error("请先选择一个会话")
+            return
         if not self._configure_provider_from_form():
             return
+        if not self._confirm_material_generation(session_id, automatic=False):
+            return
+        self._start_material_generation(session_id)
+
+    def _confirm_material_generation(self, session_id: str, *, automatic: bool) -> bool:
+        try:
+            preview = self.service.material_generation_preview(session_id)
+        except Exception as exc:  # noqa: BLE001 - UI boundary reports configuration failures
+            self._show_action_error(str(exc))
+            return False
+        if preview.transcript_count == 0:
+            self._show_action_error("当前会话没有可发送的有效字幕")
+            return False
+        title = "确认自动生成会话材料" if automatic else "确认生成会话材料"
+        message = (
+            f"将发送 {preview.transcript_count} 条完整会话字幕 "
+            f"（约 {preview.character_count} 字）到深度分析模型。\n\n"
+            f"连接：{preview.connection_name}\n"
+            f"模型：{preview.model}\n"
+            f"地址：{preview.base_url}\n"
+            f"推理级别：{preview.reasoning_level}\n\n"
+            "可能产生模型连接服务费用，费用与配额由所选连接决定；应用不会显示或发送密钥。"
+        )
+        if automatic:
+            QMessageBox.information(self, title, message + "\n\n将按已保存策略开始生成。")
+            return True
+        response = QMessageBox.question(
+            self,
+            title,
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return response == QMessageBox.StandardButton.Yes
+
+    def _start_material_generation(self, session_id: str) -> None:
+        self._material_generation_in_flight = True
         self.summary_button.setEnabled(False)
-        self.output.set_markdown("_正在生成会话总结…_")
+        self.material_edit_button.setEnabled(False)
+        self.output.set_markdown("_正在生成会话材料…_")
 
         def work() -> None:
             try:
-                result = self.manager.summarize()
+                result = self.service.generate_material(session_id)
             except Exception as exc:  # noqa: BLE001 - background task reports through Qt
                 self.bridge.action_error.emit(str(exc))
             else:
-                self.bridge.summary.emit(self._format_summary(result))
+                self.bridge.material.emit(result)
 
-        threading.Thread(target=work, name="summarize-session", daemon=True).start()
+        threading.Thread(target=work, name="generate-material", daemon=True).start()
 
     def _configure_provider_from_form(self) -> bool:
         try:
@@ -2709,6 +3026,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _show_action_error(self, message: str) -> None:
+        self._material_generation_in_flight = False
         compact = self._compact_message(message)
         self._set_status("操作失败", "error")
         self.notice_text.setText(compact)
@@ -2717,6 +3035,7 @@ class MainWindow(QMainWindow):
         self.ask_button.setEnabled(True)
         self._refresh_reanswer_target()
         self.summary_button.setEnabled(True)
+        self._refresh_material_controls()
         self.test_provider_button.setEnabled(True)
         self.voice_button.setEnabled(True)
         self.voice_button.setText("按住说话")
@@ -2725,8 +3044,16 @@ class MainWindow(QMainWindow):
             self.pause_button.setEnabled(self.service.supports_pause)
         self._refresh_invocation_audit()
 
-    @Slot(int, str)
-    def _show_answer(self, question_id: int, answer: str) -> None:
+    @Slot(int, str, str)
+    def _show_answer(
+        self, question_id: int, answer: str, origin_session_id: str | None = None
+    ) -> None:
+        if origin_session_id and origin_session_id != self._selected_session_id:
+            self.ask_button.setEnabled(True)
+            self._refresh_reanswer_target()
+            self._show_worker_warning("回答已保存到原会话；当前浏览位置未切换。")
+            return
+        self._content_kind = "answer"
         self._last_answer = answer
         self.output.set_markdown(answer)
         self.ask_button.setEnabled(True)
@@ -2763,7 +3090,24 @@ class MainWindow(QMainWindow):
     def _show_summary(self, summary: str) -> None:
         self.output.set_markdown(summary)
         self.summary_button.setEnabled(True)
-        self._set_status("总结已生成", "success")
+        self._set_status("材料已生成", "success")
+        self._refresh_invocation_audit()
+
+    @Slot(object)
+    def _show_material(self, material: SessionMaterialVersionRecord) -> None:
+        self._material_generation_in_flight = False
+        if material.session_id != self._selected_session_id:
+            self._set_status(f"材料已保存 · {material.session_id[:8]}", "success")
+            self._refresh_material_controls()
+            self._refresh_invocation_audit()
+            return
+        self._materials_by_id[material.id] = material
+        self._selected_material_version_id = material.id
+        self._content_kind = "material"
+        self._populate_material_selector(list(self._materials_by_id.values()))
+        self._show_selected_material()
+        self._refresh_material_controls()
+        self._set_status(f"材料版本 {material.version_number} 已生成", "success")
         self._refresh_invocation_audit()
 
     @Slot(str)
@@ -2788,6 +3132,45 @@ class MainWindow(QMainWindow):
             self.pause_button.setEnabled(self.service.supports_pause)
         else:
             self._refresh_recording_status()
+
+    def _choose_material_generation_mode(self) -> MaterialGenerationMode | None:
+        labels = ["始终自动生成", "每次结束时询问", "仅手动生成"]
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "选择会话材料生成策略",
+            "以后结束会话时：",
+            labels,
+            1,
+            False,
+        )
+        if not accepted:
+            return None
+        mode = {
+            labels[0]: MaterialGenerationMode.ALWAYS,
+            labels[1]: MaterialGenerationMode.ASK,
+            labels[2]: MaterialGenerationMode.MANUAL,
+        }[choice]
+        setter = getattr(self.manager, "set_material_generation_mode", None)
+        if callable(setter):
+            setter(mode)
+        return mode
+
+    def _maybe_generate_material_after_stop(self, session_id: str) -> None:
+        getter = getattr(self.manager, "material_generation_mode", None)
+        setter = getattr(self.manager, "set_material_generation_mode", None)
+        generator = getattr(self.service, "generate_material", None)
+        if not callable(getter) or not callable(setter) or not callable(generator):
+            return
+        mode = getter()
+        if mode is None:
+            mode = self._choose_material_generation_mode()
+        if mode is None or mode == MaterialGenerationMode.MANUAL:
+            return
+        if not self._confirm_material_generation(
+            session_id, automatic=mode == MaterialGenerationMode.ALWAYS
+        ):
+            return
+        self._start_material_generation(session_id)
 
     @Slot(str)
     def _recording_stopped(self, session_id: str) -> None:
@@ -2815,6 +3198,8 @@ class MainWindow(QMainWindow):
         self.correction_window_input.setEnabled(True)
         self._refresh_recording_status()
         self._refresh_sessions(session_id)
+        if not interrupted:
+            self._maybe_generate_material_after_stop(session_id)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._storage_dialog is not None and self._storage_dialog.operation_active:

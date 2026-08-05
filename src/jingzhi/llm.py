@@ -26,6 +26,13 @@ class AnswerModelResult:
     model: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MaterialModelResult:
+    content: str
+    request_id: str | None = None
+    model: str | None = None
+
+
 class OpenAIContextModel:
     def __init__(
         self,
@@ -248,7 +255,50 @@ class OpenAIContextModel:
             raise ProviderRequestError("字幕校订模型返回了空文本")
         return corrected
 
-    def summarize(self, transcript: str) -> dict[str, Any]:
+    def generate_material(
+        self, context: QuestionContext | str, *, template_id: str | None = None
+    ) -> MaterialModelResult:
+        transcript = context.transcript if isinstance(context, QuestionContext) else context
+        template_hint = f"可选模板标识：{template_id}\n" if template_id else ""
+        prompt = (
+            "根据以下实际会话字幕生成会话材料。输出必须是可直接保存的自由 Markdown，"
+            "不要输出 JSON、固定字段对象或 Markdown 代码围栏；可以按内容自然组织标题、"
+            "列表、表格、引用和 LaTeX 公式。只把字幕能支持的内容写成会话事实，并在相关"
+            "段落中保留方括号里的稳定证据标识和会话相对时间；无法从字幕确认的内容要明确"
+            "标为推断或待确认。\n"
+            f"{template_hint}\n"
+            f"会话证据：\n{transcript}"
+        )
+        try:
+            client = self._client()
+            if self.api_mode == "responses":
+                response = client.responses.create(
+                    model=self.model, input=prompt, **self._responses_options()
+                )
+                raw = str(response.output_text or "").strip()
+                request_id = getattr(response, "id", None)
+                resolved_model = getattr(response, "model", self.model)
+            else:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = self._chat_text(response).strip()
+                request_id = getattr(response, "id", None)
+                resolved_model = getattr(response, "model", self.model)
+        except ProviderRequestError:
+            raise
+        except Exception as exc:
+            raise self._provider_error(exc) from exc
+        if not raw:
+            raise ProviderRequestError("会话材料模型没有返回 Markdown 内容", request_id=request_id)
+        return MaterialModelResult(raw, request_id, resolved_model)
+
+    def summarize(self, transcript: str) -> MaterialModelResult:
+        """Compatibility alias for callers that still use the old summary name."""
+        return self.generate_material(transcript)
+
+    def _legacy_summarize_json(self, transcript: str) -> dict[str, Any]:
         prompt = (
             "根据会话字幕生成严格 JSON，不要使用 Markdown 代码块。结构必须是："
             '{"summary":"...","knowledge_points":[{"name":"...","explanation":"...",'

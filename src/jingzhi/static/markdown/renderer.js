@@ -55,7 +55,7 @@
   window.renderMarkdown = (source) => {
     if (!source || !source.trim()) {
       content.className = "empty-state";
-      content.textContent = "回答、总结、知识点和错题会显示在这里。";
+      content.textContent = "回答和会话材料会显示在这里。";
       return;
     }
 

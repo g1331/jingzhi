@@ -196,6 +196,15 @@ CREATE TABLE IF NOT EXISTS questions (
     state TEXT NOT NULL DEFAULT 'submitted' CHECK (state IN ('draft', 'submitted'))
 );
 
+CREATE TABLE IF NOT EXISTS question_notes (
+    id INTEGER PRIMARY KEY,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS question_note_history
+ON question_notes(question_id, id);
+
 CREATE TABLE IF NOT EXISTS answer_versions (
     id INTEGER PRIMARY KEY,
     question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
@@ -265,6 +274,42 @@ CREATE TABLE IF NOT EXISTS model_invocation_evidence (
     UNIQUE(invocation_id, stable_id)
 );
 
+CREATE TABLE IF NOT EXISTS session_material_versions (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('generated', 'user_edit')),
+    content TEXT NOT NULL,
+    template_id TEXT,
+    model TEXT,
+    connection_json TEXT,
+    model_invocation_id INTEGER REFERENCES model_invocations(id) ON DELETE SET NULL,
+    request_status TEXT NOT NULL CHECK (request_status IN ('succeeded', 'failed')),
+    upstream_request_id TEXT,
+    error TEXT,
+    evidence_state TEXT NOT NULL CHECK (evidence_state IN ('exact', 'unavailable')),
+    created_at_utc TEXT NOT NULL,
+    UNIQUE(session_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS session_material_version_history
+ON session_material_versions(session_id, version_number);
+
+CREATE TABLE IF NOT EXISTS session_material_evidence (
+    material_version_id INTEGER NOT NULL REFERENCES session_material_versions(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stable_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('transcript', 'frame')),
+    source TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    transcript_version_id INTEGER REFERENCES transcript_versions(id),
+    frame_id INTEGER REFERENCES frames(id),
+    content_text TEXT,
+    resource_path TEXT,
+    PRIMARY KEY(material_version_id, ordinal),
+    UNIQUE(material_version_id, stable_id)
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -280,7 +325,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 
 
 class SessionNotificationKind(StrEnum):
@@ -503,7 +548,47 @@ class SessionAnswerRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class QuestionNoteRecord:
+    id: int
+    question_id: int
+    content: str
+    created_at_utc: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionMaterialVersionRecord:
+    id: int
+    session_id: str
+    version_number: int
+    kind: str
+    content: str
+    template_id: str | None
+    model: str | None
+    connection_json: str | None
+    model_invocation_id: int | None
+    request_status: str
+    request_id: str | None
+    error: str | None
+    evidence_state: str
+    created_at_utc: str
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerEvidenceRecord:
+    ordinal: int
+    stable_id: str
+    kind: str
+    source: str
+    start_ms: int
+    end_ms: int
+    transcript_version_id: int | None
+    frame_id: int | None
+    content_text: str | None
+    resource_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialEvidenceRecord:
     ordinal: int
     stable_id: str
     kind: str
@@ -1707,6 +1792,29 @@ class Database:
             ).fetchone()
         return QuestionRecord(**dict(row)) if row is not None else None
 
+    def add_question_note(self, question_id: int, content: str) -> QuestionNoteRecord:
+        content = content.strip()
+        if not content:
+            raise ValueError("Question note is required")
+        created_at = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO question_notes(question_id, content, created_at_utc)
+                   VALUES (?, ?, ?)""",
+                (question_id, content, created_at),
+            )
+            note_id = int(cursor.lastrowid)
+        return QuestionNoteRecord(note_id, question_id, content, created_at)
+
+    def question_notes(self, question_id: int) -> list[QuestionNoteRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, question_id, content, created_at_utc
+                   FROM question_notes WHERE question_id = ? ORDER BY id""",
+                (question_id,),
+            ).fetchall()
+        return [QuestionNoteRecord(**dict(row)) for row in rows]
+
     def latest_question_id(self, session_id: str) -> int | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1845,6 +1953,189 @@ class Database:
             )
             for row in rows
         ]
+
+    def session_material_versions(self, session_id: str) -> list[SessionMaterialVersionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, session_id, version_number, kind, content, template_id,
+                          model, connection_json, model_invocation_id, request_status,
+                          upstream_request_id AS request_id, error, evidence_state, created_at_utc
+                   FROM session_material_versions
+                   WHERE session_id = ? ORDER BY version_number""",
+                (session_id,),
+            ).fetchall()
+        return [SessionMaterialVersionRecord(**dict(row)) for row in rows]
+
+    def material_version(self, material_version_id: int) -> SessionMaterialVersionRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT id, session_id, version_number, kind, content, template_id,
+                          model, connection_json, model_invocation_id, request_status,
+                          upstream_request_id AS request_id, error, evidence_state, created_at_utc
+                   FROM session_material_versions WHERE id = ?""",
+                (material_version_id,),
+            ).fetchone()
+        return SessionMaterialVersionRecord(**dict(row)) if row is not None else None
+
+    def material_evidence(self, material_version_id: int) -> list[MaterialEvidenceRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT ordinal, stable_id, kind, source, start_ms, end_ms,
+                          transcript_version_id, frame_id, content_text, resource_path
+                   FROM session_material_evidence
+                   WHERE material_version_id = ? ORDER BY ordinal""",
+                (material_version_id,),
+            ).fetchall()
+        return [
+            MaterialEvidenceRecord(
+                ordinal=row["ordinal"],
+                stable_id=row["stable_id"],
+                kind=row["kind"],
+                source=row["source"],
+                start_ms=row["start_ms"],
+                end_ms=row["end_ms"],
+                transcript_version_id=row["transcript_version_id"],
+                frame_id=row["frame_id"],
+                content_text=row["content_text"],
+                resource_path=Path(row["resource_path"]) if row["resource_path"] else None,
+            )
+            for row in rows
+        ]
+
+    def record_material_version(
+        self,
+        session_id: str,
+        *,
+        kind: str,
+        content: str,
+        template_id: str | None,
+        model: str | None,
+        connection_json: str | None,
+        model_invocation_id: int | None,
+        request_status: str,
+        request_id: str | None,
+        error: str | None,
+        evidence_state: str,
+        evidence: list[dict[str, object]],
+    ) -> SessionMaterialVersionRecord:
+        if kind not in {"generated", "user_edit"}:
+            raise ValueError(f"Unsupported material version kind: {kind}")
+        if request_status not in {"succeeded", "failed"}:
+            raise ValueError(f"Unsupported material request status: {request_status}")
+        if evidence_state not in {"exact", "unavailable"}:
+            raise ValueError(f"Unsupported material evidence state: {evidence_state}")
+        content = content.strip()
+        if not content:
+            raise ValueError("Material content is required")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            version_number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(version_number), 0) + 1
+                       FROM session_material_versions WHERE session_id = ?""",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            created_at = datetime.now(UTC).isoformat()
+            cursor = connection.execute(
+                """INSERT INTO session_material_versions(
+                       session_id, version_number, kind, content, template_id, model,
+                       connection_json, model_invocation_id, request_status,
+                       upstream_request_id, error, evidence_state, created_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    version_number,
+                    kind,
+                    content,
+                    template_id,
+                    model,
+                    connection_json,
+                    model_invocation_id,
+                    request_status,
+                    request_id,
+                    error,
+                    evidence_state,
+                    created_at,
+                ),
+            )
+            material_id = int(cursor.lastrowid)
+            connection.executemany(
+                """INSERT INTO session_material_evidence(
+                       material_version_id, ordinal, stable_id, kind, source,
+                       start_ms, end_ms, transcript_version_id, frame_id,
+                       content_text, resource_path
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        material_id,
+                        ordinal,
+                        item["stable_id"],
+                        item["kind"],
+                        item["source"],
+                        item["start_ms"],
+                        item["end_ms"],
+                        item.get("transcript_version_id"),
+                        item.get("frame_id"),
+                        item.get("content_text"),
+                        item.get("resource_path"),
+                    )
+                    for ordinal, item in enumerate(evidence)
+                ],
+            )
+        return SessionMaterialVersionRecord(
+            material_id,
+            session_id,
+            version_number,
+            kind,
+            content,
+            template_id,
+            model,
+            connection_json,
+            model_invocation_id,
+            request_status,
+            request_id,
+            error,
+            evidence_state,
+            created_at,
+        )
+
+    def record_material_edit(
+        self, material_version_id: int, content: str
+    ) -> SessionMaterialVersionRecord:
+        parent = self.material_version(material_version_id)
+        if parent is None:
+            raise KeyError(f"Unknown material version: {material_version_id}")
+        evidence = [
+            {
+                "stable_id": item.stable_id,
+                "kind": item.kind,
+                "source": item.source,
+                "start_ms": item.start_ms,
+                "end_ms": item.end_ms,
+                "transcript_version_id": item.transcript_version_id,
+                "frame_id": item.frame_id,
+                "content_text": item.content_text,
+                "resource_path": str(item.resource_path) if item.resource_path else None,
+            }
+            for item in self.material_evidence(material_version_id)
+        ]
+        # Keep the original invocation as provenance; `user_edit` records that no new
+        # model request produced this version while preserving its evidence lineage.
+        return self.record_material_version(
+            parent.session_id,
+            kind="user_edit",
+            content=content,
+            template_id=parent.template_id,
+            model=parent.model,
+            connection_json=parent.connection_json,
+            model_invocation_id=parent.model_invocation_id,
+            request_status="succeeded",
+            request_id=parent.request_id,
+            error=None,
+            evidence_state=parent.evidence_state,
+            evidence=evidence,
+        )
 
     def add_question(
         self,
