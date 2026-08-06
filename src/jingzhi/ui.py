@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QPixmapCache, QShortcut
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QApplication,
@@ -381,6 +381,8 @@ class UiBridge(QObject):
     archive_preview_failed = Signal(str)
     audio_recovery_finished = Signal(object)
     audio_recovery_failed = Signal(str)
+    correction_retry_finished = Signal(int)
+    correction_retry_failed = Signal(str)
     runtime_metrics_ready = Signal(object)
     runtime_metrics_failed = Signal(str)
 
@@ -1841,6 +1843,7 @@ class OnboardingDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    LIVE_TIMELINE_REFRESH_MS = 1_000
     CORRECTION_STATE_LABELS: ClassVar[dict[str, str]] = {
         "recognizing": "识别中",
         "pending": "待校订",
@@ -1919,6 +1922,11 @@ class MainWindow(QMainWindow):
         self._runtime_metrics_snapshot = None
         self._runtime_metrics_in_flight = False
         self._runtime_metrics_generation = 0
+        self._timeline_refresh_session_id: str | None = None
+        self._timeline_refresh_timer = QTimer(self)
+        self._timeline_refresh_timer.setSingleShot(True)
+        self._timeline_refresh_timer.setInterval(self.LIVE_TIMELINE_REFRESH_MS)
+        self._timeline_refresh_timer.timeout.connect(self._refresh_active_timeline)
         self._build_ui()
         self._connect_signals()
         self.setStyleSheet(APP_STYLE)
@@ -3275,9 +3283,8 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 - optional recovery notice boundary
             unfinished = []
         try:
-            metrics = self.service.runtime_metrics()
-            retryable_model_tasks = metrics.retryable_model_tasks
-            failed_audio_chunks = metrics.failed_audio_chunks
+            retryable_model_tasks = self.service.retryable_model_task_count()
+            failed_audio_chunks = self.service.failed_audio_chunk_count()
         except Exception:  # noqa: BLE001 - optional recovery notice boundary
             retryable_model_tasks = 0
             failed_audio_chunks = 0
@@ -3340,19 +3347,35 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, name="retry-audio", daemon=True).start()
 
     def _retry_failed_corrections(self) -> None:
+        if not self.retry_correction_button.isEnabled():
+            return
         self.retry_correction_button.setEnabled(False)
-        try:
-            count = self.service.retry_failed_correction_runs()
-        except Exception as exc:  # noqa: BLE001 - retry boundary reports to UI
-            self.retry_correction_button.setEnabled(True)
-            self._show_worker_warning(str(exc))
-        else:
-            self.retry_correction_button.setVisible(False)
-            if count == 0:
-                self.retry_correction_button.setEnabled(True)
-            self._set_status("字幕校订已排队", "warning")
-            self.notice_text.setText(f"已重新排队 {count} 个字幕校订窗口")
-            self.notice.show()
+        self._set_status("正在重新排队字幕校订…", "warning")
+
+        def work() -> None:
+            try:
+                count = self.service.retry_failed_correction_runs()
+            except Exception as exc:  # noqa: BLE001 - retry boundary reports to UI
+                self.bridge.correction_retry_failed.emit(str(exc))
+            else:
+                self.bridge.correction_retry_finished.emit(count)
+
+        threading.Thread(target=work, name="retry-corrections", daemon=True).start()
+
+    @Slot(int)
+    def _correction_retry_finished(self, count: int) -> None:
+        self.retry_correction_button.setVisible(False)
+        self.retry_correction_button.setEnabled(True)
+        self._set_status("字幕校订已排队", "warning")
+        self.notice_text.setText(f"已重新排队 {count} 个字幕校订窗口")
+        self.notice.show()
+
+    @Slot(str)
+    def _correction_retry_failed(self, message: str) -> None:
+        self.retry_correction_button.setEnabled(True)
+        self._set_status("字幕校订重试失败", "error")
+        self.notice_text.setText(self._compact_message(message))
+        self.notice.show()
 
     @Slot(str)
     def _audio_recovery_failed(self, message: str) -> None:
@@ -3471,13 +3494,18 @@ class MainWindow(QMainWindow):
                 button.setToolTip(
                     f"关键帧 #{frame.id} · {frame.source_id} · {self._format_time(frame.ts_ms)}"
                 )
-                pixmap = QPixmap(str(frame.path))
-                if not pixmap.isNull():
-                    thumbnail = pixmap.scaled(
-                        QSize(82, 58),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
+                cache_key = f"jingzhi-frame-thumbnail:{frame.path}"
+                thumbnail = QPixmap()
+                if not QPixmapCache.find(cache_key, thumbnail):
+                    pixmap = QPixmap(str(frame.path))
+                    if not pixmap.isNull():
+                        thumbnail = pixmap.scaled(
+                            QSize(82, 58),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                        QPixmapCache.insert(cache_key, thumbnail)
+                if not thumbnail.isNull():
                     button.setIcon(QIcon(thumbnail))
                     button.setIconSize(QSize(82, 58))
                 button.clicked.connect(
@@ -4036,6 +4064,8 @@ class MainWindow(QMainWindow):
         self.bridge.source_event.connect(self._source_event_reported)
         self.bridge.audio_recovery_finished.connect(self._audio_recovery_finished)
         self.bridge.audio_recovery_failed.connect(self._audio_recovery_failed)
+        self.bridge.correction_retry_finished.connect(self._correction_retry_finished)
+        self.bridge.correction_retry_failed.connect(self._correction_retry_failed)
         self.bridge.runtime_metrics_ready.connect(self._runtime_metrics_ready)
         self.bridge.runtime_metrics_failed.connect(self._runtime_metrics_failed)
         self.answer_selector.currentIndexChanged.connect(self._select_answer)
@@ -4757,20 +4787,34 @@ class MainWindow(QMainWindow):
     @Slot(int, int, str, str)
     def _append_segment(self, start_ms: int, _end_ms: int, source: str, text: str) -> None:
         del start_ms, source, text
+        active_session_id = self._active_session_id()
+        if active_session_id is None or active_session_id != self._selected_session_id:
+            return
+        self._timeline_refresh_session_id = active_session_id
+        if not self._timeline_refresh_timer.isActive():
+            self._timeline_refresh_timer.start()
+
+    @Slot()
+    def _refresh_active_timeline(self) -> None:
+        session_id = self._timeline_refresh_session_id
+        self._timeline_refresh_session_id = None
+        if session_id is None or session_id != self._active_session_id():
+            return
         current = self.session_library.currentItem()
-        if current is not None:
-            self._open_session_item(current)
+        if current is None or current.data(Qt.ItemDataRole.UserRole) != session_id:
+            return
+        self._open_session_item(current)
 
     @Slot(str)
     def _show_worker_warning(self, message: str) -> None:
         try:
-            metrics = self.service.runtime_metrics()
-            self.retry_audio_button.setVisible(metrics.failed_audio_chunks > 0)
+            failed_audio_chunks = self.service.failed_audio_chunk_count()
+            self.retry_audio_button.setVisible(failed_audio_chunks > 0)
             failed_correction_runs = self.service.failed_correction_run_count()
             self.retry_correction_button.setVisible(failed_correction_runs > 0)
             self.retry_correction_button.setEnabled(failed_correction_runs > 0)
         except Exception as exc:  # noqa: BLE001 - warning display must not mask the worker error
-            logger.debug("Could not refresh retryable audio count: %s", exc)
+            logger.debug("Could not refresh retryable task counts: %s", exc)
         self.notice_text.setText(self._compact_message(message))
         self.notice.show()
 

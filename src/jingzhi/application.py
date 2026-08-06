@@ -310,6 +310,19 @@ class JingzhiApplicationService:
             raise RuntimeError("Failed audio retry is unavailable for this recorder")
         return method()
 
+    def failed_audio_chunk_count(self) -> int:
+        method = getattr(self.recorder, "database", None)
+        if method is None:
+            return 0
+        _pending, failed = method.recovery_audio_counts()
+        return int(failed)
+
+    def retryable_model_task_count(self) -> int:
+        method = getattr(self.recorder, "database", None)
+        if method is None:
+            return 0
+        return int(method.retryable_model_task_count())
+
     def failed_correction_run_count(self) -> int:
         method = getattr(self.recorder, "database", None)
         if method is None:
