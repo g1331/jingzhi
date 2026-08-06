@@ -22,7 +22,7 @@
 - [x] `uv run ruff format --check src tests`
 - [x] `uv run ruff check src tests`
 - [x] `uv run python -m compileall -q src tests`
-- [x] `uv run pytest -q` — 211 passed, 4 skipped
+- [x] `uv run pytest -q` — 215 passed, 4 skipped
 - [x] `uv build`
 
 专项覆盖：
@@ -86,5 +86,6 @@
 
 - 进程已经退出后无法继续同一组实时采集线程；应用会保留中断会话、已写入时间线和待转写音频，并在重启后恢复可恢复部分。
 - 没有 NVIDIA 驱动或 `nvidia-smi` 的机器不能提供 GPU 利用率/显存指标，界面显示“未检测”。
+- CUDA 驱动可见但运行库不完整时，Whisper 不会误启用 GPU，而是回退到 CPU 并提示缺少的 DLL；需要 GPU 时可使用 `uv sync --extra gpu` 安装 CUDA 12/cuDNN 9 运行库后重启。
 - 物理设备拔出后的缺失区间不会被伪造为有效证据；来源故障会记录为时间线事件并提示用户。
 - 真机验收记录需要设备、网络和存储权限，不能由离屏测试替代。

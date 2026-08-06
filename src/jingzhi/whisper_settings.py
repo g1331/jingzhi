@@ -131,12 +131,50 @@ class WhisperCapabilities:
     devices: tuple[str, ...]
     compute_types: dict[str, tuple[str, ...]]
     gpu_name: str | None = None
+    cuda_runtime_error: str | None = None
+
+
+_CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def _missing_cuda_runtime_dlls() -> tuple[str, ...]:
+    if sys.platform != "win32":
+        return ()
+    try:
+        import ctypes
+
+        import ctranslate2
+
+        package_dir = Path(ctranslate2.__file__).resolve().parent
+        dll_directories = [package_dir]
+        site_packages = package_dir.parent
+        dll_directories.extend(
+            (
+                site_packages / "nvidia" / "cublas" / "bin",
+                site_packages / "nvidia" / "cudnn" / "bin",
+            )
+        )
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            for directory in dll_directories:
+                if directory.is_dir():
+                    _CUDA_DLL_DIRECTORY_HANDLES.append(add_dll_directory(str(directory)))
+        missing = []
+        for name in ("cublas64_12.dll", "cudnn64_9.dll"):
+            try:
+                ctypes.WinDLL(name)
+            except (FileNotFoundError, OSError):
+                missing.append(name)
+        return tuple(missing)
+    except (AttributeError, FileNotFoundError, OSError, RuntimeError, TypeError):
+        return ("cublas64_12.dll", "cudnn64_9.dll")
 
 
 def detect_whisper_capabilities() -> WhisperCapabilities:
     devices = ["cpu"]
     compute_types: dict[str, tuple[str, ...]] = {"cpu": ("int8", "float32")}
     gpu_name = None
+    cuda_runtime_error = None
     try:
         import ctranslate2
 
@@ -145,19 +183,32 @@ def detect_whisper_capabilities() -> WhisperCapabilities:
             value for value in ("int8", "float32") if value in cpu_supported
         ) or ("float32",)
         if ctranslate2.get_cuda_device_count() > 0:
-            cuda_supported = ctranslate2.get_supported_compute_types("cuda")
-            supported = tuple(
-                value
-                for value in ("float16", "int8_float16", "int8", "float32")
-                if value in cuda_supported
-            )
-            if supported:
-                devices.append("cuda")
-                compute_types["cuda"] = supported
-                gpu_name = "CUDA GPU"
+            missing_dlls = _missing_cuda_runtime_dlls()
+            if missing_dlls:
+                cuda_runtime_error = (
+                    "检测到 NVIDIA GPU，但 CUDA 运行库不可用（缺少或无法加载："
+                    f"{', '.join(missing_dlls)}）。已回退到 CPU；如需 GPU，请安装项目的 "
+                    "gpu extra 后重启。"
+                )
+            else:
+                cuda_supported = ctranslate2.get_supported_compute_types("cuda")
+                supported = tuple(
+                    value
+                    for value in ("float16", "int8_float16", "int8", "float32")
+                    if value in cuda_supported
+                )
+                if supported:
+                    devices.append("cuda")
+                    compute_types["cuda"] = supported
+                    gpu_name = "CUDA GPU"
     except (ImportError, RuntimeError, ValueError):
         pass
-    return WhisperCapabilities(tuple(devices), compute_types, gpu_name)
+    return WhisperCapabilities(
+        tuple(devices),
+        compute_types,
+        gpu_name,
+        cuda_runtime_error,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +224,13 @@ def resolve_whisper_settings(
     advice: list[str] = []
     if device == "auto":
         device = "cuda" if "cuda" in capabilities.devices else "cpu"
+        if device == "cpu" and capabilities.cuda_runtime_error:
+            advice.append(capabilities.cuda_runtime_error)
     elif device not in capabilities.devices:
-        advice.append("当前环境不支持 CUDA；已回退到 CPU。可安装兼容的 NVIDIA 驱动后重试。")
+        advice.append(
+            capabilities.cuda_runtime_error
+            or "当前环境不支持 CUDA；已回退到 CPU。可安装兼容的 NVIDIA 驱动后重试。"
+        )
         device = "cpu"
 
     supported = capabilities.compute_types[device]
