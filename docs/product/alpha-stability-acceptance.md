@@ -22,7 +22,7 @@
 - [x] `uv run ruff format --check src tests`
 - [x] `uv run ruff check src tests`
 - [x] `uv run python -m compileall -q src tests`
-- [x] `uv run pytest -q` — 218 passed, 4 skipped
+- [x] `uv run pytest -q` — 219 passed, 4 skipped
 - [x] `uv build`
 
 专项覆盖：
