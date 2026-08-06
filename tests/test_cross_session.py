@@ -438,6 +438,7 @@ def test_failed_cross_session_synthesis_enters_retry_queue(tmp_path: Path) -> No
     assert retried.answer == "重试成功"
     assert retried.retry_of_id == failed_id
     assert manager.database.cross_session_syntheses(request_status="failed") == ()
+    assert manager.database.retryable_model_task_count() == 0
 
 
 def test_failed_cross_session_synthesis_is_not_retryable_after_source_is_trashed(

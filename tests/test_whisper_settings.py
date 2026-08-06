@@ -86,6 +86,26 @@ def test_auto_device_uses_available_gpu_with_supported_precision() -> None:
     assert resolved.fallback_advice == ""
 
 
+def test_explicit_cuda_uses_runtime_specific_fallback_advice() -> None:
+    capabilities = WhisperCapabilities(
+        devices=("cpu",),
+        compute_types={"cpu": ("int8", "float32")},
+        cuda_runtime_error="CUDA runtime is unavailable: cublas64_12.dll",
+    )
+    requested = replace(
+        PROFILE_PRESETS[WhisperProfile.BALANCED].settings,
+        device="cuda",
+        compute_type="float16",
+    )
+
+    resolved = resolve_whisper_settings(requested, capabilities)
+
+    assert resolved.settings.device == "cpu"
+    assert resolved.settings.compute_type == "int8"
+    assert resolved.fallback_advice.startswith(capabilities.cuda_runtime_error)
+    assert "CPU" in resolved.fallback_advice
+
+
 def test_fake_model_benchmark_reports_text_latency_realtime_factor_and_resources(
     tmp_path: Path,
 ) -> None:
@@ -241,6 +261,85 @@ def test_downloader_and_benchmark_pass_the_configured_model_directory(
     assert download_calls[0]["cache_dir"] == str(tmp_path)
 
 
+def test_cuda_runtime_probe_reports_the_specific_missing_dll(monkeypatch, tmp_path: Path) -> None:
+    class FakeCTranslate2:
+        __file__ = str(tmp_path / "ctranslate2.dll")
+
+        @staticmethod
+        def get_cuda_device_count() -> int:
+            return 1
+
+        @staticmethod
+        def get_supported_compute_types(device: str) -> set[str]:
+            return {"int8", "float32"} if device == "cpu" else {"float16", "float32"}
+
+    def fake_win_dll(name: str):
+        if name == "cublas64_12.dll":
+            raise OSError("missing cublas")
+        return object()
+
+    monkeypatch.setitem(__import__("sys").modules, "ctranslate2", FakeCTranslate2)
+    monkeypatch.setattr("ctypes.WinDLL", fake_win_dll, raising=False)
+    monkeypatch.setattr(__import__("sys"), "platform", "win32")
+
+    capabilities = detect_whisper_capabilities()
+
+    assert capabilities.devices == ("cpu",)
+    assert capabilities.cuda_runtime_error is not None
+    assert "cublas64_12.dll" in capabilities.cuda_runtime_error
+    assert "cudnn64_9.dll" not in capabilities.cuda_runtime_error
+
+
+def test_non_windows_cuda_skips_windows_dll_preflight(monkeypatch) -> None:
+    class FakeCTranslate2:
+        @staticmethod
+        def get_cuda_device_count() -> int:
+            return 1
+
+        @staticmethod
+        def get_supported_compute_types(device: str) -> set[str]:
+            return {"int8", "float32"} if device == "cpu" else {"float16", "float32"}
+
+    monkeypatch.setitem(__import__("sys").modules, "ctranslate2", FakeCTranslate2)
+    monkeypatch.setattr(__import__("sys"), "platform", "linux")
+
+    capabilities = detect_whisper_capabilities()
+
+    assert capabilities.devices == ("cpu", "cuda")
+    assert capabilities.cuda_runtime_error is None
+
+
+def test_cuda_device_without_runtime_is_not_reported_as_available(monkeypatch) -> None:
+    class FakeCTranslate2:
+        @staticmethod
+        def get_cuda_device_count() -> int:
+            return 1
+
+        @staticmethod
+        def get_supported_compute_types(device: str) -> set[str]:
+            return {"int8", "float32"} if device == "cpu" else {"float16", "float32"}
+
+    monkeypatch.setitem(__import__("sys").modules, "ctranslate2", FakeCTranslate2)
+    monkeypatch.setattr(
+        "jingzhi.whisper_settings._missing_cuda_runtime_dlls",
+        lambda: ("cublas64_12.dll",),
+    )
+
+    capabilities = detect_whisper_capabilities()
+    resolved = resolve_whisper_settings(
+        PROFILE_PRESETS[WhisperProfile.BALANCED].settings,
+        capabilities,
+    )
+
+    assert capabilities.devices == ("cpu",)
+    assert capabilities.cuda_runtime_error
+    assert resolved.settings.device == "cpu"
+    assert resolved.settings.compute_type == "int8"
+    assert "CUDA" in resolved.fallback_advice
+    assert "运行库" in resolved.fallback_advice
+    assert "gpu extra" in resolved.fallback_advice
+
+
 def test_windows_detected_capabilities_resolve_cpu_and_available_gpu(monkeypatch) -> None:
     class FakeCTranslate2:
         @staticmethod
@@ -252,6 +351,7 @@ def test_windows_detected_capabilities_resolve_cpu_and_available_gpu(monkeypatch
             return {"int8", "float32"} if device == "cpu" else {"float16", "float32"}
 
     monkeypatch.setitem(__import__("sys").modules, "ctranslate2", FakeCTranslate2)
+    monkeypatch.setattr("jingzhi.whisper_settings._missing_cuda_runtime_dlls", lambda: ())
     capabilities = detect_whisper_capabilities()
 
     assert capabilities.devices == ("cpu", "cuda")

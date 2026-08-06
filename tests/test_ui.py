@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -396,6 +397,71 @@ def test_html_warning_is_compacted_and_does_not_change_window_width(tmp_path) ->
     assert len(window.notice_text.text()) < 120
     assert window.width() == initial_width
     window.manager.save_provider = lambda: None
+    window.close()
+
+
+def test_worker_warning_does_not_scan_runtime_metrics_on_ui_thread(tmp_path) -> None:
+    QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window._recording_status_timer.stop()
+    runtime_metrics_called = False
+
+    def fail_if_called():
+        nonlocal runtime_metrics_called
+        runtime_metrics_called = True
+        raise AssertionError("runtime metrics must not run in the warning slot")
+
+    window.service.runtime_metrics = fail_if_called
+    window._show_worker_warning("后台校订失败")
+
+    assert runtime_metrics_called is False
+    window.close()
+
+
+def test_retry_correction_runs_off_the_ui_thread(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window.retry_correction_button.show()
+    called_thread: list[threading.Thread] = []
+    completed = threading.Event()
+
+    def retry() -> int:
+        called_thread.append(threading.current_thread())
+        completed.set()
+        return 1
+
+    window.service.retry_failed_correction_runs = retry
+    window._retry_failed_corrections()
+
+    assert completed.wait(timeout=1)
+    assert called_thread[0] is not threading.current_thread()
+    application.processEvents()
+    assert window.retry_correction_button.isVisible() is False
+    window.close()
+
+
+def test_segment_updates_coalesce_timeline_rerenders(tmp_path) -> None:
+    QApplication.instance() or QApplication([])
+    window = MainWindow(Settings(data_dir=tmp_path))
+    session_id = "active-session"
+    window.manager.session_id = session_id
+    window.manager.stop_event = threading.Event()
+    item = QListWidgetItem("当前会话")
+    item.setData(Qt.ItemDataRole.UserRole, session_id)
+    window.session_library.addItem(item)
+    window.session_library.setCurrentItem(item)
+    window._selected_session_id = session_id
+    rendered: list[object] = []
+    window._open_session_item = lambda current: rendered.append(current)
+
+    window._append_segment(1_000, 2_000, "microphone", "第一句")
+    window._append_segment(2_000, 3_000, "microphone", "第二句")
+
+    assert window._timeline_refresh_timer.isActive()
+    assert rendered == []
+    window._refresh_active_timeline()
+    assert rendered == [item]
+    window.service.stop_session = lambda: None
     window.close()
 
 
@@ -1500,3 +1566,24 @@ def test_interrupted_session_timeline_retains_status(tmp_path) -> None:
 
     assert "已中断" in window.workspace_meta.text()
     window.close()
+
+
+def test_main_window_reports_audio_recovery_and_retryable_tasks(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "jingzhi.sqlite3")
+    session_id = database.create_session("失败音频", "2026-01-01T00:00:00+00:00")
+    audio = tmp_path / "failed.wav"
+    audio.write_bytes(b"audio")
+    chunk_id = database.add_audio_chunk(session_id, "microphone", 0, 2_000, audio)
+    database.set_chunk_state(chunk_id, "failed", "temporary")
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window.show()
+    application.processEvents()
+
+    window._audio_recovery_finished(SimpleNamespace(queued_chunks=2, missing_chunks=1))
+
+    assert "已恢复 2 个待转写音频片段" in window.notice_text.text()
+    assert "音频文件缺失" in window.notice_text.text()
+    assert window.retry_audio_button.isVisible()
+    window.close()
+    application.processEvents()

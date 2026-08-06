@@ -97,6 +97,8 @@ def test_legacy_database_migrates_frames_without_losing_data(tmp_path: Path) -> 
         13,
         14,
         15,
+        16,
+        17,
     ]
 
 

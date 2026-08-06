@@ -111,7 +111,7 @@ class ProviderSettingsStore:
             id=connection_id,
             name=str(item.get("name", connection_id)).strip(),
             base_url=str(item.get("base_url", "")).strip(),
-            api_key=self._read_secret(connection_id),
+            api_key=self._read_secret(connection_id, legacy=connection_id == "default"),
             api_mode=str(item.get("api_mode", "responses")),
         )
 

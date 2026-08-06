@@ -324,6 +324,15 @@ def test_incomplete_correction_result_is_recorded_as_failure(tmp_path: Path) -> 
     ]
 
 
+def test_recovered_window_can_be_registered_before_worker_starts() -> None:
+    batcher = CorrectionWindowBatcher(15)
+    window = ("session", 0)
+
+    batcher.register(window)
+    batcher.start(window)
+    assert batcher.complete(window) == ()
+
+
 def test_completed_window_is_rescheduled_when_a_late_segment_arrives() -> None:
     batcher = CorrectionWindowBatcher(15)
     window = ("session", 0)

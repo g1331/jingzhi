@@ -33,6 +33,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
+gpu = [
+  "nvidia-cublas-cu12>=12,<13; sys_platform == 'win32'",
+  "nvidia-cudnn-cu12>=9,<10; sys_platform == 'win32'",
+]
 
 [project.scripts]
 jingzhi = "jingzhi.main:main"

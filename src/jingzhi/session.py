@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -31,6 +32,14 @@ from jingzhi.database import (
     SessionMaterialVersionRecord,
     SourceEventRecord,
     TimelineEventKind,
+)
+from jingzhi.diagnostics import (
+    AudioRecoveryReport,
+    RuntimeMetrics,
+    SystemMetricsSampler,
+    directory_size,
+    disk_free_bytes,
+    now_utc_iso,
 )
 from jingzhi.llm import MaterialModelResult
 from jingzhi.material_settings import MaterialGenerationMode, MaterialGenerationSettingsStore
@@ -117,6 +126,52 @@ class SessionManager:
         self.pending_question_id: int | None = None
         self.question_voice_recorder: QuestionVoiceRecorder | None = None
         self.question_transcriber: WhisperQuestionTranscriber | None = None
+        self._transcription_metrics_lock = threading.RLock()
+        self._transcription_audio_ms = 0
+        self._transcription_processing_seconds = 0.0
+        self._resource_sampler = SystemMetricsSampler()
+        recovered_correction_items = self.database.recover_running_correction_runs(
+            datetime.now(UTC).isoformat()
+        )
+        self.recovered_correction_items = tuple(recovered_correction_items)
+
+    def start_recovered_correction_tasks(self) -> None:
+        retryable_items = [
+            item
+            for item in self.recovered_correction_items
+            if self.database.transcript_correction_settings(item[0]).enabled
+        ]
+        if not retryable_items:
+            return
+        self._start_correction_worker()
+        assert self.correction_queue is not None
+        for item in retryable_items:
+            self.correction_batcher.register(item)
+            self.database.resolve_retryable_model_tasks(
+                "transcript_correction",
+                item[0],
+                payload_key="window_start_ms",
+                payload_value=item[1],
+            )
+            self.correction_queue.put(item)
+        self.recovered_correction_items = ()
+
+    def retry_failed_correction_runs(self) -> int:
+        items = self.database.failed_correction_windows()
+        if not items:
+            return 0
+        self._start_correction_worker()
+        assert self.correction_queue is not None
+        for item in items:
+            self.correction_batcher.register(item)
+            self.database.resolve_retryable_model_tasks(
+                "transcript_correction",
+                item[0],
+                payload_key="window_start_ms",
+                payload_value=item[1],
+            )
+            self.correction_queue.put(item)
+        return len(items)
 
     def configure_provider(self, settings: SavedProviderSettings) -> None:
         connection_ids = {connection.id for connection in settings.connections}
@@ -285,6 +340,130 @@ class SessionManager:
                 f"{message}。确认数据缺失后才会写入时间线。"
             )
 
+    def _record_transcription_metrics(self, audio_ms: int, processing_seconds: float) -> None:
+        with self._transcription_metrics_lock:
+            self._transcription_audio_ms += max(0, audio_ms)
+            self._transcription_processing_seconds += max(0.0, processing_seconds)
+
+    def runtime_metrics(self) -> RuntimeMetrics:
+        session_id = self.session_id
+        counts = (
+            self.database.session_runtime_counts(session_id) if session_id is not None else None
+        )
+        global_pending_audio, global_failed_audio = self.database.recovery_audio_counts()
+        duration_ms = self.recording_status().duration_ms if self.is_recording else 0
+        storage_path = self.settings.data_dir
+        if session_id is not None:
+            storage_path = self.settings.data_dir / "sessions" / session_id
+        with self._transcription_metrics_lock:
+            audio_ms = self._transcription_audio_ms
+            processing_seconds = self._transcription_processing_seconds
+        if counts is not None:
+            audio_ms = max(audio_ms, counts.transcribed_audio_ms)
+        realtime_factor = (
+            processing_seconds / (audio_ms / 1000)
+            if audio_ms > 0 and processing_seconds > 0
+            else None
+        )
+        correction_backlog = counts.correction_backlog if counts is not None else 0
+        if self.correction_queue is not None:
+            correction_backlog += self.correction_queue.qsize()
+        resources = self._resource_sampler.sample()
+        return RuntimeMetrics(
+            session_id=session_id,
+            duration_ms=duration_ms,
+            frame_count=counts.frame_count if counts is not None else 0,
+            storage_bytes=directory_size(storage_path),
+            free_bytes=disk_free_bytes(self.settings.data_dir),
+            transcribed_audio_ms=audio_ms,
+            transcription_realtime_factor=realtime_factor,
+            correction_backlog=correction_backlog,
+            pending_audio_chunks=(
+                counts.pending_audio_chunks if counts is not None else global_pending_audio
+            ),
+            failed_audio_chunks=(
+                counts.failed_audio_chunks if counts is not None else global_failed_audio
+            ),
+            retryable_model_tasks=self.database.retryable_model_task_count(),
+            cpu_percent=resources.cpu_percent,
+            memory_used_bytes=resources.memory_used_bytes,
+            memory_total_bytes=resources.memory_total_bytes,
+            gpu_utilization_percent=resources.gpu_utilization_percent,
+            gpu_memory_used_bytes=resources.gpu_memory_used_bytes,
+            gpu_memory_total_bytes=resources.gpu_memory_total_bytes,
+            sampled_at_utc=now_utc_iso(),
+        )
+
+    def recover_pending_audio(self, *, include_failed: bool = False) -> AudioRecoveryReport:
+        with self._lifecycle_lock:
+            if self.is_recording:
+                raise RuntimeError("Cannot recover audio while a session is recording")
+            if self.transcriber is not None and self.transcriber.is_alive():
+                raise RuntimeError("Audio recovery is already running")
+            self.database.reconcile_transcribed_audio_chunks()
+            records = self.database.pending_audio_chunks(include_failed=include_failed)
+            if not records:
+                return AudioRecoveryReport(queued_chunks=0, missing_chunks=0)
+            recovery_queue: queue.Queue[AudioChunk | None] = queue.Queue(
+                maxsize=max(16, len(records) + 1)
+            )
+            missing = 0
+            queued_chunks = 0
+            for record in records:
+                if not record.path.is_file():
+                    self.database.set_chunk_state(
+                        record.id, "failed", "音频文件不存在，无法恢复待转写任务"
+                    )
+                    missing += 1
+                    continue
+                recovery_queue.put(
+                    AudioChunk(
+                        id=record.id,
+                        session_id=record.session_id,
+                        source=record.source,
+                        start_ms=record.start_ms,
+                        end_ms=record.end_ms,
+                        path=record.path,
+                    )
+                )
+                queued_chunks += 1
+            if recovery_queue.empty():
+                return AudioRecoveryReport(queued_chunks=0, missing_chunks=missing)
+            if any(
+                self.database.transcript_correction_settings(record.session_id).enabled
+                for record in records
+                if record.path.is_file()
+            ):
+                self._start_correction_worker()
+            recovery_queue.put(None)
+            self.chunk_queue = recovery_queue
+            self.transcriber = TranscriptionWorker(
+                database=self.database,
+                chunk_queue=recovery_queue,
+                settings=self.actual_whisper_settings,
+                model_dir=self.settings.model_dir,
+                on_segment=self.on_segment,
+                on_persisted_segment=self._enqueue_correction,
+                on_recognition_started=(
+                    (lambda start, end, source: self.on_segment(start, end, source, ""))
+                    if self.on_segment
+                    else None
+                ),
+                on_metrics=self._record_transcription_metrics,
+                on_error=self.on_error,
+            )
+            self.transcriber.start()
+            return AudioRecoveryReport(queued_chunks=queued_chunks, missing_chunks=missing)
+
+    def retry_failed_audio(self) -> AudioRecoveryReport:
+        with self._lifecycle_lock:
+            if self.is_recording:
+                raise RuntimeError("Cannot retry audio while a session is recording")
+            if self.transcriber is not None and self.transcriber.is_alive():
+                raise RuntimeError("Audio recovery is already running")
+            self.database.retry_failed_audio_chunks()
+            return self.recover_pending_audio()
+
     def whisper_model_in_use(self, repository_id: str) -> bool:
         active_repository = canonical_whisper_repository_id(self.actual_whisper_settings.model)
         if repository_id != active_repository:
@@ -369,6 +548,9 @@ class SessionManager:
         self._pause_event_id = None
         self._failed_sources.clear()
         self._source_event_keys.clear()
+        with self._transcription_metrics_lock:
+            self._transcription_audio_ms = 0
+            self._transcription_processing_seconds = 0.0
         resolved_whisper = resolve_whisper_settings(
             self.whisper_settings, self.whisper_capabilities
         )
@@ -439,6 +621,7 @@ class SessionManager:
                 if self.on_segment
                 else None
             ),
+            on_metrics=self._record_transcription_metrics,
             on_error=self.on_error,
         )
         self.transcriber.start()
@@ -463,7 +646,8 @@ class SessionManager:
                         continue
                     self.correction_batcher.start(item)
                     session_id, window_start_ms = item
-                    window_ms = self.correction_window_seconds * 1000
+                    settings = self.database.transcript_correction_settings(session_id)
+                    window_ms = settings.window_ms
                     ready_at_ms = (
                         window_start_ms + window_ms + round(self.settings.audio_chunk_s * 1000)
                     )
@@ -494,7 +678,7 @@ class SessionManager:
         self.correction_worker.start()
 
     def _enqueue_correction(self, session_id: str, _segment_id: int, start_ms: int) -> None:
-        if not self.correction_enabled or self.correction_queue is None:
+        if self.correction_queue is None:
             return
         for item in self.correction_batcher.add_segment(session_id, start_ms):
             self.correction_queue.put(item)
@@ -502,7 +686,10 @@ class SessionManager:
     @storage_writer("测试模型连接")
     def test_provider(self) -> str:
         result = self._model_router().invoke(
-            RoleName.UTILITY, lambda model: model.test_connection(), session_id=self.session_id
+            RoleName.UTILITY,
+            lambda model: model.test_connection(),
+            session_id=self.session_id,
+            task_type="provider_test",
         )
         return result.value
 
@@ -761,6 +948,16 @@ class SessionManager:
             generate,
             session_id=target_session_id,
             evidence=evidence,
+            task_type="material",
+            task_payload_json=json.dumps(
+                {
+                    "session_id": target_session_id,
+                    "template_id": template_id,
+                    "evidence": persistence_items,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
         )
         result = routed.value
         if isinstance(result, MaterialModelResult):
@@ -773,6 +970,7 @@ class SessionManager:
             model_name = routed.invocation.model
         else:
             raise TypeError("Material model returned an unsupported result")
+        self.database.resolve_retryable_model_tasks("material", target_session_id)
         return self.database.record_material_version(
             target_session_id,
             kind="generated",

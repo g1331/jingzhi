@@ -9,6 +9,7 @@ from jingzhi.config import Settings
 from jingzhi.model_roles import ModelConnection, RoleName, default_roles
 from jingzhi.provider_settings import (
     KEYRING_SERVICE,
+    KEYRING_USERNAME,
     LEGACY_KEYRING_SERVICE,
     ProviderSettingsStore,
     SavedProviderSettings,
@@ -59,6 +60,46 @@ def test_provider_settings_fall_back_to_legacy_keyring_entry(tmp_path, monkeypat
     settings = ProviderSettingsStore(tmp_path).load()
 
     assert KEYRING_SERVICE != LEGACY_KEYRING_SERVICE
+    assert settings.connections[0].api_key == "legacy-key"
+
+
+def test_v2_default_connection_falls_back_to_legacy_keyring_entry(tmp_path, monkeypatch) -> None:
+    (tmp_path / "provider.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "connections": [
+                    {
+                        "id": "default",
+                        "name": "默认连接",
+                        "base_url": "https://provider.example/v1",
+                        "api_mode": "responses",
+                    }
+                ],
+                "roles": [
+                    {
+                        "name": role.name.value,
+                        "connection_id": "default",
+                        "model": role.model,
+                        "reasoning": role.reasoning.value,
+                        "fallbacks": [],
+                    }
+                    for role in default_roles()
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        keyring,
+        "get_password",
+        lambda service, username: (
+            "legacy-key" if service == KEYRING_SERVICE and username == KEYRING_USERNAME else None
+        ),
+    )
+
+    settings = ProviderSettingsStore(tmp_path).load()
+
     assert settings.connections[0].api_key == "legacy-key"
 
 
