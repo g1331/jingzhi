@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ from PIL.ImageQt import ImageQt
 from PySide6.QtCore import (
     QEasingCurve,
     QObject,
+    QPoint,
     QPropertyAnimation,
     QSize,
     Qt,
@@ -339,6 +341,13 @@ QLabel#transcriptChip { background: #182221; border: 1px solid #33413e; padding:
 QLabel#eventChip { color: #a7b5b0; background: #171f20; padding: 7px; }
 QFrame#recordingCapsule {
     background: #111817; border: 1px solid #604927; border-radius: 9px;
+}
+QLabel#capsuleDragHandle {
+    color: #9ee7ca; font-weight: 700; padding: 0 2px;
+}
+QLabel#capsuleDragHandle:hover { color: #dff5e9; }
+QPushButton#capsuleHideButton {
+    min-width: 26px; max-width: 26px; min-height: 27px; padding: 0;
 }
 QLabel#evidenceImage { background: #edeae1; border: 1px solid #374442; }
 QLabel#evidenceMetadata { color: #92a29c; font-size: 11px; }
@@ -1078,6 +1087,74 @@ class CrossSessionSynthesisDialog(QDialog):
             self.navigate_callback(candidate)
 
 
+class RecordingCapsulePositionStore:
+    VERSION = 1
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "recording-capsule.json"
+
+    def load(self) -> tuple[int, int] | None:
+        try:
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return None
+        if not isinstance(document, dict) or document.get("version") != self.VERSION:
+            return None
+        x = document.get("x")
+        y = document.get("y")
+        if type(x) is not int or type(y) is not int:
+            return None
+        return x, y
+
+    def save(self, position: QPoint) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"version": self.VERSION, "x": position.x(), "y": position.y()},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+
+
+class CapsuleDragHandle(QLabel):
+    drag_finished = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__("境织", parent)
+        self.setObjectName("capsuleDragHandle")
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("拖动以移动录制胶囊")
+        self._drag_offset: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        window = self.window()
+        self._drag_offset = event.globalPosition().toPoint() - window.frameGeometry().topLeft()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._drag_offset is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_offset is not None:
+            self._drag_offset = None
+            self.drag_finished.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class RecordingCapsule(QFrame):
     def __init__(
         self,
@@ -1085,13 +1162,34 @@ class RecordingCapsule(QFrame):
         default_system_audio_enabled: bool,
         default_microphone_enabled: bool,
         pause_enabled: bool,
+        floating: bool = False,
+        position_store: RecordingCapsulePositionStore | None = None,
+        parent: QWidget | None = None,
         object_name: str = "recordingCapsule",
     ) -> None:
-        super().__init__()
+        super().__init__(parent)
+        self._floating = floating
+        self._position_store = position_store
+        self._position_restored = False
+        self._allow_close = False
         self.setObjectName(object_name)
+        self.setProperty("floating", floating)
+        if self._floating:
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setWindowTitle("境织 · 录制胶囊")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 8, 6)
         layout.setSpacing(7)
+        self.drag_handle: CapsuleDragHandle | None = None
+        self.hide_button: QPushButton | None = None
+        if self._floating:
+            self.drag_handle = CapsuleDragHandle(self)
+            layout.addWidget(self.drag_handle)
         self.status = QLabel("空闲")
         self.status.setObjectName("statusPill")
         self.status.setProperty("state", "idle")
@@ -1112,6 +1210,13 @@ class RecordingCapsule(QFrame):
         self.stop_button = QPushButton("结束")
         self.stop_button.setProperty("role", "danger")
         self.stop_button.setEnabled(False)
+        if self._floating:
+            self.hide_button = QPushButton("×")
+            self.hide_button.setObjectName("capsuleHideButton")
+            self.hide_button.setProperty("role", "quiet")
+            self.hide_button.setToolTip("隐藏胶囊，不会结束当前会话")
+            self.hide_button.setVisible(False)
+            self.hide_button.clicked.connect(self._hide)
         for widget in (
             self.status,
             self.title_input,
@@ -1123,6 +1228,73 @@ class RecordingCapsule(QFrame):
             self.stop_button,
         ):
             layout.addWidget(widget)
+        if self.hide_button is not None:
+            layout.addWidget(self.hide_button)
+            self.drag_handle.drag_finished.connect(self._save_position)
+
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        if not self._floating or self._position_restored:
+            return
+        self.adjustSize()
+        saved = self._position_store.load() if self._position_store is not None else None
+        if saved is None:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                self.move(
+                    available.left() + max(0, (available.width() - self.width()) // 2),
+                    available.top() + 18,
+                )
+        else:
+            self.move(self._clamp_position(QPoint(*saved)))
+        self._position_restored = True
+
+    def _clamp_position(self, position: QPoint) -> QPoint:
+        available = None
+        for screen in QApplication.screens():
+            geometry = screen.availableGeometry()
+            if geometry.contains(position):
+                available = geometry
+                break
+        if available is None:
+            screen = QApplication.primaryScreen()
+            available = screen.availableGeometry() if screen is not None else None
+        if available is None:
+            return position
+        maximum_x = max(available.left(), available.right() - self.width() + 1)
+        maximum_y = max(available.top(), available.bottom() - self.height() + 1)
+        return QPoint(
+            min(max(position.x(), available.left()), maximum_x),
+            min(max(position.y(), available.top()), maximum_y),
+        )
+
+    def _hide(self) -> None:
+        self._save_position()
+        self.hide()
+
+    def _save_position(self) -> None:
+        if not self._floating or self._position_store is None:
+            return
+        try:
+            self._position_store.save(self.pos())
+        except OSError:
+            logger.warning("Could not save recording capsule position", exc_info=True)
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._floating and not self._allow_close:
+            self._save_position()
+            self.hide()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        if not self._floating:
+            return
+        self._allow_close = True
+        self._save_position()
+        self.close()
 
 
 class OnboardingDialog(QDialog):
@@ -1885,6 +2057,8 @@ class MainWindow(QMainWindow):
             self.manager.on_source_event = self.bridge.source_event.emit
         self.settings = settings
         self._onboarding_store = OnboardingSettingsStore(settings.data_dir)
+        self._capsule_position_store = RecordingCapsulePositionStore(settings.data_dir)
+        self._capsule_shown_once = False
         self._onboarding_dialog: OnboardingDialog | None = None
         self._selected_session_id: str | None = None
         self._reanswer_question_id: int | None = None
@@ -1946,20 +2120,34 @@ class MainWindow(QMainWindow):
         if show_onboarding:
             QTimer.singleShot(0, self._maybe_show_onboarding)
 
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        if not self._capsule_shown_once:
+            self._capsule_shown_once = True
+            self._show_recording_capsule()
+
+    def _show_recording_capsule(self) -> None:
+        if not self.capsule.isVisible():
+            self.capsule.show()
+        self.capsule.raise_()
+        if self.capsule_hide_button is not None:
+            self.capsule_hide_button.setVisible(bool(getattr(self.service, "is_recording", False)))
+
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        capsule_row = QHBoxLayout()
-        capsule_row.setContentsMargins(220, 8, 280, 6)
-        capsule_row.addStretch(1)
         capsule = RecordingCapsule(
             default_system_audio_enabled=self.settings.capture_system_audio,
             default_microphone_enabled=self.settings.capture_microphone,
             pause_enabled=callable(getattr(self.manager, "pause", None)),
+            floating=True,
+            position_store=self._capsule_position_store,
         )
+        capsule.setStyleSheet(APP_STYLE)
+        self.capsule = capsule
         self.status = capsule.status
         self.title_input = capsule.title_input
         self.system_audio_check = capsule.system_audio_check
@@ -1968,9 +2156,7 @@ class MainWindow(QMainWindow):
         self.capsule_ask_button = capsule.capsule_ask_button
         self.start_button = capsule.start_button
         self.stop_button = capsule.stop_button
-        capsule_row.addWidget(capsule)
-        capsule_row.addStretch(1)
-        layout.addLayout(capsule_row)
+        self.capsule_hide_button = capsule.hide_button
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -3193,6 +3379,8 @@ class MainWindow(QMainWindow):
         self.notice.show()
 
     def _refresh_recording_status(self) -> None:
+        if self.capsule_hide_button is not None:
+            self.capsule_hide_button.setVisible(bool(getattr(self.service, "is_recording", False)))
         if not getattr(self.service, "is_recording", False):
             if self._archive_active() or self._stop_in_flight:
                 self.start_button.setEnabled(False)
@@ -4212,6 +4400,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - UI boundary must surface worker failures
             self._show_action_error(str(exc))
             return False
+        self._show_recording_capsule()
         self.system_audio_check.setChecked(selection.system_audio_id is not None)
         self.microphone_check.setChecked(selection.microphone_id is not None)
         self._runtime_metrics_generation += 1
@@ -4315,6 +4504,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _focus_question(self) -> None:
+        if self.service.is_recording and not self.capsule.isVisible():
+            self._show_recording_capsule()
         self.activateWindow()
         self.raise_()
         if self.question.hasFocus():
@@ -5037,6 +5228,10 @@ class MainWindow(QMainWindow):
             self._show_action_error("存储迁移正在进行，请等待完成后再退出境织。")
             event.ignore()
             return
+        if self.service.is_recording:
+            self._show_recording_capsule()
+            event.ignore()
+            return
         if self._question_active:
             self.service.cancel_question()
         configure_provider = getattr(self.manager, "configure_provider", None)
@@ -5053,8 +5248,7 @@ class MainWindow(QMainWindow):
                 save_whisper()
             except Exception:
                 logger.exception("Could not save Whisper settings while closing")
-        if self.service.is_recording:
-            self.service.stop_session()
+        self.capsule.shutdown()
         event.accept()
 
 
