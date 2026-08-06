@@ -1500,3 +1500,24 @@ def test_interrupted_session_timeline_retains_status(tmp_path) -> None:
 
     assert "已中断" in window.workspace_meta.text()
     window.close()
+
+
+def test_main_window_reports_audio_recovery_and_retryable_tasks(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    database = Database(tmp_path / "jingzhi.sqlite3")
+    session_id = database.create_session("失败音频", "2026-01-01T00:00:00+00:00")
+    audio = tmp_path / "failed.wav"
+    audio.write_bytes(b"audio")
+    chunk_id = database.add_audio_chunk(session_id, "microphone", 0, 2_000, audio)
+    database.set_chunk_state(chunk_id, "failed", "temporary")
+    window = MainWindow(Settings(data_dir=tmp_path))
+    window.show()
+    application.processEvents()
+
+    window._audio_recovery_finished(SimpleNamespace(queued_chunks=2, missing_chunks=1))
+
+    assert "已恢复 2 个待转写音频片段" in window.notice_text.text()
+    assert "音频文件缺失" in window.notice_text.text()
+    assert window.retry_audio_button.isVisible()
+    window.close()
+    application.processEvents()

@@ -242,6 +242,7 @@ def test_router_executes_authorized_fallbacks_and_records_actual_source(tmp_path
     assert records[-1].role == "instant_answer"
     assert records[-1].reasoning_level == "balanced"
     assert records[-1].evidence_ids == ("transcript:7:v2",)
+    assert database.retryable_model_task_count() == 0
 
 
 def test_router_does_not_use_unauthorized_cross_connection_fallback(tmp_path) -> None:

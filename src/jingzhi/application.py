@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +35,7 @@ from jingzhi.database import (
     TranscriptCorrectionSettingsRecord,
     TranscriptVersionRecord,
 )
+from jingzhi.diagnostics import AudioRecoveryReport, RuntimeMetrics
 from jingzhi.materials import MaterialGenerationPreview
 from jingzhi.model_roles import RoleName
 from jingzhi.model_routing import InvocationEvidence, ModelRouter, invocation_connection_json
@@ -41,6 +44,8 @@ from jingzhi.transcript_correction import (
     TranscriptCorrectionModel,
     TranscriptCorrectionProcessor,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class QuestionAnsweringService:
@@ -147,6 +152,12 @@ class QuestionAnsweringService:
                 lambda model: model.answer(question, context),
                 session_id=anchor.session_id,
                 evidence=invocation_evidence,
+                task_type="answer",
+                task_payload_json=json.dumps(
+                    {"question_id": question_id, "evidence": evidence},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             )
         except Exception as exc:
             invocation = getattr(exc, "last_invocation", None)
@@ -162,9 +173,16 @@ class QuestionAnsweringService:
                 error=str(exc),
                 evidence_state="exact",
                 evidence=evidence,
+                model_invocation_id=invocation.id,
             )
             raise
         result = routed.value
+        self.database.resolve_retryable_model_tasks(
+            "answer",
+            anchor.session_id,
+            payload_key="question_id",
+            payload_value=question_id,
+        )
         return self.database.record_answer_version(
             question_id,
             model=result.model or routed.invocation.model,
@@ -175,6 +193,7 @@ class QuestionAnsweringService:
             error=None,
             evidence_state="exact",
             evidence=evidence,
+            model_invocation_id=routed.invocation.id,
         )
 
 
@@ -273,6 +292,36 @@ class SessionNotification:
 class JingzhiApplicationService:
     """Application boundary used by the Qt UI and hardware-free use-case tests."""
 
+    def runtime_metrics(self) -> RuntimeMetrics:
+        method = getattr(self.recorder, "runtime_metrics", None)
+        if method is None:
+            raise RuntimeError("Runtime metrics are unavailable for this recorder")
+        return method()
+
+    def recover_pending_audio(self, *, include_failed: bool = False) -> AudioRecoveryReport:
+        method = getattr(self.recorder, "recover_pending_audio", None)
+        if method is None:
+            raise RuntimeError("Pending audio recovery is unavailable for this recorder")
+        return method(include_failed=include_failed)
+
+    def retry_failed_audio(self) -> AudioRecoveryReport:
+        method = getattr(self.recorder, "retry_failed_audio", None)
+        if method is None:
+            raise RuntimeError("Failed audio retry is unavailable for this recorder")
+        return method()
+
+    def failed_correction_run_count(self) -> int:
+        method = getattr(self.recorder, "database", None)
+        if method is None:
+            return 0
+        return int(method.failed_correction_run_count())
+
+    def retry_failed_correction_runs(self) -> int:
+        method = getattr(self.recorder, "retry_failed_correction_runs", None)
+        if method is None:
+            raise RuntimeError("Failed correction retry is unavailable for this recorder")
+        return int(method())
+
     def __init__(
         self,
         database: Database,
@@ -283,12 +332,177 @@ class JingzhiApplicationService:
     ) -> None:
         self.database = database
         self.recorder = recorder
+        self.database.reclaim_orphan_cross_session_retry_claims()
         self.archive = ArchiveManager(database, source_busy_reason=self.archive_storage_busy_reason)
         self._now = now or (lambda: datetime.now(UTC))
         self.correction_model = correction_model
         active_session_id = getattr(recorder, "session_id", None) if recorder.is_recording else None
-        self.database.interrupt_recording_sessions(
-            self._now_utc().isoformat(), exclude_session_id=active_session_id
+        restart_at = self._now_utc().isoformat()
+        self.database.interrupt_recording_sessions(restart_at, exclude_session_id=active_session_id)
+        interrupted_models = self.database.running_model_invocations()
+        self.database.recover_running_model_invocations(restart_at)
+        start_recovered_correction_tasks = getattr(
+            recorder, "start_recovered_correction_tasks", None
+        )
+        if callable(start_recovered_correction_tasks):
+            start_recovered_correction_tasks()
+        self._materialize_interrupted_model_tasks(interrupted_models)
+
+    def _materialize_interrupted_model_tasks(self, invocations) -> None:  # type: ignore[no-untyped-def]
+        for invocation in invocations:
+            if not invocation.task_type or not invocation.task_payload_json:
+                continue
+            try:
+                payload = json.loads(invocation.task_payload_json)
+                if invocation.task_type == "answer":
+                    self._materialize_interrupted_answer(invocation, payload)
+                elif invocation.task_type == "material":
+                    self._materialize_interrupted_material(invocation, payload)
+                elif invocation.task_type == "cross_session":
+                    self._materialize_interrupted_cross_session(invocation, payload)
+            except Exception:
+                logger.exception("Could not materialize interrupted model task %s", invocation.id)
+
+    def _materialize_interrupted_answer(self, invocation, payload) -> None:  # type: ignore[no-untyped-def]
+        question_id = int(payload["question_id"])
+        question = self.database.question(question_id)
+        if question is None:
+            return
+        if any(
+            version.model_invocation_id == invocation.id
+            for version in self.database.answer_versions(question_id)
+        ):
+            return
+        raw_evidence = payload.get("evidence")
+        evidence = (
+            [dict(item) for item in raw_evidence if isinstance(item, dict)]
+            if isinstance(raw_evidence, list)
+            else []
+        )
+        if (
+            not evidence
+            and question.context_start_ms is not None
+            and question.context_end_ms is not None
+        ):
+            try:
+                evidence = (
+                    ContextAssembler(self.database)
+                    .for_anchor(
+                        question.session_id, question.context_start_ms, question.context_end_ms
+                    )
+                    .persistence_items()
+                )
+            except Exception:
+                logger.debug("Could not restore answer evidence for %s", question_id, exc_info=True)
+        self.database.record_answer_version(
+            question_id,
+            model=invocation.model,
+            connection_json=invocation_connection_json(invocation),
+            request_status="failed",
+            request_id=invocation.request_id,
+            answer=None,
+            error=invocation.error or "应用异常退出，回答任务可重试",
+            evidence_state="exact" if evidence else "unavailable",
+            evidence=evidence,
+            model_invocation_id=invocation.id,
+        )
+
+    def _materialize_interrupted_material(self, invocation, payload) -> None:  # type: ignore[no-untyped-def]
+        session_id = str(payload["session_id"])
+        if self.database.session(session_id) is None:
+            return
+        if any(
+            version.model_invocation_id == invocation.id
+            for version in self.database.session_material_versions(session_id)
+        ):
+            return
+        template_id = payload.get("template_id")
+        raw_evidence = payload.get("evidence")
+        evidence = (
+            [dict(item) for item in raw_evidence if isinstance(item, dict)]
+            if isinstance(raw_evidence, list)
+            else []
+        )
+        if not evidence:
+            try:
+                evidence = (
+                    ContextAssembler(self.database).for_material(session_id).persistence_items()
+                )
+            except Exception:
+                logger.debug(
+                    "Could not restore material evidence for %s", session_id, exc_info=True
+                )
+        self.database.record_material_version(
+            session_id,
+            kind="generated",
+            content="模型任务在应用异常退出前未完成，可从材料入口重试。",
+            template_id=str(template_id) if template_id is not None else None,
+            model=invocation.model,
+            connection_json=invocation_connection_json(invocation),
+            model_invocation_id=invocation.id,
+            request_status="failed",
+            request_id=invocation.request_id,
+            error=invocation.error or "应用异常退出，材料任务可重试",
+            evidence_state="exact" if evidence else "unavailable",
+            evidence=evidence,
+        )
+
+    def _materialize_interrupted_cross_session(self, invocation, payload) -> None:  # type: ignore[no-untyped-def]
+        question = str(payload["question"]).strip()
+        stable_ids = tuple(str(item) for item in payload["stable_ids"])
+        if self.database.cross_session_synthesis_for_invocation(invocation.id) is not None:
+            return
+        raw_evidence = payload.get("evidence")
+        if isinstance(raw_evidence, list):
+            evidence = tuple(
+                CrossSessionEvidenceRecord(
+                    stable_id=str(item["stable_id"]),
+                    session_id=str(item["session_id"]),
+                    session_title=str(item["session_title"]),
+                    kind=str(item["kind"]),
+                    source=str(item["source"]),
+                    start_ms=int(item["start_ms"]),
+                    end_ms=int(item["end_ms"]),
+                    content_text=(
+                        str(item["content_text"]) if item.get("content_text") is not None else None
+                    ),
+                    resource_path=(
+                        Path(str(item["resource_path"])) if item.get("resource_path") else None
+                    ),
+                    transcript_version_id=(
+                        int(item["transcript_version_id"])
+                        if item.get("transcript_version_id") is not None
+                        else None
+                    ),
+                    frame_id=(int(item["frame_id"]) if item.get("frame_id") is not None else None),
+                    answer_version_id=(
+                        int(item["answer_version_id"])
+                        if item.get("answer_version_id") is not None
+                        else None
+                    ),
+                    material_version_id=(
+                        int(item["material_version_id"])
+                        if item.get("material_version_id") is not None
+                        else None
+                    ),
+                )
+                for item in raw_evidence
+                if isinstance(item, dict)
+            )
+        else:
+            evidence = tuple(self.database.cross_session_evidence_candidates(stable_ids))
+        self.database.record_cross_session_synthesis(
+            question=question,
+            answer=None,
+            model=invocation.model,
+            connection_json=invocation_connection_json(invocation),
+            model_invocation_id=invocation.id,
+            request_status="failed",
+            request_id=invocation.request_id,
+            error=invocation.error or "应用异常退出，跨会话综合任务可重试",
+            evidence_state="exact" if evidence else "unavailable",
+            evidence=tuple(evidence),
+            retry_of_id=(int(payload["retry_of_id"]) if payload.get("retry_of_id") else None),
         )
 
     @property

@@ -67,6 +67,11 @@ class CorrectionWindowBatcher:
             self._pending.add(window)
         return (window,)
 
+    def register(self, window: tuple[str, int]) -> None:
+        with self._lock:
+            self._pending.add(window)
+            self._dirty.discard(window)
+
     def start(self, window: tuple[str, int]) -> None:
         with self._lock:
             if window not in self._pending:

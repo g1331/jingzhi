@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from threading import Lock
 
 from jingzhi.context import ContextAssembler
 from jingzhi.database import (
@@ -41,6 +43,8 @@ class CrossSessionSynthesisPreview:
 
 
 class CrossSessionSynthesisService:
+    _retry_lock = Lock()
+
     def __init__(self, database: Database, router: ModelRouter) -> None:
         self.database = database
         self.router = router
@@ -168,13 +172,27 @@ class CrossSessionSynthesisService:
         return estimate
 
     def retry(self, synthesis_id: int) -> CrossSessionSynthesisRecord:
-        failed = self.database.cross_session_synthesis(synthesis_id)
-        if failed is None or failed.request_status != "failed":
-            raise LookupError("找不到可重试的跨会话综合")
-        stable_ids = tuple(
-            item.stable_id for item in self.database.cross_session_synthesis_evidence(synthesis_id)
-        )
-        return self.synthesize(failed.question, stable_ids, retry_of_id=synthesis_id)
+        with self._retry_lock:
+            failed = self.database.cross_session_synthesis(synthesis_id)
+            if failed is None or failed.request_status != "failed":
+                raise LookupError("找不到可重试的跨会话综合")
+            if self.database.cross_session_successor_exists(synthesis_id):
+                raise LookupError("该跨会话综合已经重试")
+            if not self.database.claim_cross_session_retry(synthesis_id):
+                raise LookupError("该跨会话综合已经重试")
+            if failed.model_invocation_id is not None:
+                self.database.resolve_model_fallbacks([failed.model_invocation_id])
+            stable_ids = tuple(
+                item.stable_id
+                for item in self.database.cross_session_synthesis_evidence(synthesis_id)
+            )
+            try:
+                return self.synthesize(failed.question, stable_ids, retry_of_id=synthesis_id)
+            except CrossSessionSynthesisError:
+                raise
+            except Exception:
+                self.database.release_cross_session_retry_claim(synthesis_id)
+                raise
 
     def synthesize(
         self,
@@ -210,6 +228,36 @@ class CrossSessionSynthesisService:
                 lambda model: model.synthesize(question.strip(), context),
                 session_id=None,
                 evidence=evidence,
+                task_type="cross_session",
+                task_payload_json=json.dumps(
+                    {
+                        "question": question.strip(),
+                        "stable_ids": list(preview.stable_ids),
+                        "evidence": [
+                            {
+                                "stable_id": item.stable_id,
+                                "session_id": item.session_id,
+                                "session_title": item.session_title,
+                                "kind": item.kind,
+                                "source": item.source,
+                                "start_ms": item.start_ms,
+                                "end_ms": item.end_ms,
+                                "content_text": item.content_text,
+                                "resource_path": (
+                                    str(item.resource_path) if item.resource_path else None
+                                ),
+                                "transcript_version_id": item.transcript_version_id,
+                                "frame_id": item.frame_id,
+                                "answer_version_id": item.answer_version_id,
+                                "material_version_id": item.material_version_id,
+                            }
+                            for item in selected
+                        ],
+                        "retry_of_id": retry_of_id,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             )
         except Exception as exc:
             invocation = getattr(exc, "last_invocation", None)
@@ -268,6 +316,10 @@ class CrossSessionSynthesisService:
                 retry_of_id=retry_of_id,
             )
             raise CrossSessionSynthesisError("综合模型没有返回内容", failed.id)
+        if retry_of_id is not None:
+            failed = self.database.cross_session_synthesis(retry_of_id)
+            if failed is not None and failed.model_invocation_id is not None:
+                self.database.resolve_model_fallbacks([failed.model_invocation_id])
         return self.database.record_cross_session_synthesis(
             question=question.strip(),
             answer=answer,

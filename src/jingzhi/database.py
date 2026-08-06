@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -226,6 +227,7 @@ CREATE TABLE IF NOT EXISTS answer_versions (
     model TEXT,
     connection_json TEXT,
     request_status TEXT NOT NULL CHECK (request_status IN ('succeeded', 'failed')),
+    model_invocation_id INTEGER REFERENCES model_invocations(id),
     upstream_request_id TEXT,
     answer TEXT,
     error TEXT,
@@ -266,6 +268,9 @@ CREATE TABLE IF NOT EXISTS model_invocations (
     reasoning_level TEXT NOT NULL CHECK (reasoning_level IN ('fast', 'balanced', 'deep')),
     fallback_reason TEXT,
     status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    retryable INTEGER NOT NULL DEFAULT 1,
+    task_type TEXT,
+    task_payload_json TEXT,
     upstream_request_id TEXT,
     error TEXT,
     started_at_utc TEXT NOT NULL,
@@ -357,6 +362,11 @@ CREATE TABLE IF NOT EXISTS cross_session_syntheses (
 CREATE INDEX IF NOT EXISTS cross_session_synthesis_history
 ON cross_session_syntheses(created_at_utc, id);
 
+CREATE TABLE IF NOT EXISTS cross_session_retry_claims (
+    synthesis_id INTEGER PRIMARY KEY REFERENCES cross_session_syntheses(id) ON DELETE CASCADE,
+    claimed_at_utc TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cross_session_synthesis_evidence (
     synthesis_id INTEGER NOT NULL REFERENCES cross_session_syntheses(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
@@ -394,7 +404,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 17
 
 CROSS_SESSION_FTS_CONTENT_QUERY = """
 SELECT 'transcript-version:' || version.id, segment.session_id, 'transcript',
@@ -546,6 +556,26 @@ class SessionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionRuntimeCounts:
+    frame_count: int
+    transcribed_audio_ms: int
+    transcript_count: int
+    correction_backlog: int
+    pending_audio_chunks: int
+    failed_audio_chunks: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAudioChunk:
+    id: int
+    session_id: str
+    source: str
+    start_ms: int
+    end_ms: int
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class PendingMediaDeletion:
     session_id: str
     title: str
@@ -627,6 +657,7 @@ class AnswerVersionRecord:
     error: str | None
     evidence_state: str
     created_at_utc: str
+    model_invocation_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,6 +797,8 @@ class ModelInvocationRecord:
     started_at_utc: str
     completed_at_utc: str | None
     evidence_ids: tuple[str, ...]
+    task_type: str | None = None
+    task_payload_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -907,6 +940,42 @@ class Database:
             )
         if previous_version < 14:
             self._migrate_cross_session_evidence_snapshots(connection)
+        if previous_version < 16:
+            model_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(model_invocations)").fetchall()
+            }
+            if "retryable" not in model_columns:
+                connection.execute(
+                    "ALTER TABLE model_invocations ADD COLUMN retryable INTEGER NOT NULL DEFAULT 1"
+                )
+            model_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(model_invocations)").fetchall()
+            }
+            for name in ("task_type", "task_payload_json"):
+                if name not in model_columns:
+                    connection.execute(f"ALTER TABLE model_invocations ADD COLUMN {name} TEXT")
+            connection.execute(
+                "UPDATE model_invocations SET retryable = 0 WHERE status = 'succeeded'"
+            )
+        if previous_version < 17:
+            answer_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(answer_versions)").fetchall()
+            }
+            if "model_invocation_id" not in answer_columns:
+                connection.execute(
+                    "ALTER TABLE answer_versions ADD COLUMN model_invocation_id INTEGER "
+                    "REFERENCES model_invocations(id)"
+                )
+            model_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(model_invocations)").fetchall()
+            }
+            for name in ("task_type", "task_payload_json"):
+                if name not in model_columns:
+                    connection.execute(f"ALTER TABLE model_invocations ADD COLUMN {name} TEXT")
         if previous_version < 15:
             synthesis_columns = {
                 row["name"]
@@ -2099,6 +2168,42 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    def persist_transcript_segments(
+        self,
+        session_id: str,
+        chunk_id: int,
+        source: str,
+        records: list[tuple[int, int, str, str | None, float | None]],
+    ) -> list[int]:
+        with self.connect() as connection:
+            segment_ids: list[int] = []
+            for start_ms, end_ms, text, language, confidence in records:
+                cursor = connection.execute(
+                    """INSERT INTO transcript_segments(
+                           session_id, audio_chunk_id, source, start_ms, end_ms,
+                           text, language, confidence
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, chunk_id, source, start_ms, end_ms, text, language, confidence),
+                )
+                segment_id = int(cursor.lastrowid)
+                segment_ids.append(segment_id)
+                connection.execute(
+                    """INSERT INTO transcript_versions(
+                           segment_id, kind, text, created_at_utc, active
+                       ) VALUES (?, 'original', ?, ?, 1)""",
+                    (segment_id, text, datetime.now(UTC).isoformat()),
+                )
+                connection.execute(
+                    "INSERT INTO transcript_fts(segment_id, session_id, text) VALUES (?, ?, ?)",
+                    (segment_id, session_id, text),
+                )
+                self._reindex_transcript_segment(connection, segment_id)
+            connection.execute(
+                "UPDATE audio_chunks SET state = 'transcribed', error = NULL WHERE id = ?",
+                (chunk_id,),
+            )
+            return segment_ids
+
     def add_transcript(
         self,
         session_id: str,
@@ -2133,11 +2238,227 @@ class Database:
             return segment_id
 
     def set_chunk_state(self, chunk_id: int, state: str, error: str | None = None) -> None:
+        if state not in {"pending", "transcribed", "failed"}:
+            raise ValueError(f"Unsupported audio chunk state: {state}")
         with self.connect() as connection:
             connection.execute(
                 "UPDATE audio_chunks SET state = ?, error = ? WHERE id = ?",
                 (state, error, chunk_id),
             )
+
+    def audio_chunk_state(self, chunk_id: int) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM audio_chunks WHERE id = ?", (chunk_id,)
+            ).fetchone()
+        return str(row["state"]) if row is not None else None
+
+    def reconcile_transcribed_audio_chunks(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE audio_chunks
+                   SET state = 'transcribed', error = NULL
+                   WHERE state = 'pending'
+                     AND EXISTS (
+                         SELECT 1 FROM transcript_segments
+                         WHERE transcript_segments.audio_chunk_id = audio_chunks.id
+                     )"""
+            )
+        return int(cursor.rowcount)
+
+    def pending_audio_chunks(
+        self, *, include_failed: bool = False
+    ) -> tuple[PendingAudioChunk, ...]:
+        states = ("pending", "failed") if include_failed else ("pending",)
+        placeholders = ", ".join("?" for _ in states)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT chunks.id, chunks.session_id, chunks.source,
+                              chunks.start_ms, chunks.end_ms, chunks.path
+                       FROM audio_chunks AS chunks
+                       JOIN sessions ON sessions.id = chunks.session_id
+                       WHERE chunks.state IN ({placeholders})
+                         AND sessions.trashed_at_utc IS NULL
+                       ORDER BY chunks.session_id, chunks.start_ms, chunks.id""",
+                states,
+            ).fetchall()
+        return tuple(
+            PendingAudioChunk(
+                id=int(row["id"]),
+                session_id=str(row["session_id"]),
+                source=str(row["source"]),
+                start_ms=int(row["start_ms"]),
+                end_ms=int(row["end_ms"]),
+                path=Path(row["path"]),
+            )
+            for row in rows
+        )
+
+    def retry_failed_audio_chunks(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE audio_chunks SET state = 'pending', error = NULL
+                   WHERE state = 'failed'
+                     AND session_id IN (
+                         SELECT id FROM sessions WHERE trashed_at_utc IS NULL
+                     )"""
+            )
+        return int(cursor.rowcount)
+
+    def recovery_audio_counts(self) -> tuple[int, int]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM audio_chunks AS chunk
+                          JOIN sessions AS session ON session.id = chunk.session_id
+                         WHERE session.trashed_at_utc IS NULL AND chunk.state = 'pending')
+                           AS pending_count,
+                       (SELECT COUNT(*) FROM audio_chunks AS chunk
+                          JOIN sessions AS session ON session.id = chunk.session_id
+                         WHERE session.trashed_at_utc IS NULL AND chunk.state = 'failed')
+                           AS failed_count"""
+            ).fetchone()
+        assert row is not None
+        return int(row["pending_count"]), int(row["failed_count"])
+
+    def session_runtime_counts(self, session_id: str) -> SessionRuntimeCounts:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM frames WHERE session_id = ?) AS frame_count,
+                       (SELECT COALESCE(SUM(end_ms - start_ms), 0)
+                          FROM audio_chunks
+                         WHERE session_id = ? AND state = 'transcribed')
+                           AS transcribed_audio_ms,
+                       (SELECT COUNT(*) FROM transcript_segments WHERE session_id = ?)
+                           AS transcript_count,
+                       (SELECT COUNT(*) FROM transcript_correction_runs
+                         WHERE session_id = ? AND state = 'running')
+                           AS correction_backlog,
+                       (SELECT COUNT(*) FROM audio_chunks
+                         WHERE session_id = ? AND state = 'pending')
+                           AS pending_audio_chunks,
+                       (SELECT COUNT(*) FROM audio_chunks
+                         WHERE session_id = ? AND state = 'failed')
+                           AS failed_audio_chunks""",
+                (session_id,) * 6,
+            ).fetchone()
+        assert row is not None
+        return SessionRuntimeCounts(
+            frame_count=int(row["frame_count"]),
+            transcribed_audio_ms=int(row["transcribed_audio_ms"]),
+            transcript_count=int(row["transcript_count"]),
+            correction_backlog=int(row["correction_backlog"]),
+            pending_audio_chunks=int(row["pending_audio_chunks"]),
+            failed_audio_chunks=int(row["failed_audio_chunks"]),
+        )
+
+    def recover_running_model_invocations(self, completed_at_utc: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE model_invocations
+                   SET status = 'failed',
+                       retryable = CASE WHEN task_type IS NULL THEN 0 ELSE 1 END,
+                       error = COALESCE(error, '应用异常退出，模型任务可重试'),
+                       completed_at_utc = ?
+                   WHERE status = 'running'""",
+                (completed_at_utc,),
+            )
+        return int(cursor.rowcount)
+
+    def failed_correction_windows(self) -> tuple[tuple[str, int], ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT session_id, window_start_ms
+                   FROM transcript_correction_runs AS failed
+                   WHERE failed.state = 'failed'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM transcript_correction_runs AS newer
+                         WHERE newer.session_id = failed.session_id
+                           AND newer.window_start_ms = failed.window_start_ms
+                           AND newer.id > failed.id
+                           AND newer.state IN ('running', 'corrected', 'failed')
+                     )
+                   ORDER BY failed.id"""
+            ).fetchall()
+        return tuple((str(row["session_id"]), int(row["window_start_ms"])) for row in rows)
+
+    def failed_correction_run_count(self) -> int:
+        return len(self.failed_correction_windows())
+
+    def recover_running_correction_runs(self, completed_at_utc: str) -> list[tuple[str, int]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT session_id, window_start_ms
+                   FROM transcript_correction_runs
+                   WHERE state = 'running'
+                   ORDER BY id"""
+            ).fetchall()
+            if rows:
+                connection.execute(
+                    """UPDATE transcript_correction_runs
+                       SET state = 'failed',
+                           completed_at_utc = ?,
+                           error_source = 'application',
+                           error = COALESCE(error, '应用异常退出，字幕校订将重试')
+                       WHERE state = 'running'""",
+                    (completed_at_utc,),
+                )
+        return [(str(row["session_id"]), int(row["window_start_ms"])) for row in rows]
+
+    def resolve_retryable_model_tasks(
+        self,
+        task_type: str,
+        session_id: str | None,
+        *,
+        payload_key: str | None = None,
+        payload_value: object | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, task_payload_json
+                   FROM model_invocations
+                   WHERE status = 'failed' AND retryable = 1
+                     AND task_type = ? AND session_id IS ?""",
+                (task_type, session_id),
+            ).fetchall()
+            ids: list[int] = []
+            for row in rows:
+                if payload_key is not None:
+                    try:
+                        payload = json.loads(row["task_payload_json"] or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if payload.get(payload_key) != payload_value:
+                        continue
+                ids.append(int(row["id"]))
+            if ids:
+                placeholders = ", ".join("?" for _ in ids)
+                connection.execute(
+                    f"UPDATE model_invocations SET retryable = 0 WHERE id IN ({placeholders})",
+                    ids,
+                )
+
+    def resolve_model_fallbacks(self, invocation_ids: list[int]) -> None:
+        if not invocation_ids:
+            return
+        placeholders = ", ".join("?" for _ in invocation_ids)
+        with self.connect() as connection:
+            connection.execute(
+                f"UPDATE model_invocations SET retryable = 0 WHERE id IN ({placeholders})",
+                invocation_ids,
+            )
+
+    def retryable_model_task_count(self) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS count FROM model_invocations
+                   WHERE status = 'failed' AND retryable = 1
+                     AND task_type IN (
+                         'answer', 'material', 'cross_session', 'transcript_correction'
+                     )"""
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
 
     def transcripts_between(
         self, session_id: str, start_ms: int, end_ms: int
@@ -2514,6 +2835,7 @@ class Database:
         error: str | None,
         evidence_state: str,
         evidence: list[dict[str, object]],
+        model_invocation_id: int | None = None,
     ) -> AnswerVersionRecord:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2528,14 +2850,16 @@ class Database:
             cursor = connection.execute(
                 """INSERT INTO answer_versions(
                        question_id, version_number, model, connection_json, request_status,
-                       upstream_request_id, answer, error, evidence_state, created_at_utc
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       model_invocation_id, upstream_request_id, answer, error,
+                       evidence_state, created_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     question_id,
                     version_number,
                     model,
                     connection_json,
                     request_status,
+                    model_invocation_id,
                     request_id,
                     answer,
                     error,
@@ -2580,6 +2904,7 @@ class Database:
             error,
             evidence_state,
             created_at,
+            model_invocation_id,
         )
 
     def answer_versions(self, question_id: int) -> list[AnswerVersionRecord]:
@@ -2587,7 +2912,7 @@ class Database:
             rows = connection.execute(
                 """SELECT id, question_id, version_number, model, connection_json,
                           request_status, upstream_request_id AS request_id, answer, error,
-                          evidence_state, created_at_utc
+                          evidence_state, created_at_utc, model_invocation_id
                    FROM answer_versions WHERE question_id = ? ORDER BY version_number""",
                 (question_id,),
             ).fetchall()
@@ -2912,14 +3237,17 @@ class Database:
         reasoning_level: str,
         fallback_reason: str | None,
         evidence: tuple[ModelInvocationEvidenceRecord, ...] = (),
+        task_type: str | None = None,
+        task_payload_json: str | None = None,
     ) -> int:
         started_at = datetime.now(UTC).isoformat()
         with self.connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO model_invocations(
                        session_id, role, connection_id, connection_name, base_url, api_mode,
-                       model, reasoning_level, fallback_reason, status, started_at_utc
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
+                       model, reasoning_level, fallback_reason, status, retryable,
+                       task_type, task_payload_json, started_at_utc
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -2930,6 +3258,8 @@ class Database:
                     model,
                     reasoning_level,
                     fallback_reason,
+                    task_type,
+                    task_payload_json,
                     started_at,
                 ),
             )
@@ -2994,9 +3324,10 @@ class Database:
         with self.connect() as connection:
             cursor = connection.execute(
                 """UPDATE model_invocations
-                   SET status = ?, upstream_request_id = ?, error = ?, completed_at_utc = ?
+                   SET status = ?, retryable = ?, upstream_request_id = ?,
+                       error = ?, completed_at_utc = ?
                    WHERE id = ? AND status = 'running'""",
-                (status, request_id, error, completed_at, invocation_id),
+                (status, int(status == "failed"), request_id, error, completed_at, invocation_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Model invocation is unavailable or already finished")
@@ -3013,6 +3344,9 @@ class Database:
         if session_id is None:
             return self._model_invocations("", ())
         return self._model_invocations("WHERE invocation.session_id = ?", (session_id,))
+
+    def running_model_invocations(self) -> tuple[ModelInvocationRecord, ...]:
+        return self._model_invocations("WHERE invocation.status = 'running'", ())
 
     def _model_invocations(
         self, where: str, parameters: tuple[object, ...]
@@ -3056,6 +3390,8 @@ class Database:
                 evidence_ids=tuple((row["evidence_ids"] or "").split(chr(31)))
                 if row["evidence_ids"]
                 else (),
+                task_type=row["task_type"],
+                task_payload_json=row["task_payload_json"],
             )
             for row in rows
         )
@@ -3155,6 +3491,55 @@ class Database:
             created_at_utc=row["created_at_utc"],
             retry_of_id=row["retry_of_id"],
         )
+
+    def reclaim_orphan_cross_session_retry_claims(self) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """DELETE FROM cross_session_retry_claims AS claim
+                   WHERE claim.claimed_at_utc < ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cross_session_syntheses AS successor
+                         WHERE successor.retry_of_id = claim.synthesis_id
+                     )""",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
+    def claim_cross_session_retry(self, synthesis_id: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO cross_session_retry_claims(
+                       synthesis_id, claimed_at_utc
+                   ) VALUES (?, ?)""",
+                (synthesis_id, datetime.now(UTC).isoformat()),
+            )
+        return cursor.rowcount == 1
+
+    def release_cross_session_retry_claim(self, synthesis_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM cross_session_retry_claims WHERE synthesis_id = ?",
+                (synthesis_id,),
+            )
+
+    def cross_session_successor_exists(self, synthesis_id: int) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM cross_session_syntheses WHERE retry_of_id = ? LIMIT 1",
+                (synthesis_id,),
+            ).fetchone()
+        return row is not None
+
+    def cross_session_synthesis_for_invocation(
+        self, invocation_id: int
+    ) -> CrossSessionSynthesisRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM cross_session_syntheses WHERE model_invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        return self.cross_session_synthesis(int(row["id"])) if row is not None else None
 
     def cross_session_syntheses(
         self, *, limit: int = 50, request_status: str | None = None

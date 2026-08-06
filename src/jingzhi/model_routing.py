@@ -91,6 +91,15 @@ class RoutedTranscriptCorrectionModel:
                 lambda adapter: adapter.correct(request),
                 session_id=request.session_id,
                 evidence=evidence,
+                task_type="transcript_correction",
+                task_payload_json=json.dumps(
+                    {
+                        "session_id": request.session_id,
+                        "window_start_ms": request.window_start_ms,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             )
         except Exception as exc:
             invocation = getattr(exc, "last_invocation", None)
@@ -135,6 +144,8 @@ class ModelRouter:
         *,
         session_id: str | None = None,
         evidence: tuple[InvocationEvidence, ...] = (),
+        task_type: str | None = None,
+        task_payload_json: str | None = None,
     ) -> RoutedResult[T]:
         role = self._role(role_name)
         targets = [(role.connection_id, role.model)]
@@ -146,6 +157,7 @@ class ModelRouter:
         fallback_reason: str | None = None
         last_error: Exception | None = None
         last_invocation: ModelInvocationRecord | None = None
+        attempt_ids: list[int] = []
         for connection_id, model in targets:
             connection = self._connection(connection_id)
             invocation_id = self.database.start_model_invocation(
@@ -159,7 +171,10 @@ class ModelRouter:
                 reasoning_level=role.reasoning.value,
                 fallback_reason=fallback_reason,
                 evidence=evidence,
+                task_type=task_type,
+                task_payload_json=task_payload_json,
             )
+            attempt_ids.append(invocation_id)
             try:
                 adapter = self.adapter_factory(
                     connection,
@@ -182,7 +197,10 @@ class ModelRouter:
                 "succeeded",
                 request_id=getattr(value, "request_id", None),
             )
+            self.database.resolve_model_fallbacks(attempt_ids[:-1])
             return RoutedResult(value, invocation)
+        if len(attempt_ids) > 1:
+            self.database.resolve_model_fallbacks(attempt_ids[:-1])
         if last_error is None or last_invocation is None:
             raise RuntimeError(f"No model target is configured for role {role_name.value}")
         try:
